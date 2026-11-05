@@ -113,9 +113,17 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
                 force = (params.repulsion_distance - distance) * params.repulsion_force
                 self.vx += (dx / distance) * force
                 self.vy += (dy / distance) * force
+        # 微扰漂移：力导向收敛后仍保持缓慢游动，星云永远是活的
+        self.vx += random.uniform(-1.0, 1.0) * params.drift_jitter
+        self.vy += random.uniform(-1.0, 1.0) * params.drift_jitter
         self.vx *= params.friction
         self.vy *= params.friction
         self.setPos(self.x() + self.vx, self.y() + self.vy)
+        # 神经元自发放电：低频微闪烁，模拟静息态电活动
+        if random.random() < params.neuron_fire_probability and self.flash_intensity < 0.2:
+            self.flash_intensity = max(self.flash_intensity, 0.35)
+            self.flash_count += 1
+            self._update_brush()
         if self.flash_intensity > 0:
             self.flash_intensity = max(0.0, self.flash_intensity - params.flash_decay)
             self._update_brush()
@@ -175,6 +183,7 @@ class NebulaView(QtWidgets.QGraphicsView):
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self._stardust = self._build_stardust()
+        self._frame = 0
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.animate)
@@ -365,14 +374,45 @@ class NebulaView(QtWidgets.QGraphicsView):
                 del self._line_items[key]
 
     def animate(self) -> None:
+        self._frame += 1
         for node in self.nodes:
             node.update_physics(self.nodes)
+        self._maybe_spontaneous_pulse()
         self.update_lines()
         for pulse in self.pulses[:]:
             if not pulse.update_position():
                 self.last_arrivals.append(pulse.end_node.node_id)
                 self.view_scene.removeItem(pulse)
                 self.pulses.remove(pulse)
+
+    def _maybe_spontaneous_pulse(self) -> None:
+        """静息态自发脉冲：随机节点沿突触向邻居放电，星云在无检索时也保持活性。"""
+        params = self._config.ui
+        if params.spontaneous_pulse_interval_ms <= 0 or not self.nodes:
+            return
+        interval_frames = max(1, params.spontaneous_pulse_interval_ms // max(1, params.timer_interval_ms))
+        if self._frame % interval_frames != 0:
+            return
+        source = random.choice(self.nodes)
+        neighbors = [
+            target_id
+            for source_id, target_id, _weight, _kind in self._edges
+            if source_id == source.node_id
+        ] + [
+            source_id
+            for source_id, target_id, _weight, _kind in self._edges
+            if target_id == source.node_id
+        ]
+        if not neighbors:
+            near = sorted(
+                (node for node in self.nodes if node is not source),
+                key=lambda node: (node.x() - source.x()) ** 2 + (node.y() - source.y()) ** 2,
+            )[:3]
+            neighbors = [node.node_id for node in near]
+        if not neighbors:
+            return
+        target_id = random.choice(neighbors)
+        self.emit_pulses(source.node_id, [(target_id, random.uniform(0.45, 0.85))])
 
     def pulse_count(self) -> int:
         return len(self.pulses)

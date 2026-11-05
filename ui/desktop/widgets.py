@@ -183,7 +183,7 @@ FIELD_LABELS: dict[str, str] = {
     "mcp_host": "MCP 地址", "mcp_port": "MCP 端口", "http_host": "HTTP 地址", "http_port": "HTTP 端口",
     "default_rate_limit": "默认限速 (/min)", "registry_enabled": "启用注册中心",
     # 外观
-    "timer_interval_ms": "帧间隔 (ms)", "max_labels": "同屏标签数", "stardust_count": "星尘数量",
+    "drift_jitter": "节点漂移强度", "spontaneous_pulse_interval_ms": "自发脉冲间隔 (ms)", "neuron_fire_probability": "自发放电概率", "timer_interval_ms": "帧间隔 (ms)", "max_labels": "同屏标签数", "stardust_count": "星尘数量",
     "dim_opacity": "非高亮透明度", "label_font_size": "标签字号", "glow_multiplier": "光晕倍率",
     "pulse_radius": "光点半径", "flash_decay": "闪烁衰减", "link_distance": "近邻连线半径",
     "window_width": "窗口宽", "window_height": "窗口高",
@@ -285,6 +285,9 @@ FIELD_HINTS: dict[str, str] = {
     "pulse_speed_base": "光点的基础飞行速度。",
     "pulse_speed_similarity_gain": "相似度越高光点飞得越快的加成。",
     "max_pulses": "同屏最多同时飞几个光点。",
+    "drift_jitter": "每帧随机微扰力：让节点永不静止，越大星云越「躁」。",
+    "spontaneous_pulse_interval_ms": "每隔多久有一个神经元沿突触自发放电（0=关闭）；这是静息态的大脑活动。",
+    "neuron_fire_probability": "每个节点每帧自发微闪烁的概率，模拟静息态电活动。",
     "timer_interval_ms": "动画刷新间隔：16≈60fps；感觉卡顿就调大到 33。",
     "max_labels": "同屏最多显示几个记忆标签。",
     "stardust_count": "背景星尘点数，纯装饰。",

@@ -227,7 +227,10 @@ class UiConfig(BaseSettings):
     proximity_line_alpha: int = 165             # 近邻线基础透明度（语义边更亮）
     pulse_radius: float = 6.0                   # 光点半径
     flash_decay: float = 0.05
-    max_labels: int = 8                        # 同屏最多记忆标签（避免重叠）
+    max_labels: int = 6                        # 同屏最多记忆标签（避免重叠）
+    drift_jitter: float = 0.35                 # 每帧随机微扰力：节点永不完全静止
+    spontaneous_pulse_interval_ms: int = 1200  # 突触自发脉冲间隔（0=关闭）
+    neuron_fire_probability: float = 0.0008    # 每帧每节点自发放电概率（微闪烁）
     stardust_count: int = 260                   # 背景星尘点数
     stardust_color: str = "#33496B"
     label_color: str = "#8FA6C4"

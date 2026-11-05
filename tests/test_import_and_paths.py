@@ -106,3 +106,21 @@ def test_config_editor_path_fields_have_browse_button(desktop_config, qapp):
     editor = ConfigEditor((("存储引擎", desktop_config.storage),))
     buttons = [w for w in editor.findChildren(QtWidgets.QPushButton) if w.text() == "浏览…"]
     assert len(buttons) >= 5, "五个存储路径字段都应有「浏览…」选择器"
+
+
+def test_nebula_stays_alive_without_retrieval(backend, desktop_config, qapp):
+    """静息态活性：无检索时节点持续漂移 + 周期性自发脉冲。"""
+    import random
+
+    from ui.desktop.neurons import NebulaView
+
+    random.seed(7)
+    view = NebulaView(desktop_config, auto_animate=False)
+    graph = backend.graph()
+    view.set_graph(graph)
+    before = {node.node_id: (node.x(), node.y()) for node in view.nodes}
+    for _ in range(40):
+        view.animate()
+    after = {node.node_id: (node.x(), node.y()) for node in view.nodes}
+    assert before != after, "漂移微扰下节点必须持续移动"
+    assert view.pulse_count() + len(view.last_arrivals) > 0, "自发脉冲必须周期性放电"
