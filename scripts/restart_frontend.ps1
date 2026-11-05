@@ -1,10 +1,10 @@
 # scripts/restart_frontend.ps1 —— 杀掉本项目旧前端实例并重新启动（每次改完代码后运行）
-$root = Split-Path -Parent $PSScriptRoot
+$root = 'B:\Desktop\BaiduSyncdisk\desktop\VSProject\my_brain_backend'
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
     Where-Object { $_.CommandLine -like '*ui.desktop*' -and $_.CommandLine -like '*my_brain_backend*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
-Start-Process -FilePath (Join-Path $root '.venv\Scripts\pythonw.exe') `
+Start-Process -FilePath "$root\.venv\Scripts\pythonw.exe" `
     -ArgumentList '-m', 'ui.desktop' -WorkingDirectory $root
 Start-Sleep -Seconds 5
 $alive = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
