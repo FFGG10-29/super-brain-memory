@@ -11,6 +11,7 @@ from ui.desktop.pages.recall_page import RecallPage
 from ui.desktop.pages.settings_page import SettingsPage
 from ui.desktop.pages.sync_page import SyncPage
 from ui.desktop.pages.system_page import SystemPage
+from ui.desktop.pages.timeline_page import TimelinePage
 
 __all__ = [
     "AboutPage",
@@ -23,4 +24,5 @@ __all__ = [
     "SettingsPage",
     "SyncPage",
     "SystemPage",
+    "TimelinePage",
 ]

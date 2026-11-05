@@ -1,6 +1,6 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-05）：**93 passed**（含配置中心 10 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-06）：**123 passed**（桌面 22 / 用户控制 6 / 增量与索引 4 / 配置中心 13），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅
@@ -87,7 +87,7 @@
 > 启动：`python -m ui.desktop`；离屏预览：`python scripts/nebula_preview.py` → `data/nebula_preview.png`
 > 验收：`pytest tests/test_desktop.py -q` → **22 passed**（含真实 socket 端口 + 事件循环启停）
 
-布局（对齐 LivingMemory）：左侧 220px 导航九页 · 顶栏（空间选择/返回全景/全局搜索/导出/管理数据/全屏）·
+布局（对齐 LivingMemory）：左侧 220px 导航九页（v2.2 扩到**十一页**，新增「模型配置」「事件时间轴」）· 顶栏（空间选择/返回全景/全局搜索/导出/管理数据/全屏）·
 中央星云 · 右下迷你地图 + 浮动按钮 · 底部统计状态栏。
 
 | 验收项 | 状态 | 证据 |
@@ -115,7 +115,7 @@
 ## 配置中心（打包后免重编译）✅（2026-11-05）
 
 > 设置页 = 一键预设 + 全量参数自动表单；差异补丁存 `%APPDATA%/super-brain/config.json`；密钥只进钥匙串
-> 验收：`pytest tests/test_settings_center.py -q` → **10 passed**（含本地假 OpenAI 服务器）
+> 验收：`pytest tests/test_settings_center.py -q` → **13 passed**（含本地假 OpenAI 服务器）
 
 | 验收项 | 状态 | 证据 |
 |---|---|---|
@@ -127,9 +127,80 @@
 | 内核热重启 | ✅ | `DesktopBackend.restart()`：应用用户补丁重建引擎，数据保留 |
 | 精排开关 | ✅ | `recall.rerank_enabled=False` 跳过交叉编码（低配省电） |
 
+## 记忆可视化与用户控制（v2.2）✅（2026-11-06）
+
+> 主题：让记忆「可见、可纠正、可遗忘、可审计」，且全部改动仍落在事件溯源纪律内。
+> 验收：`pytest tests/test_user_control.py -q` → **6 passed**；`pytest tests/test_incremental_memory.py -q` → **4 passed**；全量 **123 passed**。
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 纠正 → 新版本 + 原值审计 | ✅ | `test_correct_creates_new_version_and_preserves_original`：旧行 `is_active=False` 且 content 原值不变、`tx_to` 打点；新行内容/分层生效；`memory_audit()` 含 `supersede`(changed 含 content) + `ingest` |
+| 封存 / 遗忘不出现在召回与列表 | ✅ | `test_forget_removes_from_recall_but_keeps_audit`：`tombstone` 事件 + 主库封存行保留 |
+| 编辑走事件而非原地改 payload | ✅ | `brain/memory_editor.py` 写入顺序 journal(fsync) → 主库 → 派生库/outbox；可编辑字段白名单 `_EDITABLE` |
+| 事件时间轴 + EventType 筛选 | ✅ | `test_event_timeline_and_type_filter`：`event_timeline(types=...)` 过滤正确、`event_types()` 恰 7 类；页面 30min 会话分组 + 3s 轮询 |
+| 时间轴/星云 → 检查器双向可达 | ✅ | `MainWindow.open_memory()`；`nebula_page.node_selected` 与 `timeline_page.focus_requested` 均接上 |
+| 敏感记忆上下文显隐 | ✅ | `test_sensitive_and_core_memory`：`set_sensitive` → `sensitive_ids()` / `memory_inspect()["sensitive"]`；列表与召回默认 `••••••`，检查器「在当前上下文显示敏感内容」按钮就地揭示 |
+| 命名空间预过滤 | ✅ | `test_cognitive_sectors_and_namespaces`：`recall(namespaces=("不存在",)).hits == []`；过滤在 `prefrontal.recall` 打分前生效，不依赖后置过滤 |
+| 认知分区可视化（五类） | ✅ | `cognitive_sectors()` 返回 5 类且计数≥1；数据页「认知分区」柱图 + 说明 |
+| 星云语义化布局 | ✅ | `neurons._semantic_position`：环=分层（core 内圈/archive 外圈）、扇区=记忆类型、角度≈形成时间；纯确定性，跨设备与截图可复现 |
+| 星云图例与节点详情 | ✅ | 页脚图例（颜色/环/扇区/角度含义）；悬停节点、连线看摘要；点击节点打开检查器 |
+| 可编辑 Core Memory | ✅ | 四块 human/persona/preferences/constraints → KV + 单条 `policy` 事件（`reason=edit_core_memory`），`projections` 重放到同一 bucket |
+| `search_text` 退化路径索引化 | ✅ | `test_text_inverted_index_replaces_full_scan`：正文 2-gram 倒排命中/不误命中/删除后失效；`LanceVectorDB.search_text` 在 FTS 缺失时先走倒排，最后才物化全表 |
+| 稀疏通道倒排索引 | ✅ | `_SparseIndex`：`(term,id,weight)` postings，查询只扫命中 term；行数不符整表重建，异常退回全扫且结果一致 |
+| 星云构图增量 + 落盘缓存 | ✅ | `test_incremental_memory.py` 4 条：命中缓存零 embedding 调用、新增只补算一条、缓存损坏/签名变化重建、倒排与全扫一致 |
+| 重活移出主线程 | ✅ | `ui/desktop/async_backend.py`：单线程池 + `QueuedConnection` 回主线程；`refresh_status()` 在后台忙时跳过本轮 |
+| GPU 三通道探针 | ✅ 脚本就绪 | `main.py --probe-models --json` 输出 `verdict` / `all_on_gpu` / `embedder.sparse_enabled`；`self_check` 只构造对象，不能替代本探针 |
+| 冻结态资源路径 | ✅ | `core/runtime_paths.py`（dev=项目根，frozen=`_MEIPASS`/exe 旁 + 用户数据目录）；`engine/cuda_runtime.py` 预登记 DLL 目录 |
+| 便携发行与换机校验 | ✅ 脚本就绪 | `scripts/build_portable.py`（DLL/权重归集 + spec）、`scripts/verify_portable.py`（改目录、无 `.env`、DLL 不在 venv 下复跑探针要求 `GPU_OK`） |
+| 全页截图覆盖 | ✅ | `scripts/desktop_screenshots.py` 覆盖星云/记忆/召回/系统/数据/模型/接口/同步/设置/**时间轴**（`01`~`10`），`--real` 用真实库 |
+
+> 算力现状：本机 GTX 1060 / 6GB / 驱动 581.57 已具备 `CUDAExecutionProvider` 与
+> `llama_supports_gpu_offload() == True`，三通道权重齐全、`sparse_head.onnx` 已导出。
+> 仍待确认一项（只能靠实跑）：便携目录复制到**另一台机器**后探针是否仍 `GPU_OK`。
+
+## 冻结发行包（PyInstaller onedir）✅（2026-11-06）
+
+> 产物 `dist/super-brain/`：9.6GB（含 3.35GB 权重）。流程见 `WORKING_MEMORY.md` §8。
+> 全部在本机实测，命令与输出都在 `build/probe_frozen2.json`、`build/selfcheck_frozen.json`、`build/frozen_ui.png`。
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 打包可完成、可复现 | ✅ | PyInstaller 6.22.3，`super-brain.spec --noconfirm` → 274s 完成，`COLLECT` 成功 |
+| GUI 能起来且渲染正常 | ✅ | `super-brain.exe` 出窗口「超级大脑 v2.1 · Living Memory」，十一页导航齐全（截图 `build/frozen_ui.png`） |
+| 冻结态自检 | ✅ | `super-brain-cli.exe --self-check --json` → relational/vector/graph/kv/timeseries/hypergraph/clock 七项全 `ok=true`，冷启动 0.57s |
+| 冻结态 GPU 三通道 | ✅ | `--probe-models --json` → `verdict=GPU_OK`、`all_on_gpu=true`、llm `active_gpu_layers=-1`、embedder/reranker 均 `CUDAExecutionProvider`、`sparse_enabled=true`、`cuda_dll_complete=true`（驱动 API 13.0） |
+| CUDA DLL 预登记生效 | ✅ | `cuda_dll_dirs` 命中 `_internal`、`_internal/cuda_bin`、`_internal/llama_cpp/lib`、`_internal/onnxruntime/capi` 四处 |
+| 数据不写安装目录 | ✅ | 首次启动自动在 `%APPDATA%\super-brain\data` 建六引擎库；配置读 `%APPDATA%\super-brain\config.env` |
+| 体积可控 | ✅ | 去重后 9.6GB：删掉与 `onnxruntime/capi`、`llama_cpp/lib` 同名的 25 个平铺 DLL + `providers_tensorrt`，释放 3397MB，探针复跑仍 `GPU_OK` |
+| 生成物不入库 | ✅ | `.gitignore` 增 `build/`、`dist/`、`app_entry.py`、`super-brain.spec`（已 `git check-ignore` 验证） |
+
+> 一个隐性坑记在这里：PyInstaller **不会**自动收集 `llama_cpp/lib/*.dll`（那是 ctypes 运行时加载的），
+> 漏了不报错、只是静默退回规则抽取。spec 里显式把它们收进 `llama_cpp/lib` 才有 GPU 推理。
+
+## 多 Agent 共享 + 桌面体验（v2.2 收尾）✅（2026-11-06）
+
+> 定位确认：超级大脑是**所有 Agent 共用的外置记忆中枢**，`agent_id` 只写审计。
+> 全量回归：`pytest tests -q` → **129 passed**。
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 记忆跨 Agent 共享（不按 agent 隔离） | ✅ | `test_memories_are_shared_across_all_agents`：codebuddy 写入 → dsh 不带任何参数即可召回；反向亦通；`namespace` 去重后仍只有一个值 |
+| 多进程同时接入同一内核 | ✅ | 三个 stdio 进程经 `mcp_bridge.json` 转发 `/mcp/call`，并发写入 all applied；`health_check` 6/6 引擎 ok |
+| 入口排队（中枢逐条裁决） | ✅ | `HTTPAdapter` 单工作线程 FIFO + `queue_depth`；并发不再出现 WinError 10054 |
+| 一键复制 MCP 配置 | ✅ | 接口页「复制给 Agent」；实测用该配置 spawn → `initialize` + `health_check` 通过 |
+| 配置不含安装绝对路径 | ✅ | command=`cmd.exe`、args=`/c %LOCALAPPDATA%\SuperBrain\bin\super-brain-mcp.cmd`；启动器每次启动按当前安装位置重写 |
+| 单一数据目录 + 迁移 | ✅ | `test_storage_root_switch_migrates_data_and_restarts`：换目录后 `storage_root()` 变更、六引擎数据复制到位、重启后仍能读到迁移前的记忆 |
+| HTTP 随软件自启 | ✅ | 启动 16s 内 `mcp_bridge.json` 自动出现、8766 监听；无需手动点「启动 HTTP 服务」 |
+| 托盘驻留 / 单实例 / 自启 | ✅ | 二次启动不新增进程且唤回已有窗口；`QTrayIconMessageWindow` 存在；`autostart.py` 写 HKCU Run（`--tray`） |
+| 首页资源仪表 | ✅ | 截图 `data/screenshots/01-nebula.png`：CPU 34% / 内存 11.2-15.8GB / 显卡 2% · 0-6144MB（nvidia-smi） |
+| 模型运行总览 | ✅ | 截图 `data/screenshots/04-model.png`：三通道 × 本地/远程 × 设备 × 状态 × 模型名 + 总览行 |
+| 窗口适配笔记本屏幕 | ✅ | 1536×824 可用区下窗口 `1414×782 @ (61,40)`；接口页加滚动区后主窗口最小高度从 937 降到 656 |
+
 ## 明确未做（不在本次七阶段任务内）
 
 - `mcp_server.serve()` 的官方 SDK Streamable HTTP 传输装配（工具面已就绪，需 `pip install mcp` 后接线）。
-- 真实 GPU / 真实 ONNX 与 GGUF 模型权重加载（当前全程走确定性降级与规则抽取）。
+- 换机实测：发行包复制到另一台机器（有卡 / 无卡各一次）后的 `verdict` 与降级行为。
 - 真实 GitHub 私库 pull/push 联调（需 PAT 与 `SYNC_REPO_URL`）。
-- NiceGUI Web 图形页面、3D 大脑面板、PAT 自动轮换（v2 路线图；PySide6 桌面前端已替代主要可视化入口）。
+- 合规硬清除（tombstone purge）：遗忘只做到「移出推理路径 + 保留审计」，物理清除需另建跨六引擎的清除流。
+- 敏感记忆加密存储（当前只是前端上下文遮蔽 + 标记位，正文仍明文入库）。
+- 多用户 / 多租户权限治理、3D 大脑面板、PAT 自动轮换（v2 路线图；PySide6 桌面前端已替代主要可视化入口）。

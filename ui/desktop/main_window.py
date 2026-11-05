@@ -26,6 +26,7 @@ from ui.desktop.pages import (
     SettingsPage,
     SyncPage,
     SystemPage,
+    TimelinePage,
 )
 from ui.desktop.settings import SettingsStore
 from ui.desktop.theme import stylesheet
@@ -43,6 +44,7 @@ _NAV = (
     ("同步与备份", QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton),
     ("设置", QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView),
     ("关于", QtWidgets.QStyle.StandardPixmap.SP_MessageBoxInformation),
+    ("事件时间轴", QtWidgets.QStyle.StandardPixmap.SP_FileDialogListView),
 )
 
 
@@ -56,7 +58,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config = config or backend.config
         self.setWindowTitle("超级大脑 v2.1 · Living Memory")
         self.resize(self._config.ui.window_width, self._config.ui.window_height)
+        self._fit_to_screen()
         self.setStyleSheet(stylesheet())
+
+        # 托盘驻留状态（app.run 会调 attach_tray 注入图标）
+        self.tray = None
+        self._quitting = False
+        self._tray_hinted = False
+        from ui.desktop.tray import app_icon
+
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
 
         self.nebula_page = NebulaPage(backend, self._config)
         self.memory_page = MemoryPage(backend)
@@ -68,6 +81,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sync_page = SyncPage(backend, store)
         self.settings_page = SettingsPage(backend, store)
         self.about_page = AboutPage()
+        self.timeline_page = TimelinePage(backend)
 
         self._nav: QtWidgets.QListWidget
         self._space: QtWidgets.QComboBox
@@ -85,6 +99,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sync_page,
             self.settings_page,
             self.about_page,
+            self.timeline_page,
         ):
             self._stack.addWidget(page)
 
@@ -215,6 +230,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._space.currentTextChanged.connect(self.nebula_page.set_space)
         self._search.returnPressed.connect(self._on_search)
         self.memory_page.focus_requested.connect(self.focus_memory)
+        self.nebula_page.node_selected.connect(self.open_memory)
+        self.timeline_page.focus_requested.connect(self.open_memory)
         self.recall_page.activate_requested.connect(self.activate_query)
         self.recall_page.focus_requested.connect(self.focus_memory)
         self.settings_page.appearance_changed.connect(self._apply_appearance)
@@ -270,6 +287,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._nav.setCurrentRow(0)
         self.nebula_page.focus(memory_id)
 
+    def open_memory(self, memory_id: str) -> None:
+        """点击星云节点 → 打开记忆检查器（图谱与详情双向可达）。"""
+        self._nav.setCurrentRow(1)
+        self.memory_page.show_memory(memory_id)
+
     def reset_view(self) -> None:
         self.nebula_page.reset_view()
 
@@ -299,6 +321,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── 状态栏 ────────────────────────────────────────────────────────────
     def refresh_status(self) -> None:
+        # 后台重任务进行中：跳过本轮状态刷新，绝不排队等锁（UI 保持可交互）
+        if self._backend.tasks.busy:
+            return
         snapshot = self._backend.snapshot()
         engines = snapshot["engine_health"]["engines"]
         ok = sum(1 for engine in engines if engine["ok"])
@@ -310,8 +335,73 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._clock.setText(time.strftime("%Y-%m-%d %H:%M"))
 
+    # ── 窗口尺寸 ──────────────────────────────────────────────────────────
+    def _fit_to_screen(self) -> None:
+        """按当前屏幕可用区域收敛窗口尺寸并居中。
+
+        配置里 1400×900 是给大屏的；笔记本 1366×768 / 125% 缩放下直接照搬会让标题栏
+        跑到屏幕外（顶部看不见、拖不动）。这里一律以「屏幕可用区 − 边距」为上限。
+        """
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        min_width, min_height = 900, 600
+        width = min(self.width(), max(min_width, available.width() - 60))
+        height = min(self.height(), max(min_height, available.height() - 80))
+        self.resize(width, height)
+        x = available.left() + max(0, (available.width() - width) // 2)
+        y = available.top() + max(0, (available.height() - height) // 2)
+        self.move(x, y)
+
+    # ── 托盘驻留 ──────────────────────────────────────────────────────────
+    def attach_tray(self, tray) -> None:
+        """由 app.run 注入托盘；有了它，叉掉窗口只隐藏，服务继续跑。"""
+        self.tray = tray
+
+    def goto_page(self, index: int) -> None:
+        if 0 <= index < self._nav.count():
+            self._nav.setCurrentRow(index)
+
+    def show_from_tray(self) -> None:
+        from ui.desktop.tray import center_on_screen, notify
+
+        was_hidden = not self.isVisible()
+        self.showNormal()
+        self.setWindowState(self.windowState() & ~QtCore.Qt.WindowState.WindowMinimized)
+        center_on_screen(self)
+        self.activateWindow()
+        if was_hidden:
+            notify(self.tray, "超级大脑", "已回到前台（关闭窗口只会隐藏到托盘）")
+
+    def quit_app(self) -> None:
+        """真正退出：走完整清理（停定时器、等后台任务、关六引擎）。"""
+        self._quitting = True
+        if self.tray is not None:
+            self.tray.hide()
+        self.close()
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.quit()
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 托盘驻留：默认只隐藏窗口，引擎 / HTTP 网关 / MCP 接入保持在线
+        if self.tray is not None and not getattr(self, "_quitting", False):
+            self.hide()
+            event.ignore()
+            if not getattr(self, "_tray_hinted", False):
+                self._tray_hinted = True
+                from ui.desktop.tray import notify
+
+                notify(self.tray, "超级大脑仍在运行",
+                       "窗口已隐藏到托盘：记忆服务与 MCP 接入都没有中断。\n"
+                       "要彻底退出请右键托盘图标 →「完全退出」。")
+            return
         self._status_timer.stop()
         self.nebula_page.view.timer.stop()
+        self.nebula_page.stop_stats()
+        self.timeline_page.stop()
+        self._backend.tasks.wait()
+        self._backend.stop_http()
         self._backend.close()
         super().closeEvent(event)

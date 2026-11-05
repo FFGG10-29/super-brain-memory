@@ -31,6 +31,25 @@ from tests.fakes import FakeEmbedder, FakeLLM
 DENSE_DIM = 8  # 测试用小维度：够验证 fixed_size_list 校验，又不拖慢用例
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_config(tmp_path, monkeypatch):
+    """每个用例一套独立的用户配置目录。
+
+    设置页「保存」现在会真正落盘（含 storage 路径），若共用一个配置目录，
+    上一个用例保存的临时库路径会被下一个用例的 DesktopBackend 读回，
+    直接开在别人的 tmp_path 上 → Kùzu 单写锁冲突（曾导致成片 ERROR）。
+    """
+    monkeypatch.setenv("SUPER_BRAIN_CONFIG_DIR", str(tmp_path / "_user_config"))
+    # 用户目录也要隔离：MCP 桥接描述文件（mcp_bridge.json）在 user_dir() 下，
+    # 不隔离会把真实桌面进程的桥接地址读进测试
+    monkeypatch.setenv("SUPER_BRAIN_HOME", str(tmp_path / "_user_home"))
+    from ui.desktop.user_config import clear_overrides
+
+    clear_overrides()
+    yield
+    clear_overrides()
+
+
 @pytest.fixture()
 def brain_config(tmp_path) -> BrainConfig:
     return BrainConfig(

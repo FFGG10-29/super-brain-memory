@@ -34,6 +34,9 @@ mcp==1.30.0
 PySide6-Essentials==6.12.0
 keyring==25.7.0
 
+# 首页仪表：CPU / 内存采样（显卡走 nvidia-smi，无依赖）
+psutil==7.2.2
+
 # 测试
 pytest==9.2.0
 pytest-asyncio==1.4.1.post1

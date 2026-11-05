@@ -35,7 +35,12 @@ TOOL_SCHEMAS = [
 
 
 class MCPToolkit:
-    """协议无关的工具集合：token 决定 agent_id 与命名空间，客户端不能自报。"""
+    """协议无关的工具集合（所有 Agent 共用同一份记忆）。
+
+    token 只决定 **agent_id**（审计 / 限流 / 显式命名空间时的权限），
+    读写默认落在同一个中枢命名空间 `config.namespace_policy`；
+    这是「外置超级大脑」的前提：任何 Agent 写的记忆，其它 Agent 立刻能召回。
+    """
 
     def __init__(
         self,
@@ -71,8 +76,12 @@ class MCPToolkit:
             return {"error": type(exc).__name__, "message": str(exc)}
 
     def _dispatch(self, tool: str, args: dict, agent: Agent) -> dict[str, Any]:
-        namespace = str(args.get("namespace") or agent.scopes[0])
-        if not self._registry.namespace_allowed(agent, namespace):
+        # 超级大脑是**统一记忆中枢**：所有 Agent 默认写进同一个共享库、读同一份记忆。
+        # agent_id 只用于审计与限流，绝不参与隔离——否则每个 Agent 会看到不同的「自己」。
+        # 只有客户端**显式指定**别的命名空间时才做权限校验（显式越权仍要拒绝）。
+        requested = args.get("namespace")
+        namespace = str(requested or self._config.namespace_policy)
+        if requested and not self._registry.namespace_allowed(agent, namespace):
             raise GatewayAuthError(f"Agent 无权访问命名空间 {namespace}")
 
         if tool == "save_memory":
@@ -93,9 +102,10 @@ class MCPToolkit:
 
         if tool == "recall_memory":
             limit = int(args.get("limit") or self._config.recall.top_k)
+            # namespaces=() 表示不按命名空间过滤：任何 Agent 写的记忆，其它 Agent 都能召回
             hits = self._prefrontal.recall(
                 str(args.get("query", "")), agent_id=agent.agent_id,
-                namespaces=tuple(agent.scopes), limit=limit,
+                namespaces=(), limit=limit,
             )
             return {
                 "hits": [
@@ -125,8 +135,9 @@ class MCPToolkit:
             }
 
         if tool == "profile_read":
+            # 画像同样共享：任何 Agent 读到的都是同一份用户画像
             rows = self._relational.query(
-                "neuron", namespaces=tuple(agent.scopes), memory_types=("profile",), limit=50
+                "neuron", memory_types=("profile",), active_only=True, limit=50
             )
             return {"profiles": [dict(row) for row in rows]}
 

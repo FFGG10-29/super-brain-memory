@@ -1,8 +1,10 @@
 """scripts/desktop_screenshots.py —— 离屏遍历各功能页并截图（无需显示器）。
 
-    .venv\\Scripts\\python.exe scripts/desktop_screenshots.py
+    .venv\\Scripts\\python.exe scripts/desktop_screenshots.py            # 临时库 + 自带演示数据
+    .venv\\Scripts\\python.exe scripts/desktop_screenshots.py --real     # 真实 data/ 库（先跑 seed_demo.py）
 
 输出到 data/screenshots/*.png；可交互窗口请跑 `python -m ui.desktop`。
+--real 模式会打开真实库，运行时必须先关闭桌面窗口（Kùzu 单进程写锁）。
 """
 from __future__ import annotations
 
@@ -12,6 +14,11 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 离线截图必须隔离用户配置：否则 %APPDATA%/super-brain/config.json 里的存储路径
+# 会把临时库覆盖成真实 data/（维度 1024 vs 8 → SchemaVersionMismatch）。--real 模式除外。
+if "--real" not in sys.argv:
+    os.environ["SUPER_BRAIN_CONFIG_DIR"] = tempfile.mkdtemp(prefix="shots_cfg_")
+    os.environ["SUPER_BRAIN_HOME"] = tempfile.mkdtemp(prefix="shots_home_")
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -57,6 +64,9 @@ PAGES = (
     (0, "01-nebula"),
     (1, "02-memory"),
     (3, "03-system"),
+    (4, "09-data"),
+    (2, "08-recall"),
+    (10, "10-timeline"),
     (5, "04-model"),
     (6, "05-interface"),
     (7, "06-sync"),
@@ -64,28 +74,37 @@ PAGES = (
 )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    real = "--real" in args
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     for font_path in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/simsun.ttc"):
         if Path(font_path).exists():
             QtGui.QFontDatabase.addApplicationFont(font_path)
 
-    root = Path(tempfile.mkdtemp(prefix="brain_shots_"))
-    config = BrainConfig(
-        storage=StorageConfig(
-            sqlite_path=root / "r.db", lancedb_path=root / "v.lance",
-            kuzu_path=root / "g.kuzu", lmdb_path=root / "kv.lmdb", duckdb_path=root / "t.db",
-        ),
-        model=ModelConfig(dense_dim=8, use_cuda=False, llm_gguf_dir=root / "models"),
-        sync=SyncConfig(device_id="dev-preview", local_repo_dir=root / "sync"),
-    )
-    config.activation.similarity_threshold = 0.22
+    if real:
+        from config import get_config
+
+        # 真实库只截图、不灌数据；数据由 scripts/seed_demo.py 准备
+        config = get_config()
+        store = SettingsStore(config)
+    else:
+        root = Path(tempfile.mkdtemp(prefix="brain_shots_"))
+        config = BrainConfig(
+            storage=StorageConfig(
+                sqlite_path=root / "r.db", lancedb_path=root / "v.lance",
+                kuzu_path=root / "g.kuzu", lmdb_path=root / "kv.lmdb", duckdb_path=root / "t.db",
+            ),
+            model=ModelConfig(dense_dim=8, use_cuda=False, llm_gguf_dir=root / "models"),
+            sync=SyncConfig(device_id="dev-preview", local_repo_dir=root / "sync"),
+        )
+        config.activation.similarity_threshold = 0.22
+        store = SettingsStore(config, keyring_backend=_NoKeyring(), qsettings=_MemorySettings())
     backend = DesktopBackend(config)
     try:
-        for content in DEMO_MEMORIES:
-            backend.save_memory(content)
-
-        store = SettingsStore(config, keyring_backend=_NoKeyring(), qsettings=_MemorySettings())
+        if not real:
+            for content in DEMO_MEMORIES:
+                backend.save_memory(content)
         window = MainWindow(backend, store, config)
         window.resize(1440, 900)
         window.show()
@@ -97,6 +116,7 @@ def main() -> int:
 
         # 星云页：一次真实检索让光脉冲停在半空
         window.activate_query("发版冲突")
+        backend.tasks.flush()   # 召回异步执行，等光点生成后再截图
         for _ in range(6):
             window.nebula_page.view.animate()
         app.processEvents()
@@ -108,6 +128,20 @@ def main() -> int:
             if index == 6:  # 接口页顺手把服务跑起来，截图里能看到运行状态
                 backend.start_http("127.0.0.1", 0)
                 window.interface_page._refresh_ui()
+                app.processEvents()
+            if index == 1:  # 记忆页选中一条，截图里能看到填充后的检查器
+                window.memory_page._table.selectRow(0)
+                app.processEvents()
+            if index == 4:  # 展示数据页切到 PAD 情绪曲线
+                page = window._stack.widget(4)
+                if hasattr(page, "_tabs"):
+                    page._tabs.setCurrentIndex(2)
+                app.processEvents()
+            if index == 2:  # 召回页跑一次真实查询，截图里能看到六路通道解释
+                window.recall_page._query.setText("发版冲突")
+                window.recall_page.run_recall()
+                backend.tasks.flush()
+                window.recall_page._table.selectRow(0)
                 app.processEvents()
             pixmap = window.grab()
             path = out_dir / f"{name}.png"

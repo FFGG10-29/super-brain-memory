@@ -77,6 +77,8 @@ class Prefrontal:
         self._amygdala = amygdala
         self._timeseries = timeseries
         self._config = config or get_config()
+        # 最近一次召回的通道埋点（只读快照，供 UI 解释「为什么命中」）
+        self.last_audit: dict[str, Any] = {}
 
     # ── 召回主流程 ────────────────────────────────────────────────────────
     def recall(
@@ -105,6 +107,8 @@ class Prefrontal:
             neuron = Neuron.from_record(record)
             if not neuron.is_active or neuron.tier == _ARCHIVED:
                 continue
+            if namespaces and neuron.namespace not in namespaces:
+                continue
             score = self._score(neuron, rrf_score, now)
             score *= self._amygdala.recall_weight(agent_id, now_ms=now)
             channels_of = tuple(channel for channel, hits in channels.items() if neuron_id in hits)
@@ -128,6 +132,13 @@ class Prefrontal:
         """各路召回命中率埋点（阶段 6 验收）+ access_log 只写不改。"""
         counts = {name: len(ids) for name, ids in channels.items()}
         injected = {name: sum(1 for hit in hits if name in hit.channels) for name in channels}
+        self.last_audit = {
+            "counts": counts,
+            "injected": injected,
+            "channels": list(channels),
+            "hits": len(hits),
+            "query": query,
+        }
         log_event("recall", agent_id=agent_id, query=query, channels=counts, injected=injected, hits=len(hits))
         if self._timeseries is None:
             return
@@ -171,9 +182,14 @@ class Prefrontal:
                     for hit in self._vector.search_sparse(embedding.sparse, limit=oversample, where=recall_filter)
                 ]
 
-        channels["fts"] = [str(record["id"]) for record in self._relational.full_text_search("neuron", query, limit=oversample)]
+        channels["fts"] = [
+            str(record["id"])
+            for record in self._relational.full_text_search(
+                "neuron", query, limit=oversample, namespaces=namespaces
+            )
+        ]
 
-        graph_ids = self._graph_channel(query, oversample)
+        graph_ids = self._graph_channel(query, oversample, namespaces)
         if graph_ids:
             channels["graph"] = graph_ids
 
@@ -189,7 +205,9 @@ class Prefrontal:
 
         return {name: hits for name, hits in channels.items() if hits}
 
-    def _graph_channel(self, query: str, oversample: int) -> list[str]:
+    def _graph_channel(
+        self, query: str, oversample: int, namespaces: tuple[str, ...] = ()
+    ) -> list[str]:
         """图谱多跳：查询词里的标识符作为种子实体，取邻居名再回主库匹配。"""
         seeds = [match.group(0) for match in _IDENTIFIER.finditer(query)]
         neighbors: list[str] = []
@@ -204,7 +222,10 @@ class Prefrontal:
         collected: list[str] = []
         for name in dict.fromkeys(neighbors):
             collected.extend(
-                str(record["id"]) for record in self._relational.full_text_search("neuron", name, limit=oversample)
+                str(record["id"])
+                for record in self._relational.full_text_search(
+                    "neuron", name, limit=oversample, namespaces=namespaces
+                )
             )
         return list(dict.fromkeys(collected))
 

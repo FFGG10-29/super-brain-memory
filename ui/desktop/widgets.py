@@ -10,7 +10,10 @@ from typing import Any, get_args, get_origin, get_type_hints
 from pydantic import BaseModel
 from PySide6 import QtCore, QtGui, QtWidgets
 
-__all__ = ["Card", "ConfigEditor", "KpiCard", "MiniMap", "Switch", "divider", "FIELD_LABELS"]
+__all__ = [
+    "Card", "ConfigEditor", "KpiCard", "MetricGauge", "MiniMap", "Switch",
+    "divider", "FIELD_LABELS",
+]
 
 
 class Switch(QtWidgets.QAbstractButton):
@@ -109,6 +112,48 @@ class KpiCard(QtWidgets.QFrame):
         self._value.setStyleSheet(f"color: {color};")
 
 
+class MetricGauge(QtWidgets.QFrame):
+    """顶部仪表：标题 + 细进度条 + 数值（CPU / 内存 / 显卡共用）。"""
+
+    def __init__(self, title: str, color: str = "#4FC3F7", parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = color
+        self.setObjectName("gauge")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 7)
+        layout.setSpacing(4)
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(6)
+        self._title = QtWidgets.QLabel(title)
+        self._title.setObjectName("gaugeTitle")
+        self._value = QtWidgets.QLabel("—")
+        self._value.setObjectName("gaugeValue")
+        head.addWidget(self._title)
+        head.addStretch(1)
+        head.addWidget(self._value)
+        self._bar = QtWidgets.QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(5)
+        self._bar.setStyleSheet(
+            "QProgressBar { background: #1A2333; border: none; border-radius: 3px; }"
+            f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+        )
+        layout.addLayout(head)
+        layout.addWidget(self._bar)
+
+    def set_value(self, percent: float | None, text: str) -> None:
+        if percent is None:
+            self._bar.setValue(0)
+        else:
+            self._bar.setValue(max(0, min(100, int(round(percent)))))
+        self._value.setText(text)
+
+    def set_tooltip(self, text: str) -> None:
+        self.setToolTip(text)
+        self._bar.setToolTip(text)
+
+
 class MiniMap(QtWidgets.QGraphicsView):
     """右下角缩略图：共享主场景 + 视口矩形指示。"""
 
@@ -154,7 +199,7 @@ FIELD_LABELS: dict[str, str] = {
     "duckdb_threads": "时序线程数", "engines_enabled": "引擎开关",
     # 模型
     "dense_dim": "向量维度", "embedding_model": "Embedding 模型", "reranker_model": "精排模型",
-    "llm_model": "本地 LLM 文件", "llm_gguf_dir": "模型目录", "use_cuda": "启用 CUDA",
+    "llm_gguf_file": "本地 LLM 文件", "llm_gguf_dir": "模型目录", "use_cuda": "启用 CUDA",
     "llm_gpu_layers": "GPU 层数 (-1=全部)", "onnx_providers": "ONNX 提供方",
     "merge_enabled": "写入时语义合并裁决", "merge_candidate_limit": "裁决候选条数",
     "cluster_summary_enabled": "聚簇主题摘要", "cluster_min_members": "聚簇最少成员",
@@ -187,6 +232,7 @@ FIELD_LABELS: dict[str, str] = {
     "segment_max_bytes": "事件段滚动阈值", "snapshot_monthly": "月度快照", "schema_version": "架构版本",
     "use_age_encrypt": "事件 age 加密", "remote_name": "远端名", "device_id": "设备标识",
     "mcp_host": "MCP 地址", "mcp_port": "MCP 端口", "http_host": "HTTP 地址", "http_port": "HTTP 端口",
+    "autostart_http": "启动即开 HTTP（MCP 桥接）",
     "default_rate_limit": "默认限速 (/min)", "registry_enabled": "启用注册中心",
     # 外观
     "drift_jitter": "节点漂移强度", "spontaneous_pulse_interval_ms": "自发脉冲间隔 (ms)", "neuron_fire_probability": "自发放电概率", "timer_interval_ms": "帧间隔 (ms)", "max_labels": "同屏标签数", "stardust_count": "星尘数量",
@@ -213,7 +259,8 @@ FIELD_HINTS: dict[str, str] = {
     "dense_dim": "向量维度，必须与 embedding 模型匹配；修改需重建向量库。",
     "embedding_model": "语义编码模型（BGE-M3），决定「听懂意思」的能力。",
     "reranker_model": "二阶段精排模型，对召回结果排序。",
-    "llm_model": "本地小模型文件名（GGUF），用于结构化抽取与总结。",
+    "llm_gguf_file": "本地小模型文件名（GGUF），用于结构化抽取与总结。",
+    "llm_model": "云端对话模型名（如 deepseek-chat）；本地 LLM 通道请留空。",
     "llm_gguf_dir": "本地模型文件所在目录。",
     "use_cuda": "有 NVIDIA 显卡才勾选；核显 / 无独显保持关闭。",
     "llm_gpu_layers": "本地 LLM 放上显卡的层数：-1=全部，0=完全用 CPU。",
@@ -282,6 +329,8 @@ FIELD_HINTS: dict[str, str] = {
     "mcp_port": "MCP 工具接口端口。",
     "http_host": "HTTP 接口默认监听地址（「接口与端口」页可临时改）。",
     "http_port": "HTTP 接口默认端口（「接口与端口」页可临时改）。",
+    "autostart_http": "启动时自动开 HTTP 适配器：MCP stdio 进程靠它转发请求"
+                      "（Kùzu 一个库只允许一个进程打开，多个 Agent 必须共用这一个内核）。",
     "default_rate_limit": "每个 agent 每分钟默认请求上限（防滥用）。",
     "registry_enabled": "关闭后不做令牌校验，仅限本机调试，绝不建议对外开服务时关闭。",
     # 星云
@@ -319,20 +368,33 @@ class ConfigEditor(QtWidgets.QWidget):
 
     def __init__(
         self,
-        sections: Sequence[tuple[str, BaseModel]],
+        sections: Sequence[tuple[str, BaseModel]] | Sequence[tuple[str, str, BaseModel]],
         *,
         excludes: dict[str, set[str]] | None = None,
         advanced: dict[str, set[str]] | None = None,
     ) -> None:
-        """advanced：每组里默认折叠的「高级参数」字段名集合，卡片底部有展开开关。"""
+        """sections 支持两种写法：
+
+        - `(标题, 子模型)`：标题同时当配置键（占位/测试用）；
+        - `(标题, 配置键, 子模型)`：**生产代码必须用这个**。
+          卡片标题是给人看的（「存储引擎」），而落盘补丁的键必须是 pydantic 的字段名
+          （`storage`），否则 `apply_overrides` 找不到 section，界面「保存」看起来成功但什么都没改。
+
+        advanced：每组里默认折叠的「高级参数」字段名集合，卡片底部有展开开关。
+        """
         super().__init__()
-        self._bindings: list[tuple[str, str, Any]] = []  # (section, field, getter)
+        self._bindings: list[tuple[str, str, Any]] = []  # (section_key, field, getter)
         excludes = excludes or {}
         advanced = advanced or {}
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        for title, model in sections:
+        for entry in sections:
+            if len(entry) == 3:
+                title, section_key, model = entry
+            else:
+                title, model = entry
+                section_key = title
             card = Card(title)
             form = QtWidgets.QFormLayout()
             form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
@@ -355,13 +417,13 @@ class ConfigEditor(QtWidgets.QWidget):
                     continue
                 widget, getter = self._build_editor(hints.get(name, str), getattr(model, name), name)
                 hint = FIELD_HINTS.get(name, "")
-                key = f"{title}.{name}"
+                key = f"{section_key}.{name}"
                 label = QtWidgets.QLabel(FIELD_LABELS.get(name, name))
                 label.setToolTip(f"{hint}\n\n参数名：{key}" if hint else key)
                 widget.setToolTip(hint)
                 target = adv_form if name in adv_fields and adv_form is not None else form
                 target.addRow(label, widget)
-                self._bindings.append((title, name, getter))
+                self._bindings.append((section_key, name, getter))
             card.body.addLayout(form)
             if toggle is not None and adv_form is not None:
                 assert adv_form.parentWidget() is not None

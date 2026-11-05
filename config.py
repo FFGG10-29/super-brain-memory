@@ -5,18 +5,35 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import socket
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 项目根（my_brain_backend/ 的父目录，用于定位 data/ 与仓库）
-PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+from core.runtime_paths import data_dir, env_file, is_frozen, models_dir, project_root, resource_root
+
+# 开发态=项目根；冻结态=exe 目录。DATA_DIR 在冻结态指向用户可写目录，
+# 绝不写进 Program Files 或 _MEI 临时目录（无权限 / 退出即丢）。
+PROJECT_ROOT = project_root()
+RESOURCE_ROOT = resource_root()
+DATA_DIR = data_dir()
+
+# 嵌套配置（ModelConfig / SyncConfig / GatewayConfig ...）各用 MODEL_ / SYNC_ / GW_
+# 前缀读环境变量，但 pydantic-settings 的 env_file 只作用于 BrainConfig 自身字段。
+# 把 .env 注入 os.environ，这些子模型才能真正读到 .env 里的配置；已有环境变量优先。
+load_dotenv(env_file(), override=False)
+
+# 打包发行版不依赖外部 .env：默认就让三通道尝试上 GPU。
+# 驱动过旧或 CUDA 运行库缺失时，由 cuda_runtime / provider 解析静默回落 CPU，
+# 不会拒绝启动（老机器仍可用，只是慢）。
+if is_frozen():
+    os.environ.setdefault("MODEL_USE_CUDA", "true")
+    os.environ.setdefault("MODEL_LLM_GPU_LAYERS", "-1")
 
 
 def _default_device_id() -> str:
@@ -61,10 +78,11 @@ class ModelConfig(BaseSettings):
     dense_dim: int = 1024                                # BGE-M3 稠密维度
     embedding_model: str = "BAAI/bge-m3"                 # 稠密+稀疏
     reranker_model: str = "BAAI/bge-reranker-v2-m3"      # 交叉编码精排
-    llm_model: str = "qwen3-0.6b-q8_0.gguf"             # 严格 JSON 抽取/总结
-    llm_gguf_dir: Path = DATA_DIR / "models"
+    llm_gguf_file: str = "qwen3-0.6b-q8_0.gguf"         # 本地 GGUF 文件名（严格 JSON 抽取/总结）
+    llm_gguf_dir: Path = models_dir()
     use_cuda: bool = False                               # CUDA→CPU 自动降级
     llm_gpu_layers: int = -1                             # n_gpu_layers 递减降级
+    llm_max_tokens: int = 512                            # 单次 JSON 抽取生成上限，防止 thinking 失控
     onnx_providers: list[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
     # 模型来源：local=全本地；cloud=云端 OpenAI 兼容 API（未配齐自动退本地）；auto=本地有模型文件用本地，否则云
     # 每条通道独立选择本地 / 云端（OpenAI 兼容），地址与 key 各自独立
@@ -174,11 +192,12 @@ class GatewayConfig(BaseSettings):
     """接入平面：MCP + HTTP 适配器 + 注册中心。"""
     model_config = SettingsConfigDict(env_prefix="GW_")
 
-    mcp_host: str = "0.0.0.0"
+    mcp_host: str = "127.0.0.1"
     mcp_port: int = 8765
     mcp_token_secret: str = Field(default="", repr=False)  # 令牌签发密钥
-    http_host: str = "0.0.0.0"
+    http_host: str = "127.0.0.1"                         # 默认只听本机：MCP 桥接只在本机转发
     http_port: int = 8766
+    autostart_http: bool = True                          # 启动即开 HTTP，供多 Agent 的 MCP 转接
     default_rate_limit: int = 60                         # 丘脑按 agent 限速(/min)
     registry_enabled: bool = True
 
@@ -197,6 +216,7 @@ class ActivationConfig(BaseSettings):
     """突触激活：相似度阈值与脉冲映射（前端可视化与后端共用一套参数）。"""
     model_config = SettingsConfigDict(env_prefix="ACT_")
 
+    cache_enabled: bool = True                   # 构图/向量缓存落盘（派生、可随时删掉重建）
     similarity_threshold: float = 0.32          # 余弦≥阈值才画"突触线"
     max_nodes: int = 80                          # 星云视图最多节点
     max_edges_per_node: int = 4                  # 每个节点保留的最强连接数
@@ -243,7 +263,8 @@ class UiConfig(BaseSettings):
 
 class BrainConfig(BaseSettings):
     """全局组合根配置。"""
-    model_config = SettingsConfigDict(env_prefix="BRAIN_", env_file=".env")
+    # extra=ignore：.env 里的 MODEL_/SYNC_/GW_ 键由子模型消费，不应被顶层判为多余字段
+    model_config = SettingsConfigDict(env_prefix="BRAIN_", env_file=".env", extra="ignore")
 
     app_name: str = "super-brain"
     log_level: str = "INFO"

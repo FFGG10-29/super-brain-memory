@@ -288,16 +288,57 @@ def test_settings_page_renders_all_groups(backend, desktop_config, qapp):
     store = SettingsStore(desktop_config, keyring_backend=_FakeKeyring(), qsettings=_FakeQSettings())
     page = SettingsPage(backend, store)
     patch = page._editor.collect()
-    for section in ("存储引擎", "召回与精排", "遗忘与强化（FSRS）",
-                    "分层流动", "丘脑准入与去重", "情感阈值（PAD / 冷静期）", "同步参数", "网关",
-                    "星云激活", "外观与动画"):
+    # 键必须是 BrainConfig 的字段名：卡片标题只是给人看的，混进补丁会导致保存静默失效
+    for section in ("storage", "merge", "recall", "plasticity", "tier", "thalamus",
+                    "amygdala", "sync", "gateway", "activation", "ui"):
         assert section in patch, f"缺分组：{section}"
+    assert "存储引擎" not in patch, "UI 标题不能当配置键"
 
     # 高级参数默认折叠，但 collect 仍覆盖全部字段（折叠只影响可见性）
     toggles = page.findChildren(QtWidgets.QCheckBox)
     assert sum(1 for box in toggles if box.text() == "显示高级参数") >= 5
-    assert patch["召回与精排"]["w_rrf"] == backend.config.recall.w_rrf
-    assert patch["遗忘与强化（FSRS）"]["fsrs_decay"] == backend.config.plasticity.fsrs_decay
+    assert patch["recall"]["w_rrf"] == backend.config.recall.w_rrf
+    assert patch["plasticity"]["fsrs_decay"] == backend.config.plasticity.fsrs_decay
+
+
+def test_settings_page_path_edit_really_persists(backend, desktop_config, qapp):
+    """回归：「点浏览选 D 盘目录 → 保存」没反应的 bug（补丁键用成了 UI 标题）。"""
+    store = SettingsStore(desktop_config, keyring_backend=_FakeKeyring(), qsettings=_FakeQSettings())
+    page = SettingsPage(backend, store)
+    moved = desktop_config.storage.sqlite_path.parent / "moved.db"
+
+    patch = page._editor.collect()
+    patch["storage"]["sqlite_path"] = moved
+    result = backend.save_settings_patch(patch)
+
+    assert result["ignored"] == []
+    assert "storage.sqlite_path" in result["changed"]
+    assert backend.config.storage.sqlite_path == moved
+    assert load_overrides()["storage"]["sqlite_path"] == str(moved)
+    assert "storage.sqlite_path" in result["restart_needed"], "改库路径必须提示重启内核"
+
+
+def test_storage_root_switch_migrates_data_and_restarts(backend, tmp_path):
+    """一键换目录：写入配置→关内核→复制六引擎数据→重启，数据跟着过去。"""
+    assert backend.save_memory("迁移前写入的一条记忆")["applied"] is True
+    target = tmp_path / "moved_storage"
+
+    result = backend.set_storage_root(target, migrate=True)
+
+    assert result["ok"] is True, result
+    assert backend.storage_root().resolve() == target.resolve()
+    assert (target / "relational.db").is_file()
+    assert (target / "vector.lance").exists()
+    # 重启后能读到迁移前的记忆
+    assert any("迁移前写入" in str(row["content"]) for row in backend.memories(limit=20))
+    assert str(target) in load_overrides()["storage"]["sqlite_path"]
+
+
+def test_save_reports_unknown_section_instead_of_dropping(backend):
+    result = backend.save_settings_patch({"存储引擎": {"sqlite_busy_timeout_ms": 1000}})
+    assert result["ignored"] == ["存储引擎"]
+    assert "存储引擎" not in load_overrides()
+    assert "无法识别" in str(result["message"])
 
 
 def test_model_page_covers_all_model_fields_and_saves(backend, desktop_config, qapp):

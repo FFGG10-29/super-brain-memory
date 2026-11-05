@@ -171,6 +171,12 @@ class SqliteRelationalDB(RelationalRepository):
                         f"CREATE INDEX IF NOT EXISTS idx_{spec.table}_active "
                         f"ON {spec.table}(is_active, namespace, tier)"
                     )
+                    # query() 恒按 updated_at_ms DESC 排序取最近若干条；没有这个索引时
+                    # 10 万条会全表排序，星云构图的 SQL 部分从 O(log n) 退化成 O(n log n)。
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_{spec.table}_updated "
+                        f"ON {spec.table}(updated_at_ms DESC)"
+                    )
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS outbox("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -339,15 +345,26 @@ class SqliteRelationalDB(RelationalRepository):
         rows = self._pool.get().execute(sql, [*params, int(limit), int(offset)]).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
-    def full_text_search(self, kind: EntityKind, query: str, *, limit: int = 20) -> list[Record]:
+    def full_text_search(
+        self,
+        kind: EntityKind,
+        query: str,
+        *,
+        limit: int = 20,
+        namespaces: Sequence[str] = (),
+    ) -> list[Record]:
         spec = self._spec(kind)
         conn = self._pool.get()
+        scope = ""
+        params: list[object] = []
+        if namespaces:
+            scope = f" AND namespace IN ({', '.join('?' for _ in namespaces)})"
+            params.extend(str(item) for item in namespaces)
         if not spec.fts_field:
             # 无全文列（突触）：退化为 payload 子串匹配，保证接口语义一致
-            like = f"%{query}%"
             rows = conn.execute(
-                f"SELECT payload FROM {spec.table} WHERE payload LIKE ? AND is_active=1 LIMIT ?",
-                (like, int(limit)),
+                f"SELECT payload FROM {spec.table} WHERE payload LIKE ? AND is_active=1{scope} LIMIT ?",
+                [f"%{query}%", *params, int(limit)],
             ).fetchall()
             return [json.loads(row["payload"]) for row in rows]
 
@@ -355,8 +372,8 @@ class SqliteRelationalDB(RelationalRepository):
             rows = conn.execute(
                 f"SELECT t.payload FROM {spec.table}_fts f "
                 f"JOIN {spec.table} t ON t.id = f.id "
-                f"WHERE {spec.table}_fts MATCH ? AND t.is_active=1 LIMIT ?",
-                (query, int(limit)),
+                f"WHERE {spec.table}_fts MATCH ? AND t.is_active=1{scope} LIMIT ?",
+                [query, *params, int(limit)],
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
@@ -366,8 +383,8 @@ class SqliteRelationalDB(RelationalRepository):
         # CJK 兜底：unicode61 对中文按整段切词，两字查询常常命中 0 条 → 对索引列做 LIKE 补搜
         rows = conn.execute(
             f"SELECT t.payload FROM {spec.table}_fts f JOIN {spec.table} t ON t.id = f.id "
-            f"WHERE f.body LIKE ? AND t.is_active=1 LIMIT ?",
-            (f"%{query}%", int(limit)),
+            f"WHERE f.body LIKE ? AND t.is_active=1{scope} LIMIT ?",
+            [f"%{query}%", *params, int(limit)],
         ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 

@@ -122,7 +122,13 @@ def test_nebula_stays_alive_without_retrieval(backend, desktop_config, qapp):
     graph = backend.graph()
     view.set_graph(graph)
     before = {node.node_id: (node.x(), node.y()) for node in view.nodes}
-    for _ in range(40):
+    # 放电节奏 = spontaneous_pulse_interval_ms / timer_interval_ms（默认 1200/16 = 75 帧），
+    # 测试必须按配置推导帧数，写死 40 帧会永远等不到火花。
+    cadence = max(
+        1,
+        desktop_config.ui.spontaneous_pulse_interval_ms // max(1, desktop_config.ui.timer_interval_ms),
+    )
+    for _ in range(cadence + 5):
         view.animate()
     after = {node.node_id: (node.x(), node.y()) for node in view.nodes}
     assert before != after, "漂移微扰下节点必须持续移动"

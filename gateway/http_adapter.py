@@ -12,8 +12,13 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
+import queue
+import secrets
+import threading
 import time
+from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -29,12 +34,72 @@ class HTTPAdapter:
         self._registry = registry
         self._toolkit = toolkit
         self._config = config or get_config()
+        # 本机桥接专用：/mcp/call 用小范围共享密钥认证，再映射到一个服务端注册的 agent。
+        # 不用 registry 签发的令牌——未配 GW_MCP_TOKEN_SECRET 时签名密钥是进程内临时值，
+        # 桌面重启后旧令牌立刻失效，多 Agent 的 stdio 进程会莫名 401。
+        self._bridge_token = secrets.token_urlsafe(24)
+        self._bridge_agent_token: str | None = None
+        # 入口即闸门：所有 Agent 的工具调用先入队，再由**唯一的工作线程**逐个执行。
+        # 六引擎与 ONNX 会话都不是并发安全的；更重要是语义——记忆必须由中枢统一裁决
+        # （丘脑准入、去重、冲突消解），不能被多个请求穿插着直写存储。
+        self._jobs: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(
+            target=self._consume, name="brain-tool-queue", daemon=True
+        )
+        self._worker.start()
+
+    # ── 入口队列（统一由中枢串行处理）──────────────────────────────────────
+    @property
+    def queue_depth(self) -> int:
+        """排队中的请求数（桌面状态栏可显示，便于观察多 Agent 争用）。"""
+        return self._jobs.qsize()
+
+    def _consume(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                self._jobs.task_done()
+                return
+            tool, args, headers, future = job
+            try:
+                future.set_result(self._toolkit.call(tool, args, headers=headers))
+            except BaseException as exc:  # noqa: BLE001  异常必须回传给调用方，不能让请求悬空
+                future.set_exception(exc)
+            finally:
+                self._jobs.task_done()
+
+    # ── 本机桥接 ──────────────────────────────────────────────────────────
+    @property
+    def bridge_token(self) -> str:
+        return self._bridge_token
+
+    def _bridge_credentials(self) -> dict:
+        """桥接调用统一用服务端自己注册的 agent，权限固定 read/write + private 命名空间。"""
+        if self._bridge_agent_token is None:
+            _, token = self._registry.register("mcp-bridge")
+            self._bridge_agent_token = token
+        return {"Authorization": f"Bearer {self._bridge_agent_token}"}
 
     def handle(self, method: str, path: str, *, headers: dict | None = None, body: dict | None = None) -> tuple[int, dict]:
         headers = dict(headers or {})
         body = dict(body or {})
         if method.upper() == "GET" and path.rstrip("/") in ("/health", "/v1/health"):
             return 200, {"status": "ok", "app": self._config.app_name, "ts_ms": int(time.time() * 1000)}
+
+        # 桥接通道先于令牌校验：只认 mcp_bridge.json 里那把密钥（本机文件 + 本机回环）
+        if method.upper() == "POST" and path.rstrip("/") == "/mcp/call":
+            supplied = str(
+                headers.get("X-Super-Brain-Bridge") or headers.get("x-super-brain-bridge") or ""
+            )
+            if not supplied or not hmac.compare_digest(supplied, self._bridge_token):
+                return 401, {"error": "unauthorized", "message": "本机桥接密钥无效"}
+            tool = str(body.get("tool") or "").strip()
+            if not tool:
+                return 400, {"error": "invalid_request", "message": "缺少 tool"}
+            args = body.get("arguments") or {}
+            if not isinstance(args, dict):
+                return 400, {"error": "invalid_request", "message": "arguments 必须是对象"}
+            return 200, self._call_tool(tool, args, headers=self._bridge_credentials())
 
         try:
             self._registry.verify(self._bearer(headers))
@@ -44,19 +109,25 @@ class HTTPAdapter:
         if method.upper() == "POST" and path.rstrip("/") == "/save":
             # 记忆插件常用字段：text / content / memory / query
             content = body.get("content") or body.get("text") or body.get("memory") or ""
-            return 200, self._toolkit.call(
+            return 200, self._call_tool(
                 "save_memory", {"content": content, "namespace": body.get("namespace")}, headers=headers
             )
         if method.upper() == "POST" and path.rstrip("/") == "/search":
             query = body.get("query") or body.get("text") or body.get("content") or ""
-            return 200, self._toolkit.call(
+            return 200, self._call_tool(
                 "recall_memory", {"query": query, "limit": body.get("limit")}, headers=headers
             )
         if method.upper() == "GET" and path.rstrip("/") == "/profile":
-            return 200, self._toolkit.call("profile_read", {}, headers=headers)
+            return 200, self._call_tool("profile_read", {}, headers=headers)
         if method.upper() == "POST" and path.rstrip("/") == "/v1/chat/completions":
             return self._chat_completions(body, headers)
         return 404, {"error": "not_found", "path": path}
+
+    def _call_tool(self, tool: str, args: dict, *, headers: dict) -> dict:
+        """入队并等待结果：并发请求自动排队，中枢按 FIFO 逐条处理。"""
+        future: Future = Future()
+        self._jobs.put((tool, args, headers, future))
+        return future.result(timeout=300)
 
     def _chat_completions(self, body: dict, headers: dict) -> tuple[int, dict]:
         messages = body.get("messages") or []
@@ -65,7 +136,7 @@ class HTTPAdapter:
             if isinstance(message, dict) and message.get("role") == "user":
                 last_user = str(message.get("content", ""))
                 break
-        recalled = self._toolkit.call("recall_memory", {"query": last_user}, headers=headers)
+        recalled = self._call_tool("recall_memory", {"query": last_user}, headers=headers)
         injection = recalled.get("injection", "")
         # 本地无 LLM 时不伪造模型回答：把记忆上下文作为 assistant 内容返回并标注 degraded
         content = injection or "（无相关记忆）"
@@ -130,3 +201,5 @@ class HTTPAdapter:
             server.serve_forever()
         finally:
             server.server_close()
+
+

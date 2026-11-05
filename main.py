@@ -45,6 +45,7 @@ from core.interfaces import (
     TimeSeriesRepository,
     VectorRepository,
 )
+from engine.cuda_runtime import prepare_cuda_dll_path
 from engine.embedding import BgeM3Embedder
 from engine.local_llm import QwenLocalLLM
 from engine.reranker import create_reranker
@@ -72,7 +73,14 @@ from sync.git_worker import GitSyncWorker
 from workers.circadian import Circadian
 from workers.life_loop import LifeLoop
 
-__all__ = ["BrainApp", "StorageSet", "build_app", "build_storage", "self_check"]
+__all__ = [
+    "BrainApp", "StorageSet", "build_app", "build_storage",
+    "gpu_runtime_info", "probe_models", "self_check",
+]
+
+# 冻结态下 CUDA DLL 随包放在 _MEIPASS/cuda_bin；必须在任何 import llama_cpp /
+# onnxruntime 之前登记，否则 LoadLibrary 找不到 cuDNN 子库，会静默回落 CPU。
+prepare_cuda_dll_path()
 
 _PROCESS_START = time.perf_counter()
 
@@ -244,7 +252,7 @@ def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
             dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
         )
 
-    local_llm_path = model.llm_gguf_dir / model.llm_model
+    local_llm_path = model.llm_gguf_dir / model.llm_gguf_file
     llm: LocalLLM
     if model.llm_backend == "cloud":
         if model.llm_base_url and model.llm_model:
@@ -261,11 +269,13 @@ def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
             llm = QwenLocalLLM(
                 model_path=str(local_llm_path) if local_llm_path.exists() else None,
                 gpu_layers=model.llm_gpu_layers,
+                max_tokens=model.llm_max_tokens,
             )
     else:
         llm = QwenLocalLLM(
             model_path=str(local_llm_path) if local_llm_path.exists() else None,
             gpu_layers=model.llm_gpu_layers,
+            max_tokens=model.llm_max_tokens,
         )
 
     reranker = create_reranker(
@@ -427,6 +437,142 @@ def self_check(config: BrainConfig | None = None, *, as_json: bool = False) -> i
     return 0 if not failed else 1
 
 
+def gpu_runtime_info() -> dict[str, Any]:
+    """只读探测：GPU 后端、CUDA 运行库、驱动版本（打包后也能用）。
+
+    任何一项缺失都只记录、不抛；老机器由 provider 解析自动回落 CPU。
+    """
+    from engine.cuda_runtime import cuda_ready, cuda_runtime_status
+
+    status = cuda_runtime_status()
+    info: dict[str, Any] = {
+        "llama_cpp_gpu_build": None,
+        "cuda_driver_api": status["cuda_driver_api"],
+        "cuda_dll_complete": status["dll_complete"],
+        "cuda_driver_sufficient": status["driver_sufficient"],
+        "cuda_dll_dirs": status["dll_dirs"],
+        "cuda_ready": cuda_ready(),
+    }
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+
+        info["llama_cpp_gpu_build"] = bool(llama_supports_gpu_offload())
+    except Exception as exc:  # noqa: BLE001
+        info["llama_cpp_error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+def probe_models(config: BrainConfig | None = None, *, as_json: bool = False) -> int:
+    """主动加载三模型，实测 GPU 是否真的生效（显卡机验收用）。
+
+    self_check 只构造对象：懒加载下 degraded 恒为 False、gpu_layers 是配置值，
+    无法区分「CUDA 生效」与「根本没加载」。本函数触发真实加载并给出判定。
+    """
+    app = build_app(config)
+    runtime = gpu_runtime_info()
+    model_path = app.config.model.llm_gguf_dir / app.config.model.llm_gguf_file
+
+    llm: dict[str, Any] = {
+        "type": type(app.llm).__name__,
+        "model_path": str(model_path),
+        "model_exists": model_path.exists(),
+        "requested_gpu_layers": app.config.model.llm_gpu_layers,
+        **runtime,
+    }
+    loader = getattr(app.llm, "_ensure_loaded", None)
+    try:
+        if callable(loader):
+            loader()
+            llm["load"] = "ok"
+        else:
+            llm["load"] = "skipped: no loader"
+    except Exception as exc:  # noqa: BLE001
+        llm["load"] = f"error: {type(exc).__name__}: {exc}"
+    llm["active_gpu_layers"] = getattr(app.llm, "active_gpu_layers", None)
+    llm["degraded"] = app.llm.degraded
+    llm["on_gpu"] = bool(
+        runtime["llama_cpp_gpu_build"] is True
+        and llm["load"] == "ok"
+        and not llm["degraded"]
+        and llm["active_gpu_layers"] != 0
+    )
+
+    embedder: dict[str, Any] = {"type": type(app.embedder).__name__}
+    embed_loader = getattr(app.embedder, "_ensure_loaded", None)
+    try:
+        if callable(embed_loader):
+            embed_loader()
+            embedder["load"] = "ok"
+        else:
+            embedder["load"] = "skipped: no loader"
+    except Exception as exc:  # noqa: BLE001
+        embedder["load"] = f"error: {type(exc).__name__}: {exc}"
+    embedder["providers"] = list(getattr(app.embedder, "providers", []))
+    embedder["degraded"] = app.embedder.degraded
+    embedder["on_gpu"] = "CUDAExecutionProvider" in embedder["providers"]
+
+    embedder["load_error"] = getattr(app.embedder, "load_error", "")
+    embedder["sparse_enabled"] = bool(getattr(app.embedder, "sparse_enabled", False))
+    embedder["sparse_error"] = getattr(app.embedder, "sparse_error", "")
+    embedder["sparse"] = (
+        "ok: lexical head 已导出并与主模型共用 GPU provider"
+        if embedder["sparse_enabled"]
+        else f"unavailable: {embedder['sparse_error'] or '缺少 sparse_head.onnx'}"
+    )
+
+    reranker: dict[str, Any] = {"type": type(app.reranker).__name__}
+    rerank_loader = getattr(app.reranker, "_ensure_loaded", None)
+    try:
+        if callable(rerank_loader):
+            rerank_loader()
+            reranker["load"] = "ok"
+        else:
+            reranker["load"] = "skipped: no loader"
+    except Exception as exc:  # noqa: BLE001
+        reranker["load"] = f"error: {type(exc).__name__}: {exc}"
+    reranker["providers"] = list(getattr(app.reranker, "providers", []))
+    reranker["degraded"] = app.reranker.degraded
+    reranker["on_gpu"] = "CUDAExecutionProvider" in reranker["providers"]
+    reranker["load_error"] = getattr(app.reranker, "load_error", "")
+
+    all_on_gpu = bool(
+        llm["on_gpu"] and embedder["on_gpu"] and reranker["on_gpu"]
+        and embedder["sparse_enabled"]
+    )
+    if not llm["model_exists"]:
+        verdict = "MODEL_MISSING"
+    elif not llm["on_gpu"]:
+        verdict = "CPU_ONLY" if runtime["llama_cpp_gpu_build"] is not True else "GPU_FELL_BACK_TO_CPU"
+    elif all_on_gpu:
+        verdict = "GPU_OK"
+    else:
+        verdict = "GPU_PARTIAL"
+    hints = {
+        "GPU_OK": "LLM / Embedding / Reranker 全部在 GPU，且 BGE-M3 lexical 稀疏头已生效",
+        "GPU_PARTIAL": "有通道未生效：检查各通道 on_gpu / sparse_enabled 与 load 字段",
+        "MODEL_MISSING": "把 Qwen3 GGUF 放到 model_path 指向的位置",
+        "CPU_ONLY": "llama-cpp-python 是 CPU 构建或驱动过旧：需 CUDA 版 wheel + NVIDIA 驱动 >= 550",
+        "GPU_FELL_BACK_TO_CPU": "已装 CUDA wheel 但加载时降级：检查驱动与 CUDA 运行时版本",
+    }
+    payload = {
+        "verdict": verdict,
+        "hint": hints[verdict],
+        "all_on_gpu": all_on_gpu,
+        "llm": llm,
+        "embedder": embedder,
+        "reranker": reranker,
+    }
+    app.close()
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(f"判定：{verdict} —— {hints[verdict]}")
+        for name, section in (("LLM", llm), ("Embedding", embedder), ("Reranker", reranker)):
+            print(f"  {name}: " + " ".join(f"{k}={v}" for k, v in section.items()))
+    return 0 if verdict == "GPU_OK" else 1
+
+
 def serve_forever(config: BrainConfig | None = None) -> int:
     """一键启动：六引擎 + 认知层 + 网关 + 昼夜调度 + 同步 worker；Ctrl-C 优雅停。"""
     config = config or get_config()
@@ -486,15 +632,18 @@ def serve_forever(config: BrainConfig | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="超级大脑 v2.1 组合根")
     parser.add_argument("--self-check", action="store_true", help="只跑冷启动与六引擎自检后退出")
+    parser.add_argument("--probe-models", action="store_true", help="主动加载三模型，实测 CUDA/GPU 是否生效")
     parser.add_argument("--serve", action="store_true", help="启动网关/调度/同步服务（阻塞）")
-    parser.add_argument("--json", action="store_true", help="自检输出 JSON")
+    parser.add_argument("--json", action="store_true", help="自检/模型探测输出 JSON")
     args = parser.parse_args(argv)
 
+    if args.probe_models:
+        return probe_models(as_json=args.json)
     if args.self_check:
         return self_check(as_json=args.json)
     if args.serve:
         return serve_forever()
-    print("可用命令：python main.py --self-check | python main.py --serve | python scripts/verify_baseline.py")
+    print("可用命令：python main.py --self-check | --probe-models | --serve | python scripts/verify_baseline.py")
     return 0
 
 

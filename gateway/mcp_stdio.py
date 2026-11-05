@@ -1,5 +1,13 @@
 """gateway.mcp_stdio —— 标准 MCP stdio 服务器：外部 Agent（WorkBuddy / CodeBuddy / DSH 等）的接入点。
 
+两种模式（自动选择，无需配置）：
+- **桥接模式**（推荐，桌面开着时）：读到 `%APPDATA%/super-brain/mcp_bridge.json` 就把工具调用
+  转发给正在运行的桌面内核——多个 Agent 同时接入也只操作**同一份记忆、同一个数据库**；
+- **独占模式**（桌面没开）：自己 `build_app()` 打开六引擎。Kùzu 一个库只允许一个进程，
+  所以多个 Agent 不能各自独占，桥接模式就是为此存在。
+
+无论哪种模式，记忆都是**全局共享**的：agent_id 只写审计，不做隔离。
+
 启动：`python -m gateway.mcp_stdio`（阻塞在 stdio，由 MCP 客户端拉起）
 配置到客户端（例如 CodeBuddy / Claude Desktop 的 mcp.json）：
     {
@@ -20,7 +28,10 @@ stdio 是本机信任通道：agent_id 由客户端传入（用于区分 WorkBud
 from __future__ import annotations
 
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 from typing import Any
 
 from mcp.server import Server
@@ -28,6 +39,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from config import get_config
+from core.runtime_paths import local_bridge_path
+from core.structured_log import configure_logging
 from main import build_app
 
 __all__ = ["build_server", "main"]
@@ -42,8 +55,137 @@ def _get_app():
     return _APP
 
 
+# ── 本机桥接：多 Agent 同时接入的唯一可行姿势 ───────────────────────────────
+# Kùzu 一个数据库文件只允许一个进程打开。三个 Agent 各自 spawn 一个 stdio 服务器时，
+# 只有第一个能开库，其余会卡在写锁上。因此：桌面内核（或 `--serve`）持有引擎并开 HTTP，
+# stdio 进程只做协议翻译 + HTTP 转发（/mcp/call）。地址与令牌从用户目录的 mcp_bridge.json 读。
+def bridge_config() -> dict[str, str] | None:
+    url = os.environ.get("SUPER_BRAIN_HTTP") or os.environ.get("SUPER_BRAIN_MCP_BRIDGE")
+    token = os.environ.get("SUPER_BRAIN_TOKEN", "")
+    if url:
+        return {"url": url.rstrip("/"), "token": token}
+    path = local_bridge_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    bridge_url = str(payload.get("url") or "").rstrip("/")
+    if not bridge_url:
+        return None
+    if not _endpoint_alive(bridge_url):
+        # 陈旧文件（上次内核被强杀）不能把 Agent 卡死：探测不通就当没有桥接，退回直连模式
+        return None
+    return {"url": bridge_url, "token": str(payload.get("token") or "")}
+
+
+def _endpoint_alive(url: str) -> bool:
+    from urllib.parse import urlparse
+    import socket
+
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return False
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def _remote_call(bridge: dict[str, str], tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{bridge['url']}/mcp/call",
+        data=json.dumps({"tool": tool, "arguments": args}, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            # 本机桥接密钥：由桌面内核写进 mcp_bridge.json，仅回环可用
+            "X-Super-Brain-Bridge": bridge["token"],
+            "Authorization": f"Bearer {bridge['token']}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        return {"error": f"bridge_http_{exc.code}", "message": detail[:400]}
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {
+            "error": "bridge_unreachable",
+            "message": f"{type(exc).__name__}: {exc}；"
+                       "请确认桌面端「接口与端口」页的 HTTP 服务在运行（或已开自动启动）",
+        }
+
+
 def _json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """直连模式（独占数据库）下的工具实现：桌面没开、也没有可用的 HTTP 桥接时用。"""
+    agent_id = str(arguments.get("agent_id", "mcp-client"))
+    if name == "save_memory":
+        result = app.hippocampus.remember(str(arguments["content"]), agent_id=agent_id)
+        return {
+            "applied": result.applied,
+            "id": result.neuron.uuid7_id,
+            "reason": result.admission.reason,
+            "memory_type": result.neuron.memory_type,
+            "pad": result.neuron.pad.as_tuple(),
+        }
+    if name == "recall_memory":
+        hits = app.prefrontal.recall(
+            str(arguments["query"]), agent_id=agent_id, limit=int(arguments.get("top_k", 5))
+        )
+        return {
+            "hits": [
+                {
+                    "id": hit.neuron.uuid7_id,
+                    "content": hit.neuron.content,
+                    "score": round(hit.score, 4),
+                    "channels": list(hit.channels),
+                    "memory_type": hit.neuron.memory_type,
+                }
+                for hit in hits
+            ]
+        }
+    if name == "timeline_query":
+        rows = app.storage.relational.query(
+            "neuron", active_only=True, limit=int(arguments.get("limit", 20))
+        )
+        since = arguments.get("since_ms")
+        until = arguments.get("until_ms")
+        return {
+            "memories": [
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "valid_from_ms": row.get("valid_from_ms"),
+                    "memory_type": row.get("memory_type"),
+                }
+                for row in rows
+                if (since is None or int(row.get("valid_from_ms") or 0) >= int(since))
+                and (until is None or int(row.get("valid_from_ms") or 0) <= int(until))
+            ]
+        }
+    if name == "profile_read":
+        rows = app.storage.relational.query(
+            "neuron", memory_types=["profile"], active_only=True, limit=50
+        )
+        return {"profiles": [{"id": row["id"], "content": row["content"]} for row in rows]}
+    if name == "conflict_report":
+        rows = app.storage.relational.query("neuron", active_only=False, limit=int(arguments.get("limit", 50)))
+        return {
+            "superseded": [
+                {"id": row["id"], "content": row["content"], "tx_to": row.get("tx_to")}
+                for row in rows
+                if not row.get("is_active", True)
+            ]
+        }
+    if name == "health_check":
+        return {"engines": [status.as_dict() for status in app.health_report()]}
+    return {"error": f"未知工具：{name}"}
 
 
 def build_server() -> Server:
@@ -108,70 +250,12 @@ def build_server() -> Server:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        app = _get_app()
-        agent_id = str(arguments.get("agent_id", "mcp-client"))
-        if name == "save_memory":
-            result = app.hippocampus.remember(str(arguments["content"]), agent_id=agent_id)
-            payload = {
-                "applied": result.applied,
-                "id": result.neuron.uuid7_id,
-                "reason": result.admission.reason,
-                "memory_type": result.neuron.memory_type,
-                "pad": result.neuron.pad.as_tuple(),
-            }
-        elif name == "recall_memory":
-            hits = app.prefrontal.recall(
-                str(arguments["query"]), agent_id=agent_id, limit=int(arguments.get("top_k", 5))
-            )
-            payload = {
-                "hits": [
-                    {
-                        "id": hit.neuron.uuid7_id,
-                        "content": hit.neuron.content,
-                        "score": round(hit.score, 4),
-                        "channels": list(hit.channels),
-                        "memory_type": hit.neuron.memory_type,
-                    }
-                    for hit in hits
-                ]
-            }
-        elif name == "timeline_query":
-            rows = app.storage.relational.query(
-                "neuron", active_only=True, limit=int(arguments.get("limit", 20))
-            )
-            since = arguments.get("since_ms")
-            until = arguments.get("until_ms")
-            payload = {
-                "memories": [
-                    {
-                        "id": row["id"],
-                        "content": row["content"],
-                        "valid_from_ms": row.get("valid_from_ms"),
-                        "memory_type": row.get("memory_type"),
-                    }
-                    for row in rows
-                    if (since is None or int(row.get("valid_from_ms") or 0) >= int(since))
-                    and (until is None or int(row.get("valid_from_ms") or 0) <= int(until))
-                ]
-            }
-        elif name == "profile_read":
-            rows = app.storage.relational.query(
-                "neuron", memory_types=["profile"], active_only=True, limit=50
-            )
-            payload = {"profiles": [{"id": row["id"], "content": row["content"]} for row in rows]}
-        elif name == "conflict_report":
-            rows = app.storage.relational.query("neuron", active_only=False, limit=int(arguments.get("limit", 50)))
-            payload = {
-                "superseded": [
-                    {"id": row["id"], "content": row["content"], "tx_to": row.get("tx_to")}
-                    for row in rows
-                    if not row.get("is_active", True)
-                ]
-            }
-        elif name == "health_check":
-            payload = {"engines": [status.as_dict() for status in app.health_report()]}
+        args = dict(arguments or {})
+        bridge = bridge_config()
+        if bridge is not None:
+            payload = _remote_call(bridge, name, args)
         else:
-            payload = {"error": f"未知工具：{name}"}
+            payload = _dispatch_local(_get_app(), name, args)
         return [TextContent(type="text", text=_json(payload))]
 
     return server
@@ -184,7 +268,23 @@ async def _serve() -> None:
 
 
 def main() -> int:
-    _get_app()  # 冷启动先完成，MCP 客户端 initialize 时引擎已就绪
+    # stdout 是 JSON-RPC 通道：日志必须走 stderr，且要抢在 build_app 的首次 log_event 之前配置
+    configure_logging(get_config().log_level, stream=sys.stderr)
+    bridge = bridge_config()
+    if bridge is None:
+        try:
+            _get_app()  # 冷启动先完成，MCP 客户端 initialize 时引擎已就绪
+        except RuntimeError as exc:  # Kùzu 单写锁：桌面内核正在运行时会撞上
+            print(
+                f"super-brain MCP 启动失败：{exc}\n"
+                "提示：Kùzu 一个库文件只能被一个进程打开。桌面端开着时请用桥接模式——"
+                "先启动桌面应用（「接口与端口」页会自动开 HTTP），本进程会自动读取 "
+                f"{local_bridge_path()} 走转发；或设环境变量 SUPER_BRAIN_HTTP 指向该地址。",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print(f"super-brain MCP 桥接模式 → {bridge['url']}（本进程不独占数据库）", file=sys.stderr)
     import anyio
 
     anyio.run(_serve)

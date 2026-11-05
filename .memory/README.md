@@ -16,4 +16,10 @@
 |---|---|
 | `WORKING_MEMORY.md` | 当前进度、下一步、已知坑（滚动维护） |
 | `DECISIONS.md` | 实现级决策记录（ADR 简版）：选型理由与被否决方案 |
-| `ACCEPTANCE.md` | 七阶段验收标准与实测结论（对着架构 §十一 打勾） |
+| `ACCEPTANCE.md` | 七阶段 + 桌面控制台 + v2.2 用户控制的验收标准与实测结论 |
+| `架构设计总章.md` | 架构基线（v2.1）+ v2.2 实现层补充（§十四） |
+| `EVALUATION.md` | 对标 Mem0/Letta/Zep/腾讯的能力矩阵、差异化与诚实短板 |
+| `LIFECYCLE_TRACE.md` | 记忆全链路案例（MCP 写入 / 用户纠正 / 遗忘 / Core Memory）+ 生产就绪评估 |
+
+维护节奏：**每次改完代码、跑完测试就回来更新**——至少动 `WORKING_MEMORY.md` 的进度与坑；
+新增架构取舍补 `DECISIONS.md`；新增验收项补 `ACCEPTANCE.md`（附用例名，不写"已测"这种无法复核的话）。

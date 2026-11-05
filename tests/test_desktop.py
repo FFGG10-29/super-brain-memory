@@ -189,9 +189,8 @@ def test_render_scene_to_image(backend, nebula, qapp):
 def test_nebula_page_activate_and_minimap(backend, desktop_config, qapp):
     page = NebulaPage(backend, desktop_config)
     assert page.minimap.scene() is page.view.view_scene
-    result = page.activate("发版冲突")
-    assert result["hits"] >= 1
-    assert result["pulses"] >= 1
+    page.activate("发版冲突")
+    backend.tasks.flush()   # 召回在后台线程，等结果回调派发完再断言
     assert page.view.pulse_count() >= 1
     assert "命中" in page._hits.text()
 
@@ -209,7 +208,9 @@ def test_spaces_filter_emotion_only(qapp):
 
 def test_main_window_pages_and_status(backend, store, desktop_config, qapp):
     window = MainWindow(backend, store, desktop_config)
-    assert window._nav.count() == 10
+    assert window._nav.count() == 11
+    window._nav.setCurrentRow(10)
+    assert window.timeline_page is window._stack.currentWidget()
     assert "引擎" in window._status_label.text()
     assert window._space.count() >= 3, "空间下拉必须包含 全部/分层/情感记忆"
 
@@ -233,18 +234,25 @@ def test_memory_page_filter_detail_and_write(backend, qapp):
     assert 0 < page._table.rowCount() <= 4
     page._table.selectRow(0)
     assert page._selected_id()
-    assert "PAD" in page._detail.toPlainText()
+    inspector = page._detail
+    assert inspector._title.text()                         # 检查器已载入该条记忆
+    assert "PAD" in inspector._fields_text.toPlainText()   # 原始字段仍可就地查看
+    assert "置信度" in inspector._confidence._label.text() # 文字化置信度（不只靠颜色）
+    assert inspector._evidence.count() >= 4               # 来源/新鲜度/使用/证据四维 badge
 
     page._search.clear()
     page._new_memory.setText("新增一条用于界面写入验证的记忆")
     page._save()
+    backend.tasks.flush()
     assert "写入成功" in page._status.text()
 
 
 def test_recall_page_renders_channels(backend, qapp):
     page = RecallPage(backend)
     page._query.setText("发版冲突")
-    view = page.run_recall()
+    page.run_recall()
+    backend.tasks.flush()
+    view = page._view
     assert view.hits
     assert page._table.rowCount() == len(view.hits)
     assert "命中" in page._status.text()
@@ -302,6 +310,9 @@ def test_settings_page_applies_appearance(backend, store, qapp):
         "ui": {"timer_interval_ms": 33, "max_labels": 5},
         "activation": {"similarity_threshold": 0.45},
     })
+    # 表单是「当前值」的唯一真源：先让表单跟上新配置，再点保存，
+    # 否则会把构造时的旧值又写回去（这是真实行为，不是 bug）。
+    page._reload_editor()
     page.save()
     assert backend.config.ui.timer_interval_ms == 33
     assert backend.config.activation.similarity_threshold == pytest.approx(0.45)

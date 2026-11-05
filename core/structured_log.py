@@ -17,12 +17,24 @@ __all__ = ["configure_logging", "log_event"]
 _CONFIGURED = False
 
 
-def configure_logging(level: str = "INFO", *, json_output: bool = True) -> None:
+def configure_logging(level: str = "INFO", *, json_output: bool = True, stream=None) -> None:
+    """初始化结构化日志。
+
+    stream 默认 stdout；**MCP stdio 服务器必须传 sys.stderr**——stdout 是 JSON-RPC 通道，
+    混进一行日志就会让客户端解析失败（表现为「工具调用无响应」）。
+    先调用的那次生效（_CONFIGURED 锁），所以 stdio 入口要在 build_app 之前调。
+    """
     global _CONFIGURED
     if _CONFIGURED:
         return
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), stream=sys.stdout)
+    target = stream or sys.stdout
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO), stream=target
+    )
     structlog.configure(
+        # structlog 默认 PrintLoggerFactory 直接写 stdout，绕开 logging 的 stream 设置；
+        # 不显式绑定 file=target，stdio 模式下 JSON 日志会插进 JSON-RPC 通道。
+        logger_factory=structlog.PrintLoggerFactory(file=target),
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,

@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import shutil
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from pathlib import Path
@@ -17,10 +20,12 @@ from brain.activation import ActivationGraph, ActivationService
 from brain.cloud_models import load_cloud_api_key
 from brain.memory_browser import MemoryBrowser
 from config import BrainConfig, get_config
+from core.ids import new_uuid7
+from core.runtime_paths import clear_local_bridge, write_local_bridge
 from gateway.http_adapter import HTTPAdapter
 from gateway.mcp_server import MCPToolkit
 from gateway.registry import AgentRegistry
-from main import build_app
+from main import build_app, gpu_runtime_info
 from sync.git_worker import GitSyncWorker
 from sync.projections import EventProjector
 from sync.snapshot import SnapshotManager
@@ -35,6 +40,15 @@ from ui.desktop.user_config import (
 )
 
 __all__ = ["DesktopBackend", "HttpState", "RecallView"]
+
+_CORE_BLOCKS = ("human", "persona", "preferences", "constraints")
+_SECTORS = (
+    ("情景 episodic", ("scenario",), "#6EC6FF"),
+    ("语义 semantic", ("fact",), "#3DDC97"),
+    ("程序 procedural", ("code",), "#B08CFF"),
+    ("情绪 emotional", ("emotion",), "#FF6B9D"),
+    ("画像 profile", ("profile",), "#FFB84D"),
+)
 
 
 def _parse_memory_file(path: Path) -> list[str]:
@@ -96,6 +110,7 @@ class RecallView:
     activations: list[tuple[str, float]] = field(default_factory=list)
     injection: str = ""
     degraded: bool = False
+    audit: dict[str, Any] = field(default_factory=dict)   # 六路通道 / 注入 / 权重解释
 
 
 @dataclass
@@ -120,8 +135,10 @@ class DesktopBackend:
         self._http_thread: threading.Thread | None = None
         self._http_state = HttpState()
         self._sync_worker: GitSyncWorker | None = None
+        self._memory_editor = None
         self._applied_overrides: list[str] = []
         self._keyring = default_keyring()
+        self._tasks = None  # 惰性创建，避免非 GUI 场景依赖 Qt 信号
         if auto_start:
             self.start()
 
@@ -161,6 +178,108 @@ class DesktopBackend:
             return {"ok": False, "message": f"内核重启失败：{type(exc).__name__}: {exc}"}
         return {"ok": True, "message": f"内核已按新配置重启（应用 {len(self.applied_overrides)} 项改动）"}
 
+    # ── 存储位置（换盘 / 迁移）────────────────────────────────────────────
+    def storage_root(self) -> Path:
+        return Path(self._config.storage.sqlite_path).parent
+
+    def _storage_targets(self, root: Path) -> dict[str, Path]:
+        return {
+            "sqlite_path": root / "relational.db",
+            "lancedb_path": root / "vector.lance",
+            "kuzu_path": root / "graph.kuzu",
+            "lmdb_path": root / "kv.lmdb",
+            "duckdb_path": root / "timeseries.db",
+        }
+
+    def set_storage_root(self, target_dir: str | Path, *, migrate: bool = True) -> dict[str, object]:
+        """一键把整个数据目录搬到新位置（可连带复制现有数据），并立即重启内核。
+
+        为什么单独做：存储路径是**启动期参数**，改完必须重启才生效；而且换库不会自动搬数据。
+        界面上散落在「存储引擎」卡片里的五个路径很容易让人以为「点保存就换好了」，
+        这里把「改路径 + 关内核 + 拷数据 + 重启 + 回读」合成一次点击。
+        """
+        target = Path(target_dir).expanduser()
+        current_root = self.storage_root()
+        try:
+            target = target.resolve()
+            current_root_resolved = current_root.resolve()
+        except OSError as exc:
+            return {"ok": False, "message": f"路径无效：{exc}"}
+        if target == current_root_resolved:
+            return {"ok": False, "message": f"目录未变化：{target}"}
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"ok": False, "message": f"目标目录不可写：{exc}"}
+
+        old_sync = Path(self._config.sync.local_repo_dir)
+        # 旧路径必须取运行时配置（历史库可能叫 r.db / v.lance，不能按新命名猜）
+        old_paths = {
+            "sqlite_path": Path(self._config.storage.sqlite_path),
+            "lancedb_path": Path(self._config.storage.lancedb_path),
+            "kuzu_path": Path(self._config.storage.kuzu_path),
+            "lmdb_path": Path(self._config.storage.lmdb_path),
+            "duckdb_path": Path(self._config.storage.duckdb_path),
+        }
+        new_paths = self._storage_targets(target)
+        new_sync = target / "brain-sync"
+        # 按「旧文件 → 新目录下的规范文件名」成对迁移：老库可能叫 r.db，新目录统一叫 relational.db
+        pairs = [(old_paths[name], new_paths[name]) for name in new_paths]
+        pairs.append((old_sync, new_sync))
+
+        # 先关内核：Kùzu / DuckDB / LMDB 都有写锁，开着拷会得到半截文件
+        self.close()
+        self._gateway = None
+        self._sync_worker = None
+
+        copied: list[str] = []
+        try:
+            if migrate:
+                for source, destination in pairs:
+                    source = Path(source)
+                    if not source.exists():
+                        continue
+                    if source.is_dir():
+                        shutil.copytree(source, destination, dirs_exist_ok=True)
+                    else:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, destination)
+                        for suffix in ("-wal", "-shm"):
+                            sidecar = source.with_name(source.name + suffix)
+                            if sidecar.exists():
+                                shutil.copy2(sidecar, destination.with_name(destination.name + suffix))
+                    copied.append(source.name)
+            save_overrides({
+                "storage": {name: str(path) for name, path in new_paths.items()},
+                "sync": {"local_repo_dir": str(new_sync)},
+            })
+            apply_overrides(self._config, load_overrides())
+            self.start()
+        except Exception as exc:  # noqa: BLE001  迁移失败要回滚并重开旧库，不能把用户留在无内核状态
+            save_overrides({
+                "storage": {name: str(path) for name, path in self._storage_targets(current_root).items()},
+                "sync": {"local_repo_dir": str(old_sync)},
+            })
+            apply_overrides(self._config, load_overrides())
+            try:
+                self.start()
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "ok": False,
+                "message": f"迁移失败并已回滚到原目录：{type(exc).__name__}: {exc}",
+            }
+        detail = (
+            f"已复制 {len(copied)} 项数据到新目录" if migrate and copied
+            else "未迁移旧数据（新目录是空库）"
+        )
+        return {
+            "ok": True,
+            "root": str(target),
+            "copied": copied,
+            "message": f"存储目录已切换到 {target}；{detail}；内核已重启",
+        }
+
     @property
     def applied_overrides(self) -> list[str]:
         return list(self._applied_overrides)
@@ -172,6 +291,15 @@ class DesktopBackend:
     @property
     def config(self) -> BrainConfig:
         return self._config
+
+    @property
+    def tasks(self):
+        """重操作任务队列（GUI 页面用；非 GUI 场景不会触碰）。"""
+        if self._tasks is None:
+            from ui.desktop.async_backend import AsyncBackend
+
+            self._tasks = AsyncBackend()
+        return self._tasks
 
     # ── 星云数据 ──────────────────────────────────────────────────────────
     def spaces(self) -> list[str]:
@@ -215,15 +343,283 @@ class DesktopBackend:
         row = self._browser.get(memory_id)
         return self._browser.detail(row) if row is not None else "记忆不存在或已被封存"
 
+    def memory_inspect(self, memory_id: str) -> dict[str, Any]:
+        """记忆检查器：来源 / 置信度证据 / 双时态 / 使用历史 / 关联。
+
+        借鉴业界「让人能信任的记忆」交互模式：区分记录与推断、用文字而非
+        纯颜色表达置信度、显式标记陈旧记忆、把历史与纠正入口放在记忆旁边。
+        全部基于主库已有字段整形，不引入新存储，也不伪造精确概率。
+        """
+        self.start()
+        assert self._browser is not None
+        row = self._browser.get(memory_id)
+        if row is None:
+            return {}
+        now_ms = int(time.time() * 1000)
+        last_recall = int(row.get("last_recall_ms") or 0)
+        anchor = last_recall or int(row.get("valid_from_ms") or row.get("created_at_ms") or 0)
+        age_days = max(0.0, (now_ms - anchor) / 86_400_000.0) if anchor else 0.0
+        recall_count = int(row.get("recall_count") or 0)
+        confidence = float(row.get("confidence") or 0.0)
+        strength = float(row.get("strength") or 0.0)
+        stability = float(row.get("stability") or 0.0)
+        provenance = 1.0 if (row.get("agent_id") or row.get("device_id")) else 0.4
+        freshness = math.exp(-age_days / 30.0)
+        usage = 1.0 - math.exp(-recall_count / 5.0)
+        evidence = min(1.0, 0.5 * confidence + 0.25 * strength + 0.25 * stability)
+        overall = 0.30 * provenance + 0.25 * freshness + 0.20 * usage + 0.25 * evidence
+        names = {str(item["id"]): str(item["content"]) for item in self._browser.list(limit=500)}
+        related = [
+            {"id": str(rid), "content": names.get(str(rid), str(rid)), "weight": round(float(weight), 3)}
+            for rid, weight in self.related(memory_id)
+        ]
+        return {
+            **row,
+            "age_days": round(age_days, 1),
+            "stale": bool(age_days > 30 and row.get("is_active", True)),
+            "confidence_breakdown": {
+                "provenance": round(provenance, 3),
+                "freshness": round(freshness, 3),
+                "usage": round(usage, 3),
+                "evidence": round(evidence, 3),
+                "overall": round(overall, 3),
+            },
+            "related": related,
+            "detail_text": self._browser.detail(row),
+            "audit": self._editor.history(memory_id),
+            "sensitive": str(memory_id) in set(self.sensitive_ids()),
+        }
+
+    # ── 用户控制闭环 ──────────────────────────────────────────────────────
+    @property
+    def _editor(self):
+        if self._app is None:
+            self.start()
+        if self._memory_editor is None:
+            from brain.memory_editor import MemoryEditor
+
+            self._memory_editor = MemoryEditor(app=self._app)
+        return self._memory_editor
+
+    def correct_memory(
+        self, memory_id: str, changes: dict[str, Any], *, reason: str = "", actor: str = "user"
+    ) -> dict[str, Any]:
+        result = self._editor.correct(memory_id, changes=changes, actor=actor, reason=reason)
+        if result.get("ok") and self._activation is not None:
+            self._activation.invalidate()
+        return result
+
+    def forget_memory(
+        self, memory_id: str, *, reason: str = "", action: str = "forget"
+    ) -> dict[str, Any]:
+        result = self._editor.forget(memory_id, reason=reason, action=action)
+        if result.get("ok") and self._activation is not None:
+            self._activation.invalidate()
+        return result
+
+    def memory_audit(self, memory_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """该记忆的创建 / 纠正 / 封存轨迹（来自 append-only journal）。"""
+        return self._editor.history(memory_id, limit=limit)
+
+    # ── 事件时间轴 ────────────────────────────────────────────────────────
+    @staticmethod
+    def _event_summary(kind: str, payload: dict[str, Any]) -> str:
+        neuron = payload.get("neuron") or {}
+        text = str(neuron.get("content") or payload.get("reason") or "")
+        if kind == "supersede":
+            return f"纠正 {payload.get('old_id', '')[:8]} → {payload.get('new_id', '')[:8]}（{', '.join(payload.get('changed') or [])}）"
+        if kind == "tombstone":
+            return f"遗忘 / 封存 {str(payload.get('neuron_id') or '')[:8]}：{payload.get('reason') or '—'}"
+        if kind == "tier_change":
+            return f"分层变更 → {payload.get('to') or '—'}"
+        return text[:80] or kind
+
+    def event_timeline(self, *, types: Sequence[str] = (), limit: int = 200) -> list[dict[str, Any]]:
+        """事件视角的时间轴：HLC 全序 + 类型筛选（不是记忆 valid_from 视角）。"""
+        self.start()
+        assert self._app is not None
+        try:
+            events = list(self._app.event_store.scan(include_self=True))
+        except Exception:  # noqa: BLE001  事件库未就绪时给空列表，不炸 UI
+            events = []
+        wanted = set(types)
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            kind = str(event.get("type") or "")
+            if wanted and kind not in wanted:
+                continue
+            payload = dict(event.get("payload") or {})
+            hlc = str(event.get("hlc") or "")
+            try:
+                ts_ms = int(hlc.split(":")[0])
+            except (ValueError, IndexError):
+                ts_ms = 0
+            neuron = payload.get("neuron") or {}
+            rows.append({
+                "event_id": str(event.get("event_id") or ""),
+                "type": kind,
+                "hlc": hlc,
+                "ts_ms": ts_ms,
+                "device_id": str(event.get("device_id") or ""),
+                "agent_id": str(event.get("agent_id") or ""),
+                "memory_id": str(
+                    neuron.get("id") or payload.get("neuron_id")
+                    or payload.get("new_id") or payload.get("old_id") or ""
+                ),
+                "actor": str(payload.get("actor") or event.get("agent_id") or ""),
+                "reason": str(payload.get("reason") or ""),
+                "summary": self._event_summary(kind, payload),
+            })
+
+        # journal 只记「跨设备值得同步」的事件（缓冲层不同步）。为了让时间轴
+        # 不空白，用主库与 access_log 补齐本地事件，并显式标注来源，不伪造成 journal。
+        known_ingest = {item["memory_id"] for item in rows if item["type"] == "ingest"}
+        if not wanted or "ingest" in wanted:
+            assert self._browser is not None
+            for record in self._browser.list(limit=int(limit)):
+                memory_id = str(record.get("id") or "")
+                if not memory_id or memory_id in known_ingest:
+                    continue
+                rows.append({
+                    "event_id": "", "type": "ingest", "hlc": "",
+                    "ts_ms": int(record.get("valid_from_ms") or 0),
+                    "device_id": "", "agent_id": "", "memory_id": memory_id,
+                    "actor": "", "reason": "",
+                    "summary": f"{str(record.get('content') or '')[:60]}（缓冲层 · 本地事件）",
+                })
+        if not wanted or "recall" in wanted:
+            try:
+                logs = self._app.storage.timeseries.query(
+                    "SELECT ts_ms, agent_id, query, hits, latency_ms FROM access_log "
+                    "ORDER BY ts_ms DESC LIMIT ?",
+                    [int(limit)],
+                )
+            except Exception:  # noqa: BLE001
+                logs = []
+            for log in logs:
+                rows.append({
+                    "event_id": "", "type": "recall", "hlc": "",
+                    "ts_ms": int(log.get("ts_ms") or 0),
+                    "device_id": "", "agent_id": str(log.get("agent_id") or ""),
+                    "memory_id": "", "actor": str(log.get("agent_id") or ""), "reason": "",
+                    "summary": (
+                        f"召回「{str(log.get('query') or '')[:24]}」命中 {log.get('hits')} 条"
+                        f" · {log.get('latency_ms')} ms"
+                    ),
+                })
+        rows.sort(key=lambda item: item["ts_ms"], reverse=True)
+        return rows[: int(limit)]
+
+    def event_types(self) -> list[str]:
+        return ["ingest", "supersede", "reinforce", "tier_change", "consolidate", "policy", "tombstone"]
+
+    # ── 敏感记忆 / Core Memory / 命名空间 ────────────────────────────────
+    def sensitive_ids(self) -> list[str]:
+        self.start()
+        assert self._app is not None
+        value = self._app.storage.kv.get_json("sensitive", "ids")
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    def set_sensitive(self, memory_id: str, flag: bool) -> dict[str, Any]:
+        self.start()
+        assert self._app is not None
+        ids = set(self.sensitive_ids())
+        if flag:
+            ids.add(str(memory_id))
+        else:
+            ids.discard(str(memory_id))
+        self._app.storage.kv.put_json("sensitive", "ids", sorted(ids))
+        return {"ok": True, "sensitive": bool(flag), "id": str(memory_id)}
+
+    def core_memory_blocks(self) -> dict[str, str]:
+        """可编辑核心记忆块（对齐 Letta ADE 的 human / persona blocks）。"""
+        self.start()
+        assert self._app is not None
+        value = self._app.storage.kv.get_json("core_memory", "blocks")
+        saved = value if isinstance(value, dict) else {}
+        return {name: str(saved.get(name, "")) for name in _CORE_BLOCKS}
+
+    def save_core_memory(self, block: str, text: str) -> dict[str, Any]:
+        if block not in _CORE_BLOCKS:
+            return {"ok": False, "message": f"未知核心记忆块: {block}"}
+        self.start()
+        assert self._app is not None
+        blocks = self.core_memory_blocks()
+        blocks[block] = str(text)
+        self._app.storage.kv.put_json("core_memory", "blocks", blocks)
+        self._app.journal.append({
+            "event_id": new_uuid7(),
+            "agent_id": "user",
+            "type": "policy",
+            "hlc": self._app.clock.tick().to_token(),
+            "payload": {"bucket": "core_memory", "key": "blocks", "blocks": blocks, "reason": "edit_core_memory"},
+        })
+        return {"ok": True, "block": block}
+
+    def save_core_memory_blocks(self, blocks: dict[str, str]) -> dict[str, Any]:
+        """一次保存全部核心记忆块，只发一条 policy 事件，避免审计噪音。"""
+        self.start()
+        assert self._app is not None
+        merged = self.core_memory_blocks()
+        merged.update({key: str(value) for key, value in blocks.items() if key in _CORE_BLOCKS})
+        self._app.storage.kv.put_json("core_memory", "blocks", merged)
+        self._app.journal.append({
+            "event_id": new_uuid7(),
+            "agent_id": "user",
+            "type": "policy",
+            "hlc": self._app.clock.tick().to_token(),
+            "payload": {"bucket": "core_memory", "key": "blocks", "blocks": merged,
+                        "reason": "edit_core_memory"},
+        })
+        return {"ok": True, "blocks": merged}
+
+    def namespaces(self) -> list[str]:
+        return sorted({str(row.get("namespace") or "private") for row in self.memories(limit=500)})
+
+    def cognitive_sectors(self) -> dict[str, int]:
+        """把五类 memory_type 映射成认知分区，供看板可视化。"""
+        counts = {name: 0 for name, _types, _color in _SECTORS}
+        for row in self.memories(limit=500):
+            kind = str(row.get("memory_type") or "fact")
+            for name, types, _color in _SECTORS:
+                if kind in types:
+                    counts[name] += 1
+                    break
+        return counts
+
+    def recall_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """最近召回审计轨迹（access_log 只写不改），供检查器「查看历史」。"""
+        self.start()
+        assert self._app is not None
+        try:
+            rows = self._app.storage.timeseries.query(
+                "SELECT ts_ms, agent_id, query, hits, latency_ms, ok "
+                "FROM access_log ORDER BY ts_ms DESC LIMIT ?",
+                [int(limit)],
+            )
+        except Exception:  # noqa: BLE001  时序库未启用时静默
+            return []
+        return [dict(row) for row in rows]
+
     # ── 检索 → 光脉冲 ────────────────────────────────────────────────────
-    def recall(self, query: str, *, limit: int | None = None, agent_id: str = "desktop") -> RecallView:
+    def recall(
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        agent_id: str = "desktop",
+        namespaces: Sequence[str] = (),
+    ) -> RecallView:
         self.start()
         assert self._app is not None and self._activation is not None
         if not query.strip():
             return RecallView(query=query)
         graph = self._activation.build()  # 刷新向量缓存，保证新写入的记忆也能被激活
         hits = self._app.prefrontal.recall(
-            query, agent_id=agent_id, limit=limit or self._config.recall.top_k
+            query,
+            agent_id=agent_id,
+            limit=limit or self._config.recall.top_k,
+            namespaces=tuple(namespaces),
         )
         rows: list[dict[str, Any]] = [
             {
@@ -249,12 +645,24 @@ class DesktopBackend:
             )
             for index in range(len(rows))
         ]
+        recall_cfg = self._config.recall
+        audit = dict(getattr(self._app.prefrontal, "last_audit", {}) or {})
+        audit["weights"] = {
+            "rrf": recall_cfg.w_rrf,
+            "freshness": recall_cfg.w_freshness,
+            "synapse": recall_cfg.w_synapse,
+            "pad": recall_cfg.w_pad,
+            "confidence": recall_cfg.w_confidence,
+        }
+        audit["rerank"] = bool(recall_cfg.rerank_enabled)
+        audit["similarities"] = dict(similarities)
         return RecallView(
             query=query,
             hits=rows,
             activations=activations,
             injection=self._app.prefrontal.inject(hits, agent_id=agent_id),
             degraded=graph.degraded,
+            audit=audit,
         )
 
     def related(self, memory_id: str) -> list[tuple[str, float]]:
@@ -273,6 +681,13 @@ class DesktopBackend:
         self.start()
         assert self._app is not None
         result = self._app.hippocampus.remember(content, agent_id=agent_id)
+        if self._activation is not None:
+            self._activation.invalidate()
+            try:
+                # 写入时顺手把增量构图落盘：下次冷启动缓存仍命中，不必加载模型
+                self._activation.build()
+            except Exception:  # noqa: BLE001  构图失败不影响写入结果
+                pass
         return {"applied": result.applied, "id": result.neuron.uuid7_id, "reason": result.admission.reason}
 
     def import_memories(
@@ -318,6 +733,8 @@ class DesktopBackend:
             if progress_cb is not None:
                 progress_cb(index, total)
         stopped = should_stop is not None and should_stop()
+        if self._activation is not None:
+            self._activation.invalidate()
         return {
             "ok": True,
             "parsed": total,
@@ -333,19 +750,45 @@ class DesktopBackend:
 
     # ── 配置中心（打包后免重编译）────────────────────────────────────────
     def model_status(self) -> dict[str, object]:
+        """运行时模型状态：只读取已加载信息，不主动预热（大权重加载会卡住 UI）。"""
         self.start()
         assert self._app is not None
         model = self._config.model
+        app = self._app
+        embed_providers = list(getattr(app.embedder, "providers", []))
+        rerank_providers = list(getattr(app.reranker, "providers", []))
         return {
             "embed_backend": model.embed_backend,
             "llm_backend": model.llm_backend,
+            "use_cuda": model.use_cuda,
+            "runtime": gpu_runtime_info(),
             "embedder": {
-                "kind": type(self._app.embedder).__name__,
-                "dim": self._app.embedder.dense_dim,
-                "degraded": self._app.embedder.degraded,
+                "kind": type(app.embedder).__name__,
+                "dim": app.embedder.dense_dim,
+                "degraded": app.embedder.degraded,
+                "loaded": bool(getattr(app.embedder, "loaded", False)),
+                "providers": embed_providers,
+                "on_gpu": "CUDAExecutionProvider" in embed_providers,
+                "model_file": getattr(app.embedder, "model_file", ""),
+                "load_error": getattr(app.embedder, "load_error", ""),
+                "sparse_enabled": bool(getattr(app.embedder, "sparse_enabled", False)),
+                "sparse_error": getattr(app.embedder, "sparse_error", ""),
             },
-            "reranker": {"kind": type(self._app.reranker).__name__, "degraded": self._app.reranker.degraded},
-            "llm": {"kind": type(self._app.llm).__name__, "degraded": self._app.llm.degraded},
+            "reranker": {
+                "kind": type(app.reranker).__name__,
+                "degraded": app.reranker.degraded,
+                "loaded": bool(getattr(app.reranker, "loaded", False)),
+                "providers": rerank_providers,
+                "on_gpu": "CUDAExecutionProvider" in rerank_providers,
+                "model_file": getattr(app.reranker, "model_file", ""),
+                "load_error": getattr(app.reranker, "load_error", ""),
+            },
+            "llm": {
+                "kind": type(app.llm).__name__,
+                "degraded": app.llm.degraded,
+                "loaded": bool(getattr(app.llm, "loaded", False)),
+                "active_gpu_layers": getattr(app.llm, "active_gpu_layers", None),
+            },
             "embed_ready": bool(model.embed_base_url and model.embed_model),
             "llm_ready": bool(model.llm_base_url and model.llm_model),
             "embed_key_present": bool(load_cloud_api_key(self._config, "embed", keyring_backend=self._keyring)),
@@ -358,21 +801,32 @@ class DesktopBackend:
         存储开关 / 模型模式 / 维度等启动期参数需要重启内核才完全生效，
         返回值里列出这些项，UI 提示用户点「应用并重启内核」。
         """
-        merged = save_overrides(patches)
+        # 补丁的 section 键必须是 BrainConfig 的字段名（storage/model/recall...）。
+        # UI 标题（「存储引擎」）混进来时会静默失效——这里显式报出来，避免「保存了但什么都没变」。
+        unknown = sorted(str(name) for name in patches if not hasattr(self._config, str(name)))
+        merged = save_overrides({k: v for k, v in patches.items() if str(k) not in unknown})
         changed = apply_overrides(self._config, merged)
         restart_needed = [
             name for name in changed
             if name.split(".", 1)[0] in ("storage", "model") or name == "recall.rerank_enabled"
         ]
+        if unknown:
+            message = (
+                f"已保存 {len(changed)} 项；{len(unknown)} 组参数名无法识别已忽略（{', '.join(unknown)}）"
+            )
+        elif restart_needed:
+            message = (
+                f"已保存 {len(changed)} 项；其中 {len(restart_needed)} 项属启动期参数，"
+                "请点「应用并重启内核」"
+            )
+        else:
+            message = f"已保存并即时生效（{len(changed)} 项）"
         return {
             "ok": True,
             "changed": changed,
             "restart_needed": restart_needed,
-            "message": (
-                "已保存并即时生效"
-                if not restart_needed
-                else f"已保存；{len(restart_needed)} 项属启动期参数，请点「应用并重启内核」"
-            ),
+            "ignored": unknown,
+            "message": message,
         }
 
     def reset_settings(self) -> dict[str, object]:
@@ -416,6 +870,9 @@ class DesktopBackend:
 
     # ── 网关：端口配置 + 一键启停 ────────────────────────────────────────
     def gateway_status(self) -> dict[str, Any]:
+        queue_depth = 0
+        if self._gateway is not None:
+            queue_depth = int(getattr(self._gateway[2], "queue_depth", 0) or 0)
         return {
             "running": self._http_state.running,
             "host": self._http_state.host,
@@ -423,6 +880,7 @@ class DesktopBackend:
             "agent_id": self._http_state.agent_id,
             "token_hint": self._http_state.token_hint,
             "error": self._http_state.error,
+            "queue_depth": queue_depth,
             "config_host": self._config.gateway.http_host,
             "config_port": self._config.gateway.http_port,
         }
@@ -441,7 +899,7 @@ class DesktopBackend:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
         thread.start()
         self._http_server, self._http_thread = server, thread
-        agent_id, token = registry.register("desktop-ui")
+        agent_id, token = registry.register("desktop-mcp")
         actual_host, actual_port = server.server_address[0], int(server.server_address[1])
         self._http_state = HttpState(
             running=True, host=str(actual_host), port=actual_port,
@@ -449,6 +907,12 @@ class DesktopBackend:
         )
         self._config.gateway.http_host = host
         self._config.gateway.http_port = int(port)
+        # 桥接密钥用 adapter 自己的（与 registry 令牌解耦：未配 GW_MCP_TOKEN_SECRET 时，
+        # registry 的签名密钥是进程内临时值，重启即失效，不适合给常驻的 stdio 代理用）
+        bridge_token = getattr(adapter, "bridge_token", token)
+        write_local_bridge(
+            host=str(actual_host), port=actual_port, token=str(bridge_token), agent_id=agent_id
+        )
         return {**self.gateway_status(), "ok": True, "message": f"HTTP 适配器已启动 http://{actual_host}:{actual_port}"}
 
     def stop_http(self) -> dict[str, Any]:
@@ -460,7 +924,8 @@ class DesktopBackend:
         if thread is not None:
             thread.join(timeout=2.0)
         self._http_state = HttpState()
-        return {**self.gateway_status(), "ok": True, "message": "HTTP 适配器已停止"}
+        clear_local_bridge()
+        return {**self.gateway_status(), "ok": True, "message": "HTTP 适配器已停止（MCP 桥接同时失效）"}
 
     def _ensure_gateway(self):
         if self._gateway is not None:

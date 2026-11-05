@@ -19,8 +19,17 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from brain.activation import ActivationGraph, ActivationNode
 from config import BrainConfig, get_config
+from core.ids import uuid7_time_ms
 
 __all__ = ["LightPulse", "NebulaView", "NeuronNode"]
+
+
+_TIER_RING = {
+    "core": (60.0, 145.0), "buffer": (145.0, 245.0),
+    "archive": (245.0, 325.0), "percept": (245.0, 325.0),
+}
+_TYPE_SECTOR = {"fact": 0, "profile": 1, "emotion": 2, "scenario": 3, "code": 4}
+_SECTORS = max(len(_TYPE_SECTOR), 1)
 
 
 def _stable_position(node_id: str, center_x: float, center_y: float) -> tuple[float, float]:
@@ -29,6 +38,28 @@ def _stable_position(node_id: str, center_x: float, center_y: float) -> tuple[fl
     seed = int.from_bytes(digest, "big")
     angle = (seed % 10000) / 10000.0 * 2 * math.pi
     radius = 120.0 + (seed >> 16) % 220
+    return center_x + math.cos(angle) * radius, center_y + math.sin(angle) * radius
+
+
+def _semantic_position(node: ActivationNode, center_x: float, center_y: float) -> tuple[float, float]:
+    """语义化布局：环=分层，扇区=记忆类型，扇区内角度=形成时间。
+
+    仍是纯确定性函数（同 id/同元数据 → 同坐标），所以跨设备重放与截图可复现；
+    但相邻的同类、同时期记忆会自然聚成社区，而不是像稳定哈希那样随机散开。
+    """
+    digest = hashlib.blake2b(node.id.encode("utf-8"), digest_size=8).digest()
+    seed = int.from_bytes(digest, "big")
+    lo, hi = _TIER_RING.get(str(node.tier), (120.0, 245.0))
+    radius = lo + (hi - lo) * ((seed % 1000) / 1000.0)
+    base = _TYPE_SECTOR.get(str(node.memory_type), 0) * (2 * math.pi / _SECTORS)
+    try:
+        created_ms = int(uuid7_time_ms(node.id))
+    except (ValueError, TypeError):
+        created_ms = 0
+    # 以 6 小时为周期把时间映射到扇区内，时间相近的记忆角度相近
+    time_frac = ((created_ms // 21_600_000) % 997) / 997.0 if created_ms else 0.5
+    jitter = ((seed >> 20) % 100) / 100.0 * 0.12
+    angle = base + (time_frac * 0.82 + jitter) * (2 * math.pi / _SECTORS)
     return center_x + math.cos(angle) * radius, center_y + math.sin(angle) * radius
 
 
@@ -49,7 +80,14 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
         self.flash_count = 0                  # 累计被激活次数（终点闪烁可观测）
         self._config = config
         self._update_brush()
-        self.setToolTip(f"{node.content}\nPAD{node.pad} / {node.tier}")
+        # Zep 风格：hover 看结构化摘要，点击进记忆检查器
+        pad = node.pad
+        self.setToolTip(
+            f"{node.content}\n"
+            f"类型 {node.memory_type} · 分层 {node.tier} · 置信度 {node.confidence:.2f}\n"
+            f"PAD  P{pad[0]:+.2f} / A{pad[1]:+.2f} / D{pad[2]:+.2f}\n"
+            "点击打开记忆检查器"
+        )
 
         # LivingMemory 风格记忆标签：小字 + 类型前缀，默认隐藏，由视图按优先级点亮
         self.label_item = QtWidgets.QGraphicsSimpleTextItem(self)
@@ -70,6 +108,15 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
         self._ring.setPen(QtGui.QPen(QtGui.QColor(180, 235, 255, 190), 1.2))
         self._ring.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         self._ring.setVisible(False)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """点击节点 → 通知视图打开记忆检查器（Zep Explorer 风格图-详情联动）。"""
+        scene = self.scene()
+        for view in scene.views() if scene is not None else []:
+            signal = getattr(view, "node_selected", None)
+            if signal is not None:
+                signal.emit(self.node_id)
+        super().mousePressEvent(event)
 
     def set_highlighted(self, highlighted: bool) -> None:
         self._ring.setVisible(highlighted)
@@ -99,26 +146,32 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
         self.flash_count += 1
         self._update_brush()
 
-    def update_physics(self, nodes: Sequence["NeuronNode"]) -> None:
+    def update_physics(self, nodes: Sequence["NeuronNode"], *, skip_forces: bool = False) -> None:
         params = self._config.ui
-        center = QtCore.QPointF(params.center_x, params.center_y)
-        self.vx += (center.x() - self.x()) * params.center_pull
-        self.vy += (center.y() - self.y()) * params.center_pull
-        for other in nodes:
-            if other is self:
-                continue
-            dx, dy = self.x() - other.x(), self.y() - other.y()
-            distance = math.sqrt(dx * dx + dy * dy)
-            if 0 < distance < params.repulsion_distance:
-                force = (params.repulsion_distance - distance) * params.repulsion_force
-                self.vx += (dx / distance) * force
-                self.vy += (dy / distance) * force
-        # 微扰漂移：力导向收敛后仍保持缓慢游动，星云永远是活的
-        self.vx += random.uniform(-1.0, 1.0) * params.drift_jitter
-        self.vy += random.uniform(-1.0, 1.0) * params.drift_jitter
+        px, py = self.x(), self.y()
+        if not skip_forces:
+            center = QtCore.QPointF(params.center_x, params.center_y)
+            self.vx += (center.x() - px) * params.center_pull
+            self.vy += (center.y() - py) * params.center_pull
+            radius = params.repulsion_distance
+            radius_sq = radius * radius
+            for other in nodes:
+                if other is self:
+                    continue
+                dx, dy = px - other.x(), py - other.y()
+                dist_sq = dx * dx + dy * dy
+                # 先比平方：绝大多数节点在作用半径外，省掉开方
+                if 0 < dist_sq < radius_sq:
+                    distance = math.sqrt(dist_sq)
+                    force = (radius - distance) * params.repulsion_force / distance
+                    self.vx += dx * force
+                    self.vy += dy * force
+            # 微扰漂移：力导向收敛后仍保持缓慢游动，星云永远是活的
+            self.vx += random.uniform(-1.0, 1.0) * params.drift_jitter
+            self.vy += random.uniform(-1.0, 1.0) * params.drift_jitter
         self.vx *= params.friction
         self.vy *= params.friction
-        self.setPos(self.x() + self.vx, self.y() + self.vy)
+        self.setPos(px + self.vx, py + self.vy)
         # 神经元自发放电：低频微闪烁，模拟静息态电活动
         if random.random() < params.neuron_fire_probability and self.flash_intensity < 0.2:
             self.flash_intensity = max(self.flash_intensity, 0.35)
@@ -163,6 +216,8 @@ class LightPulse(QtWidgets.QGraphicsEllipseItem):
 
 class NebulaView(QtWidgets.QGraphicsView):
     """星云视口：真实记忆节点 + 相似度突触线 + 检索驱动光脉冲。"""
+
+    node_selected = QtCore.Signal(str)
 
     def __init__(self, config: BrainConfig | None = None, *, auto_animate: bool = True) -> None:
         super().__init__()
@@ -227,7 +282,7 @@ class NebulaView(QtWidgets.QGraphicsView):
         self.pulses.clear()
         self._edges = [(edge.source, edge.target, edge.weight, edge.kind) for edge in graph.edges]
         for node in graph.nodes:
-            x, y = _stable_position(node.id, params.center_x, params.center_y)
+            x, y = _semantic_position(node, params.center_x, params.center_y)
             item = NeuronNode(node, x, y, config=self._config)
             self.view_scene.addItem(item)
             self.nodes.append(item)
@@ -367,6 +422,10 @@ class NebulaView(QtWidgets.QGraphicsView):
             line.setPen(
                 QtGui.QPen(QtGui.QColor(150, 225, 255, alpha), 2.5 if kind == "synapse" else 1.8)
             )
+            line.setToolTip(
+                f"{'突触关系' if kind == 'synapse' else '语义相近'} · 权重 {float(weight):.3f}\n"
+                f"{source.node.content[:26]} ↔ {target.node.content[:26]}"
+            )
 
         for key, item in list(self._line_items.items()):
             if key not in wanted:
@@ -375,8 +434,10 @@ class NebulaView(QtWidgets.QGraphicsView):
 
     def animate(self) -> None:
         self._frame += 1
+        # O(n²) 的斥力隔帧计算，奇数帧只按惯性积分：60fps 不变，计算量减半
+        skip_forces = self._frame % 2 == 1
         for node in self.nodes:
-            node.update_physics(self.nodes)
+            node.update_physics(self.nodes, skip_forces=skip_forces)
         self._maybe_spontaneous_pulse()
         self.update_lines()
         for pulse in self.pulses[:]:

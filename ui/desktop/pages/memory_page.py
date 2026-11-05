@@ -6,6 +6,7 @@ import time
 from PySide6 import QtCore, QtWidgets
 
 from ui.desktop.backend import DesktopBackend
+from ui.desktop.inspector import MemoryInspector
 
 __all__ = ["MemoryPage", "MemoryPanel"]
 
@@ -27,8 +28,11 @@ class MemoryPage(QtWidgets.QWidget):
         self._tier.addItem("全部分层")
         self._type = QtWidgets.QComboBox()
         self._type.addItem("全部类型")
+        self._namespace = QtWidgets.QComboBox()
+        self._namespace.addItem("全部命名空间")
         self._tier.currentIndexChanged.connect(self._apply_filter)
         self._type.currentIndexChanged.connect(self._apply_filter)
+        self._namespace.currentIndexChanged.connect(self._apply_filter)
         import_btn = QtWidgets.QPushButton("批量导入")
         import_btn.setToolTip(
             "从文件批量导入记忆（走完整写入流 + 自动去重）：\n"
@@ -42,6 +46,7 @@ class MemoryPage(QtWidgets.QWidget):
         filters.addWidget(self._search, 1)
         filters.addWidget(self._tier)
         filters.addWidget(self._type)
+        filters.addWidget(self._namespace)
         filters.addWidget(import_btn)
         filters.addWidget(refresh)
 
@@ -55,8 +60,11 @@ class MemoryPage(QtWidgets.QWidget):
         self._table.itemSelectionChanged.connect(self._on_select)
         self._table.itemDoubleClicked.connect(self._on_double_click)
 
-        self._detail = QtWidgets.QTextEdit()
-        self._detail.setReadOnly(True)
+        self._detail = MemoryInspector(backend)
+        self._detail.focus_requested.connect(self.focus_requested.emit)
+        self._detail.locate_requested.connect(self.focus_requested.emit)
+        self._detail.changed.connect(self._on_inspector_changed)
+        self._sensitive: set[str] = set()
         copy_id = QtWidgets.QPushButton("复制记忆 ID")
         copy_id.clicked.connect(self._copy_id)
         locate = QtWidgets.QPushButton("在星云中定位")
@@ -70,7 +78,7 @@ class MemoryPage(QtWidgets.QWidget):
         detail_box = QtWidgets.QWidget()
         detail_layout = QtWidgets.QVBoxLayout(detail_box)
         detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.addWidget(QtWidgets.QLabel("记忆详情 · 双时态 / PAD / 可塑性"))
+        detail_layout.addWidget(QtWidgets.QLabel("记忆检查器 · 来源 / 置信度 / 历史"))
         detail_layout.addWidget(self._detail, 1)
         detail_layout.addLayout(detail_actions)
 
@@ -108,29 +116,42 @@ class MemoryPage(QtWidgets.QWidget):
     # ── 数据 ──────────────────────────────────────────────────────────────
     def refresh(self) -> None:
         self._rows = self._backend.memories(limit=500)
+        self._sensitive = set(self._backend.sensitive_ids())
         tiers = sorted({str(row["tier"]) for row in self._rows})
         types = sorted({str(row["memory_type"]) for row in self._rows})
-        self._tier.blockSignals(True)
-        self._type.blockSignals(True)
+        spaces = sorted({str(row.get("namespace") or "private") for row in self._rows})
+        for combo in (self._tier, self._type, self._namespace):
+            combo.blockSignals(True)
         self._tier.clear()
         self._tier.addItem("全部分层")
         self._tier.addItems(tiers)
         self._type.clear()
         self._type.addItem("全部类型")
         self._type.addItems(types)
-        self._tier.blockSignals(False)
-        self._type.blockSignals(False)
+        self._namespace.clear()
+        self._namespace.addItem("全部命名空间")
+        self._namespace.addItems(spaces)
+        for combo in (self._tier, self._type, self._namespace):
+            combo.blockSignals(False)
         self._apply_filter()
+
+    def _on_inspector_changed(self, new_id: str) -> None:
+        """纠正 / 遗忘 / 敏感标记后刷新列表，纠正时自动选中新版本。"""
+        self.refresh()
+        if new_id:
+            self.show_memory(new_id)
 
     def _apply_filter(self) -> None:
         tier = self._tier.currentText()
         memory_type = self._type.currentText()
+        namespace = self._namespace.currentText()
         keyword = self._search.text().strip().lower()
         rows = [
             row
             for row in self._rows
             if (tier == "全部分层" or row["tier"] == tier)
             and (memory_type == "全部类型" or row["memory_type"] == memory_type)
+            and (namespace == "全部命名空间" or str(row.get("namespace") or "private") == namespace)
             and (not keyword or keyword in str(row["content"]).lower())
         ]
         self._fill(rows)
@@ -145,7 +166,8 @@ class MemoryPage(QtWidgets.QWidget):
                 str(row["memory_type"]),
                 str(row["tier"]),
                 f"{float(pad[0]):+.2f} / {float(pad[1]):+.2f} / {float(pad[2]):+.2f}",
-                str(row["content"])[:80],
+                "••••••（敏感记忆已遮蔽）" if str(row["id"]) in self._sensitive
+                else str(row["content"])[:80],
                 f"{float(row.get('confidence') or 0):.2f}",
             )
             for column, text in enumerate(cells):
@@ -166,7 +188,16 @@ class MemoryPage(QtWidgets.QWidget):
     def _on_select(self) -> None:
         memory_id = self._selected_id()
         if memory_id:
-            self._detail.setPlainText(self._backend.memory_detail(memory_id))
+            self._detail.show_memory(memory_id)
+
+    def show_memory(self, memory_id: str) -> None:
+        """供星云节点点击 / 召回结果联动：选中该行并打开检查器。"""
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item and str(item.data(QtCore.Qt.ItemDataRole.UserRole)) == str(memory_id):
+                self._table.selectRow(row)
+                break
+        self._detail.show_memory(memory_id)
 
     def _on_double_click(self, *_args) -> None:
         memory_id = self._selected_id()
@@ -188,8 +219,15 @@ class MemoryPage(QtWidgets.QWidget):
         content = self._new_memory.text().strip()
         if not content:
             return
-        result = self._backend.save_memory(content)
         self._new_memory.clear()
+        self._status.setText("写入中…（丘脑路由 + 向量投影，窗口仍可操作）")
+        self._backend.tasks.submit(
+            lambda: self._backend.save_memory(content),
+            self._on_saved,
+            lambda message: self._status.setText(f"写入失败：{message}"),
+        )
+
+    def _on_saved(self, result: dict) -> None:
         if not result["applied"]:
             self._status.setText(f"被丘脑拒绝：{result['reason']}")
             return

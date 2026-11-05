@@ -222,8 +222,14 @@ class EventProjector(Projector):
 
     def _on_policy(self, payload: dict, event: dict) -> None:
         key = str(payload.get("key", ""))
-        if key:
-            self._kv.put_json("policy", key, payload)
+        if not key:
+            return
+        bucket = str(payload.get("bucket") or "policy")
+        # 核心记忆块是用户可编辑配置，重放时必须写回同一 bucket / 同一结构
+        if bucket == "core_memory":
+            self._kv.put_json(bucket, key, payload.get("blocks") or {})
+        else:
+            self._kv.put_json(bucket, key, payload)
 
     def _on_tombstone(self, payload: dict, event: dict) -> None:
         from core.ids import HLCStamp

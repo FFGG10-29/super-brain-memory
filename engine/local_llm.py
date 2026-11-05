@@ -49,11 +49,13 @@ class QwenLocalLLM(LocalLLM):
         gpu_layers: int = -1,
         context_size: int = 4096,
         temperature: float = 0.0,
+        max_tokens: int = 512,
     ) -> None:
         self._model_path = model_path
         self._gpu_layers = int(gpu_layers)
         self._context_size = int(context_size)
         self._temperature = float(temperature)
+        self._max_tokens = int(max_tokens)
         self._llm: Any = None
         self._degraded = False
         self._active_gpu_layers = int(gpu_layers)
@@ -61,6 +63,10 @@ class QwenLocalLLM(LocalLLM):
     @property
     def degraded(self) -> bool:
         return self._degraded
+
+    @property
+    def loaded(self) -> bool:
+        return self._llm is not None
 
     @property
     def active_gpu_layers(self) -> int:
@@ -111,6 +117,7 @@ class QwenLocalLLM(LocalLLM):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=self._temperature,
+                max_tokens=self._max_tokens,
                 response_format={"type": "json_object"},
             )
             text = completion["choices"][0]["message"]["content"]

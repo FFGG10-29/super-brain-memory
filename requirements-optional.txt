@@ -4,10 +4,46 @@
 #           （或只挑对应阶段那几行单独装）
 
 # 阶段 1/2 算力层：BGE-M3 稠密+稀疏 / 精排 / Qwen3-0.6B GGUF
-# 有 N 卡用 onnxruntime-gpu，纯 CPU 用 onnxruntime；二者只装一个
-# onnxruntime>=1.17
-# onnxruntime-gpu>=1.17
-# llama-cpp-python>=0.2        # Windows 编译需 CMake + MSVC，建议用预编译 wheel
+# 本文件全部是注释：三模型懒加载 + 缺包静默降级，只装 requirements.txt
+# 不会报错，只会一直走「规则抽取 + 无向量投影」。GPU 实测必须按下面额外安装。
+#
+# ── 本地 LLM（Qwen3 GGUF → llama.cpp）────────────────────────────────────
+# CPU（先把本地模型跑通）：
+#   .venv\Scripts\python.exe -m pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python
+# CUDA（显卡机，实测通过：GTX 1060 SM6.1 / 驱动 581.57 / CUDA Driver 13.0）：
+#   0. 驱动 >= 550（nvidia-smi 顶部可见 CUDA Version）；398.27 只有 CUDA 9.2，跑不了。
+#   1. CUDA 12 运行库（ggml-cuda.dll 依赖 cudart64_12 / cublas64_12 / cublasLt64_12）：
+#      .venv\Scripts\python.exe -m pip install --no-cache-dir "nvidia-cuda-runtime-cu12==12.4.127" "nvidia-cublas-cu12==12.4.5.8"
+#      这两个包都有 win_amd64 轮子，无需安装数 GB 的 CUDA Toolkit。
+#   2. CUDA 轮子：.venv\Scripts\python.exe -m pip install --force-reinstall --no-deps data\wheels\llama_cpp_python-0.3.36-py3-none-win_amd64.whl
+#      来源：https://github.com/abetlen/llama-cpp-python/releases/tag/v0.3.36-cu124
+#   3. 把 .venv\Lib\site-packages\nvidia\cuda_runtime\bin\*.dll 与
+#      .venv\Lib\site-packages\nvidia\cublas\bin\*.dll 复制到
+#      .venv\Lib\site-packages\llama_cpp\lib\（与 ggml-cuda.dll 同目录）；
+#      本项目已暂存一份在 data\wheels\cuda_dlls\，重装轮子后直接复制回来即可。
+#   4. 验收：.venv\Scripts\python.exe main.py --probe-models --json → verdict 应为 GPU_OK
+# 回滚 CPU：用上面 CPU 那条命令重装 llama-cpp-python 即可。
+#
+# ── Embedding / Reranker（ONNX，已接线：BGE-M3 dense + bge-reranker 精排）──
+# 权重目录（对应 config.model.embedding_model / reranker_model 的默认 HF 名）：
+#   data\models\BAAI\bge-m3\              model.onnx + model.onnx_data + tokenizer.json
+#   data\models\BAAI\bge-reranker-v2-m3\  model.onnx + tokenizer.json
+#   来源：BAAI/bge-m3 的 onnx/*；Samir-j/bge-reranker-v2-m3-onnx 的 model_int8.onnx
+# 依赖（实测通过：GTX 1060 / 驱动 581.57 / CUDA Driver 13.0）：
+#   .venv\Scripts\python.exe -m pip install --no-cache-dir "onnxruntime-gpu==1.19.2" tokenizers
+#   .venv\Scripts\python.exe -m pip install --no-cache-dir "nvidia-cudnn-cu12==9.7.1.26" "nvidia-cufft-cu12==11.4.1.4"
+#   连同上面 CUDA 段的 cudart/cublas 两个包，engine/cuda_runtime.py 会自动把
+#   venv 内所有 CUDA DLL 目录登记进 PATH，无需手工设环境变量或装 CUDA Toolkit。
+# 开启 CUDA：.env 里 MODEL_USE_CUDA=true（等价于设置页「独显（全火力）」预设）。
+# sparse（lexical）头：官方 onnx/ 未导出 lexical 权重，但仓库另有 sparse_linear.pt
+# （nn.Linear(1024,1) 的 weight/bias）。下载到同一目录后执行：
+#   .venv\Scripts\python.exe scripts/export_sparse_head.py
+# 生成 sparse_head.onnx，运行时与主模型共用 CUDA provider；token 级 ReLU(W·h+b)
+# 按 token id 做 max pooling 得到稀疏向量（key 为 token id 字符串，跨设备确定性一致）。
+# 未生成时稀疏通道降级为空字典，绝不拿 token_embeddings 编造权重。
+#
+# 验证纪律：--self-check 只构造对象、不预热模型，degraded 恒为 False；
+#           判断 CUDA 是否生效一律用 main.py --probe-models --json。
 
 # 阶段 4 网关多端
 # mcp>=1.2                     # 官方 MCP SDK（Streamable HTTP）

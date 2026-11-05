@@ -88,23 +88,65 @@ structlog 记录 ingest（agent/通道/结果）→ 「系统概览」计数 +1 
 | 遗忘 | ❌ | 🟡 | 🟡 | ✅ FSRS 量化 |
 | 跨设备 | 云托管 | ❌ | 服务端 | ✅ 事件溯源+Git 总线 |
 
+## 附 1. 用户纠正一条已存在记忆（v2.2）
+
+场景：用户在「记忆管理」里点开「项目排期推迟到 6 月 1 日」，发现日期写错，改成「6 月 8 日」并顺手提到 core 层。
+
+1. **入口**：`MemoryInspector` 编辑区 → `DesktopBackend.correct_memory(id, {"content": ..., "tier": "core"}, reason=...)`
+   → `brain/memory_editor.py`。
+2. **journal 先落盘**：`ingest`（新 neuron，`extraction.source="user_correction"`）+ `supersede`
+   （payload `{old_id, new_id, before: 完整旧记录, after: 完整新记录, changed: ["content","tier"],
+   actor: "user", reason, ts_ms}`），fsync 后才返回。
+3. **主库**：新行 upsert；旧行 `is_active=0`、`tx_to/valid_to` 打点，**content 原值一字不改**。
+4. **派生库**：向量库 insert 新行 + `deactivate` 旧行；图谱补 `SUPERSEDES` 演进边；outbox 入列分发。
+5. **审计**：`memory_audit(new_id)` 返回 `ingest` + `supersede`，`changed` 里直接能看到 content 前后值——
+   这就是检查器「历史」面板的数据源，无需另建审计表。
+6. **跨设备**：另一台机器 pull 到这两个事件后重放：旧行被封存、新行出现、`SUPERSEDES` 边一致。
+   因为没新增事件类型，`EventProjector` 无需任何改动。
+
+## 附 2. 用户遗忘一条记忆（tombstone 语义）
+
+1. `DesktopBackend.forget_memory(id, reason=...)` → `tombstone` 事件
+   （payload 带 `neuron_id / before / actor / reason / action`；`action="forget"` 为用户遗忘，
+   `action="archive"` 表示封存语义，供审计区分）。
+2. `deactivate` 主库行 + `vector.delete(id)`：**推理路径上彻底消失**——召回、列表、星云都不再出现。
+3. 主库封存行与 journal 事件保留：审计可回答「这条曾经存在、被谁在什么时候遗忘」。
+4. 重放语义：任何落后设备重放 tombstone 后同样隐藏该条，不会复活。
+   → 若做物理删除，落后设备重放 `ingest` 就会把已删记忆重新造出来（这就是不物理删的原因）。
+5. 合规硬清除（GDPR 式「彻底抹掉」）不在本链路：需另建 purge 流，同步清向量/图谱/时序/KV，
+   且必须带 tombstone 前置，否则重放链路会把数据带回。
+
+## 附 3. Core Memory 编辑（policy 事件）
+
+1. 数据页「Core Memory」四个块（human / persona / preferences / constraints）→
+   `DesktopBackend.save_core_memory_blocks({...})` 一次保存全部块。
+2. 写 KV `core_memory/blocks`，并只发**一条** `policy` 事件
+   （`payload={"bucket": "core_memory", "key": "blocks", "blocks": {...}, "reason": "edit_core_memory"}`）——
+   逐块发事件会让审计里全是噪音。
+3. `sync/projections.py` 对 `bucket == "core_memory"` 走 `kv.put_json` 分支，重放到同一 bucket，
+   所以另一台设备重放后核心记忆块一致。
+4. 抽取/召回的注入侧把四块当稳定背景信息使用；它们不是记忆条目，不参与 FSRS 衰减与分层。
+
 # PRODUCTION_READINESS —— 生产就绪与构建评估（单用户场景）
 
 ## 已达标（可视为生产级）
 
-- 功能完整性：七阶段验收 + PAD 全链路 + 合并/聚类 + 112 用例全绿，`--self-check` 退出码 0；
-- 数据安全：fsync 事件日志、幂等投影/重放、快照、封存不删除、备份脚本（含文件锁退化）；
-- 故障降级：任一引擎关闭、模型缺失、云端超时都有确定行为，不崩不挂；
-- 多端：HLC 因果序、设备分目录、冲突可追溯；
-- 可观测：结构化日志 + 健康检查 + 控制台看板；
+- 功能完整性：七阶段验收 + PAD 全链路 + 合并/聚类 + 用户控制闭环 + 123 用例全绿，`--self-check` 退出码 0；
+- 数据安全：fsync 事件日志、幂等投影/重放、快照、封存/遗忘不物理删除、备份脚本（含文件锁退化）；
+- 故障降级：任一引擎关闭、模型缺失、云端超时、索引/缓存损坏都有确定行为，不崩不挂；
+- 多端：HLC 因果序、设备分目录、冲突可追溯、用户纠正与遗忘可重放；
+- 可观测：结构化日志 + 健康检查 + 控制台看板 + 事件时间轴 + 记忆检查器（来源/双时态/审计）；
 - 接入：MCP stdio + HTTP OpenAI 兼容（token/命名空间隔离）。
 
 ## 上真机前建议补（半天内可完成）
 
 1. 设置 `GW_MCP_TOKEN_SECRET` 环境变量（否则 HTTP 令牌重启失效）；
 2. 跑一次「快照 → 删库 → 快照+尾部重放恢复」演练（脚本已有，未实弹）；
-3. 显卡机上验证 CUDA：`use_cuda=true` + `llm_gpu_layers=-1`（模型配置页/预设「独显」）；
-4. 模型权重落位：BGE-M3 / bge-reranker ONNX 与 Qwen GGUF 放 `data/models/`（README 补下载说明）。
+3. 显卡机上验证 CUDA：`use_cuda=true` + `llm_gpu_layers=-1`（模型配置页/预设「独显」），
+   然后**必须**跑 `main.py --probe-models --json` 看 `verdict`（`--self-check` 只构造对象，证明不了加载）；
+4. 模型权重落位：BGE-M3（含 `sparse_head.onnx`，由 `scripts/export_sparse_head.py` 从 `sparse_linear.pt` 导出）
+   / bge-reranker ONNX 与 Qwen GGUF 放 `data/models/`；
+5. 便携发行演练：`scripts/build_portable.py` → PyInstaller onedir → `scripts/verify_portable.py` 要求换目录后仍 `GPU_OK`。
 
 ## 构建与分发建议
 
