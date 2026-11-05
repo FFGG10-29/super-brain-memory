@@ -31,6 +31,7 @@ brain-sync/
 
 # 打包产物（PyInstaller；含 3GB+ 模型，绝不入库）
 build/
-dist/
 app_entry.py
 super-brain.spec
+dist/
+release/
