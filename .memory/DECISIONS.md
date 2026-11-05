@@ -48,3 +48,17 @@
   而情绪基线本来就是慢变量，需要平滑的只有它。低通积分只应用于 `affinity`（好感度）。
 - **How to apply**：需要"当前用户情绪"读 `amygdala.state()`；需要"这条记忆的情绪色彩"读 `neuron.pad`。
   冷静期折扣只乘在召回分数上，绝不回写已存记录的 PAD。
+
+## ADR-008 桌面前端用 PySide6，光脉冲由真实相似度驱动
+
+- **决策**：`ui/desktop/` 用 PySide6 QGraphicsView；节点来自真实记忆库，语义边来自
+  `brain/activation.py` 的余弦相似度，光点速度/亮度 = 相似度；查询中心→N 条命中齐射由
+  `prefrontal.recall()` 结果触发。UI 只经 `DesktopBackend` 取数据，不碰 storage 实现。
+- **理由**：用户要的是"突触激活的视觉具象化"——光点必须是检索事件，不能是随机动画；
+  用随机 demo 数据会掩盖检索链路是否真的接通。无 ONNX 模型时降级为字符 2-gram TF 向量
+  （确定性、跨设备一致），并在 `ActivationGraph.degraded` 明示，绝不伪造相似度数值。
+- **How to apply**：新增可视化元素时，参数进 `config.UiConfig`/`ActivationConfig`；
+  视图不得改记忆、不得直接读库；场景坐标用 `scene.setSceneRect(0,0,1000,800)` 固定，
+  否则节点包围盒变化会让离屏渲染整体缩放。
+- **PAT 安全**：PAT 只进系统钥匙串（keyring）或 `GITHUB_PAT` 环境变量；
+  `SYNC_REPO_URL` 进用户级 QSettings；两者都不写项目 `.env`、不写事件日志、不在 UI 回显明文。

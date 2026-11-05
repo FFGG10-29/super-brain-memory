@@ -1,6 +1,6 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-05）：**61 passed**，`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-05）：**72 passed**（含桌面前端 11 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅
@@ -82,9 +82,29 @@
 `tests/test_pad_chain.py` 一段用例串起：①生成 ②建模 ③存储 ④检索 ⑤巩固 ⑥生命循环 ⑦同步 ⑧可视化。
 另有规则兜底用例（无 LLM 也不断链）与冷静期不改写已存 PAD 用例。
 
+## 桌面前端 PySide6 ✅（2026-11-05 新增）
+
+> 启动：`python -m ui.desktop`；离屏预览：`python scripts/nebula_preview.py` → `data/nebula_preview.png`
+> 验收：`pytest tests/test_desktop.py -q` → **11 passed**（含真实事件循环启停）
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 星云节点来自真实记忆库（非随机假数据） | ✅ | `DesktopBackend.graph()` → `ActivationService.build()`；4 条真实写入 → 4 节点 |
+| 语义突触线 = 真实余弦相似度 | ✅ | `brain/activation.py`；无 ONNX 模型时降级字符 2-gram 且 `degraded=True` 明示 |
+| 视觉近邻线 + 固定画布 | ✅ | `NebulaView.update_lines()`；`scene.setSceneRect(0,0,1000,800)` |
+| Lerp 光脉冲 / 终点闪烁 / 跟随漂移节点 | ✅ | `test_lerp_pulse_travels_flashes_and_is_destroyed`、`test_pulse_follows_drifting_nodes` |
+| 一次检索 → 中心向 N 条命中齐射 | ✅ | `MemoryPanel.do_search` → `emit_from_center(activations)` |
+| 双击记忆 → 相似记忆突触扩散 | ✅ | `MemoryPanel.activate_related` → `emit_pulses` |
+| 真实渲染出画面 | ✅ | `test_render_scene_to_image`（两帧像素不同）+ 预览 PNG |
+| PAT / SYNC_REPO_URL 前端配置 | ✅ | `SettingsPanel` 密码框；`SettingsStore` 钥匙串 + QSettings |
+| PAT 不入库/不入事件/不回显 | ✅ | 内存替身用例断言明文不进 QSettings、状态只显示掩码 |
+| 动画/配色参数全外置 | ✅ | `config.UiConfig` / `ActivationConfig` |
+
+依赖已进 `requirements.txt`：`PySide6-Essentials==6.12.0`、`keyring==25.7.0`。
+
 ## 明确未做（不在本次七阶段任务内）
 
 - `mcp_server.serve()` 的官方 SDK Streamable HTTP 传输装配（工具面已就绪，需 `pip install mcp` 后接线）。
 - 真实 GPU / 真实 ONNX 与 GGUF 模型权重加载（当前全程走确定性降级与规则抽取）。
 - 真实 GitHub 私库 pull/push 联调（需 PAT 与 `SYNC_REPO_URL`）。
-- NiceGUI 图形页面、3D 大脑面板、PAT 自动轮换（v2 路线图）。
+- NiceGUI Web 图形页面、3D 大脑面板、PAT 自动轮换（v2 路线图；PySide6 桌面前端已替代主要可视化入口）。

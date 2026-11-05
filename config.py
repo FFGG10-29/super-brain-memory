@@ -159,6 +159,45 @@ class GatewayConfig(BaseSettings):
     registry_enabled: bool = True
 
 
+class ActivationConfig(BaseSettings):
+    """突触激活：相似度阈值与脉冲映射（前端可视化与后端共用一套参数）。"""
+    model_config = SettingsConfigDict(env_prefix="ACT_")
+
+    similarity_threshold: float = 0.32          # 余弦≥阈值才画"突触线"
+    max_nodes: int = 80                          # 星云视图最多节点
+    max_edges_per_node: int = 4                  # 每个节点保留的最强连接数
+    pulse_speed_base: float = 0.028             # 基础光点速度（progress/帧）
+    pulse_speed_similarity_gain: float = 0.035  # 相似度越高光点越快
+    max_pulses: int = 40                        # 同屏光点上限，防止过载
+
+
+class UiConfig(BaseSettings):
+    """PySide6 桌面前端全部动画/配色参数（禁止散落在视图代码里）。"""
+    model_config = SettingsConfigDict(env_prefix="UI_")
+
+    timer_interval_ms: int = 16                 # ~60fps
+    background_color: str = "#05080E"
+    node_color: str = "#00FFFF"
+    emotion_node_color: str = "#FF3264"
+    line_color: str = "#64C8FF"
+    pulse_color: str = "#FFFFFF"
+    normal_node_radius: float = 7.0
+    emotion_node_radius: float = 12.0
+    center_x: float = 500.0
+    center_y: float = 400.0
+    center_pull: float = 0.0005                 # 向心力
+    repulsion_distance: float = 100.0           # 斥力作用半径
+    repulsion_force: float = 0.05
+    friction: float = 0.92
+    link_distance: float = 180.0                # 视觉近邻连线半径
+    proximity_line_alpha: int = 165             # 近邻线基础透明度（语义边更亮）
+    pulse_radius: float = 6.0                   # 光点半径
+    flash_decay: float = 0.05                   # 终点闪烁衰减
+    glow_multiplier: float = 2.5
+    window_width: int = 1400
+    window_height: int = 900
+
+
 class BrainConfig(BaseSettings):
     """全局组合根配置。"""
     model_config = SettingsConfigDict(env_prefix="BRAIN_", env_file=".env")
@@ -177,6 +216,8 @@ class BrainConfig(BaseSettings):
     amygdala: AmygdalaConfig = Field(default_factory=AmygdalaConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    activation: ActivationConfig = Field(default_factory=ActivationConfig)
+    ui: UiConfig = Field(default_factory=UiConfig)
 
 
 # 单例配置（懒加载于 main.py）

@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段全部落地，61 用例全过**
+> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + PySide6 桌面前端全部落地，72 用例全过**
 
 ## 1. 进度总览
 
@@ -15,15 +15,19 @@
 | 5 同步平面 | ✅ | projections/git_worker/snapshot；双机收敛、断网零丢失、幂等、冷启动重建全测过 |
 | 6 可视与打磨 | ✅ | 六面板数据源 + Dashboard + eval 基线 + 结构化日志 + 备份脚本 |
 | PAD 全链路 | ✅ 8/8 | `tests/test_pad_chain.py` |
+| PySide6 桌面前端 | ✅ | `ui/desktop/`：星云脉冲 + 记忆查看 + PAT/仓库配置；10 条用例 |
 
+启动：`python -m ui.desktop`（可交互）；`python scripts/nebula_preview.py`（离屏出图到 `data/nebula_preview.png`）。
 未做（明确边界）：官方 MCP SDK 传输装配、NiceGUI 图形页、真实 GPU/模型权重、真实 GitHub 私库联调。
 详见 `.memory/ACCEPTANCE.md` 末尾。
 
 ## 2. 环境事实（已实测，别重复摸索）
 
 - 解释器：项目内 `.venv`（Python 3.11.5）。系统 PATH 上的 `python` 是 KiCad 自带的，**只有 pydantic/numpy，缺全部存储依赖**，不要用它跑测试。
-- 已装：`duckdb 2.0.0` / `lancedb 0.41.0` / `kuzu 0.11.3` / `lmdb` / `pydantic 2.14.2` / `structlog` / `pytest` / `pytest-asyncio`。
-- 未装（按降级实现）：`onnxruntime`、`llama-cpp-python`、`sentence-transformers`、`hypernetx`、`pandas`、`fastapi`、`mcp`、`nicegui`、`apscheduler`。
+- 已装：`duckdb 2.0.0` / `lancedb 0.41.0` / `kuzu 0.11.3` / `lmdb 3.0.0` / `hypernetx 2.4.3` / `pydantic 2.14.2` / `PySide6-Essentials 6.12.0` / `keyring 25.7.0` / `pytest 9.2.0`。完整锁定见 `requirements.txt`（16 包）。
+- 未装（按降级实现）：`onnxruntime`、`llama-cpp-python`、`fastapi`、`mcp`、`nicegui`、`apscheduler`。
+- Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
+- Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；`SettingsStore.test_connection()` 因此只探测 `shutil.which("git")`。
 - shell 是 **PowerShell**：别用 `cd /d`；调脚本用绝对路径；命令行里 `$var` 会被 PowerShell 展开（探针会静默吃掉 Cypher 参数）。
 
 ## 3. 跑测试的正确姿势（沙箱限制，必看）
@@ -68,7 +72,7 @@ Set-Location -LiteralPath 'B:\Desktop\BaiduSyncdisk\desktop\VSProject\my_brain_b
 
 1. `pip install mcp` 后完成 `mcp_server.serve()` 的 Streamable HTTP 传输装配（工具面已就绪）。
 2. 配置 `SYNC_REPO_URL` + PAT，联调 `git_worker` 真实 pull/push（离线路径已测）。
-3. `pip install nicegui` 后启用 `ui/dashboard.py serve()` 图形页（JSON 兜底已可用）。
+3. 桌面前端已完成（`python -m ui.desktop`）；`pip install nicegui` 后可选启用 Web 看板（JSON 兜底已可用）。
 4. 放入真实 ONNX/GGUF 权重，跑一次 `eval.compare()` 出换模型对比报告。
 5. 生产前必须设置 `GW_MCP_TOKEN_SECRET`，否则令牌进程重启即失效。
 
