@@ -183,6 +183,16 @@ class GatewayConfig(BaseSettings):
     registry_enabled: bool = True
 
 
+class MergeConfig(BaseSettings):
+    """语义合并与聚类摘要（写入裁决 + 夜间升维）。"""
+    model_config = SettingsConfigDict(env_prefix="MERGE_")
+
+    merge_enabled: bool = True                    # 写入时由 LLM 裁决 新增/更新/合并/跳过
+    merge_candidate_limit: int = 3                # 参与裁决的最相似旧记忆条数
+    cluster_summary_enabled: bool = True          # 夜间巩固时为语义聚簇生成主题摘要
+    cluster_min_members: int = 3                  # 聚簇至少多少条成员才值得生成摘要
+
+
 class ActivationConfig(BaseSettings):
     """突触激活：相似度阈值与脉冲映射（前端可视化与后端共用一套参数）。"""
     model_config = SettingsConfigDict(env_prefix="ACT_")
@@ -246,6 +256,7 @@ class BrainConfig(BaseSettings):
     amygdala: AmygdalaConfig = Field(default_factory=AmygdalaConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    merge: MergeConfig = Field(default_factory=MergeConfig)
     activation: ActivationConfig = Field(default_factory=ActivationConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
 

@@ -125,6 +125,7 @@ class SettingsPage(QtWidgets.QWidget):
         return ConfigEditor(
             (
                 ("存储引擎", config.storage),
+                ("语义合并与聚类", config.merge),
                 ("召回与精排", config.recall),
                 ("遗忘与强化（FSRS）", config.plasticity),
                 ("分层流动", config.tier),

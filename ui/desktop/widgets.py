@@ -10,7 +10,51 @@ from typing import Any, get_args, get_origin, get_type_hints
 from pydantic import BaseModel
 from PySide6 import QtCore, QtGui, QtWidgets
 
-__all__ = ["Card", "ConfigEditor", "KpiCard", "MiniMap", "divider", "FIELD_LABELS"]
+__all__ = ["Card", "ConfigEditor", "KpiCard", "MiniMap", "Switch", "divider", "FIELD_LABELS"]
+
+
+class Switch(QtWidgets.QAbstractButton):
+    """iOS 风格滑动开关（自绘，主题色跟随 accent）。"""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._pos = 0.0                                   # 滑块位置 0..1
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._animate)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        return QtCore.QSize(44, 24)
+
+    def _animate(self) -> None:
+        target = 1.0 if self.isChecked() else 0.0
+        step = 0.22 if abs(target - self._pos) > 0.02 else 1.0
+        self._pos += (target - self._pos) * step
+        self._pos = target if abs(target - self._pos) < 0.01 else self._pos
+        self.update()
+        if abs(self._pos - target) < 0.01:
+            self._pos = target
+            self._timer.stop()
+
+    def nextCheckState(self) -> None:  # noqa: N802
+        super().nextCheckState()
+        self._timer.start()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        width, height = self.width(), self.height()
+        track_on = QtGui.QColor("#1C5B76")
+        track_off = QtGui.QColor("#1A2436")
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QBrush(track_on if self.isChecked() else track_off))
+        painter.drawRoundedRect(0, 0, width, height, height / 2, height / 2)
+        knob_d = height - 6
+        x = 3 + (width - knob_d - 6) * self._pos
+        painter.setBrush(QtGui.QBrush(QtGui.QColor("#EAF3FF")))
+        painter.drawEllipse(int(x), 3, knob_d, knob_d)
 
 
 def divider() -> QtWidgets.QFrame:
@@ -106,6 +150,8 @@ FIELD_LABELS: dict[str, str] = {
     "dense_dim": "向量维度", "embedding_model": "Embedding 模型", "reranker_model": "精排模型",
     "llm_model": "本地 LLM 文件", "llm_gguf_dir": "模型目录", "use_cuda": "启用 CUDA",
     "llm_gpu_layers": "GPU 层数 (-1=全部)", "onnx_providers": "ONNX 提供方",
+    "merge_enabled": "写入时语义合并裁决", "merge_candidate_limit": "裁决候选条数",
+    "cluster_summary_enabled": "聚簇主题摘要", "cluster_min_members": "聚簇最少成员",
     "embed_backend": "Embedding 来源", "embed_base_url": "Embedding API 地址", "embed_model": "Embedding 模型名",
     "embed_dim": "云端向量维度", "embed_timeout_sec": "Embedding 超时 (s)", "embed_api_key_env": "Embedding Key 环境变量名",
     "llm_backend": "LLM 来源", "llm_base_url": "LLM API 地址", "llm_model": "LLM 模型名",
@@ -319,9 +365,14 @@ class ConfigEditor(QtWidgets.QWidget):
     def _build_editor(self, annotation: Any, value: Any, field_name: str) -> tuple[QtWidgets.QWidget, Any]:
         origin = get_origin(annotation)
         if annotation is bool:
-            box = QtWidgets.QCheckBox()
-            box.setChecked(bool(value))
-            return box, box.isChecked
+            switch = Switch()
+            switch.setChecked(bool(value))
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addStretch(1)
+            row_layout.addWidget(switch)
+            return row, switch.isChecked
         if origin is typing.Literal:
             combo = QtWidgets.QComboBox()
             combo.addItems([str(item) for item in get_args(annotation)])

@@ -22,6 +22,7 @@ from typing import Any
 
 from brain.amygdala import Amygdala
 from brain.hippocampus import Hippocampus
+from brain.memory_consolidator import MemoryConsolidator
 from brain.memory_tier_manager import MemoryTierManager
 from brain.neocortex import Neocortex
 from brain.prefrontal import Prefrontal
@@ -295,6 +296,10 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
     amygdala = Amygdala(storage.kv, config)
     thalamus = Thalamus(storage.kv, config)
     extractor = RouterExtractor(llm, config)
+    consolidator = MemoryConsolidator(
+        llm=llm, relational=storage.relational, vector=storage.vector,
+        embedder=embedder, config=config,
+    )
     hippocampus = Hippocampus(
         relational=storage.relational,
         vector=storage.vector,
@@ -310,6 +315,7 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
         embedder=embedder,
         event_log=journal,
         config=config,
+        consolidator=consolidator,
     )
     prefrontal = Prefrontal(
         relational=storage.relational,
@@ -335,9 +341,20 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
         config=config,
     )
     circadian = Circadian()
+
+    def _nightly_consolidate() -> tuple[int, int, int]:
+        consolidations = neocortex.consolidate()
+        summaries = consolidator.summarize_clusters(
+            consolidations,
+            remember=lambda text: hippocampus.remember(text, agent_id="consolidator"),
+        )
+        sweep_report = tier_manager.sweep()
+        scanned = int(getattr(sweep_report, "scanned", 0) or 0)
+        return len(consolidations), len(summaries), scanned
+
     Circadian.install_defaults(
         circadian,
-        consolidate=lambda: (len(neocortex.consolidate()), tier_manager.sweep()),
+        consolidate=_nightly_consolidate,
         decay_sweep=life_loop.forget_sweep,
         snapshot=lambda: None,       # git_worker/snapshot 接线在阶段 5
         morning_brief=life_loop.morning_brief,

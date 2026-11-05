@@ -52,6 +52,7 @@ class WriteResult:
     applied: bool
     superseded: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    merge: Any | None = None  # MergeDecision：本次写入的语义裁决（add/update/merge/skip）
 
     @property
     def event_worthy(self) -> bool:
@@ -77,6 +78,7 @@ class Hippocampus:
         embedder: Embedder | None = None,
         event_log: EventLog | None = None,
         config: BrainConfig | None = None,
+        consolidator: Any | None = None,
     ) -> None:
         self._relational = relational
         self._vector = vector
@@ -92,6 +94,7 @@ class Hippocampus:
         self._embedder = embedder
         self._event_log = event_log
         self._config = config or get_config()
+        self._consolidator = consolidator
 
     # ── 主流程 ────────────────────────────────────────────────────────────
     def remember(
@@ -127,6 +130,15 @@ class Hippocampus:
         if not admission.accepted:
             return WriteResult(neuron=neuron, admission=admission, applied=False)
 
+        # 语义合并裁决（Mem0 式）：LLM 判定 add/update/merge/skip
+        merge = None
+        if self._consolidator is not None and self._config.merge.merge_enabled:
+            merge = self._consolidator.decide(neuron.content, agent_id=agent_id, namespace=namespace)
+            if merge.action == "skip":
+                return WriteResult(neuron=neuron, admission=admission, applied=False, merge=merge)
+            if merge.action in ("update", "merge") and merge.content:
+                neuron = neuron.model_copy(update={"content": merge.content})
+
         warnings: list[str] = []
         # 1) 事实先落主库
         self._relational.upsert("neuron", neuron.to_record())
@@ -142,12 +154,16 @@ class Hippocampus:
         self.dispatch_outbox(warnings=warnings)
         # 4) 冲突消解
         superseded = self._resolve_conflicts(neuron, extraction)
+        # 5) 语义合并裁出的被替代旧记忆：封存（不物理删除），随结果返回
+        if merge is not None and merge.supersede_ids:
+            superseded.extend(self._retire(merge.supersede_ids, by=neuron))
         result = WriteResult(
             neuron=neuron,
             admission=admission,
             applied=True,
             superseded=superseded,
             warnings=warnings,
+            merge=merge,
         )
         self._emit_event(neuron, extraction, result)
         return result
@@ -353,6 +369,28 @@ class Hippocampus:
         self._graph.add_relation(
             relation.subject, relation.predicate, relation.object, tx_from=self._clock.last
         )
+
+    def _retire(self, ids: tuple[str, ...], *, by: Neuron) -> list[str]:
+        """语义合并：把被 update/merge 替代的旧记忆封存（valid_to 打点 + 向量摘除）。"""
+        retired: list[str] = []
+        for old_id in ids:
+            try:
+                self._relational.deactivate(
+                    "neuron", old_id, valid_to_ms=_now_ms(), tx_to=self._clock.tick()
+                )
+            except StorageError:
+                continue
+            try:
+                self._vector.delete([old_id])
+            except Exception:  # noqa: BLE001  向量摘除失败不影响事实封存
+                pass
+            self._graph.upsert_entity(by.uuid7_id, name=f"merged:{old_id[:12]}", entity_type="fact")
+            try:
+                self._graph.supersede(by.uuid7_id, old_id, tx_from=self._clock.last)
+            except Exception:  # noqa: BLE001
+                pass
+            retired.append(old_id)
+        return retired
 
     # ── 召回强化（供前额叶回调，产生 reinforce 事件的写入端）─────────────
     def reinforce(self, neuron_id: str, *, now_ms: int | None = None) -> Neuron | None:
