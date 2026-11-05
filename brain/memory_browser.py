@@ -13,8 +13,10 @@ class MemoryBrowser:
     def __init__(self, relational: RelationalRepository) -> None:
         self._relational = relational
 
-    def list(self, *, limit: int = 80) -> list[dict]:
-        return [
+    def list(
+        self, *, limit: int = 80, tier: str | None = None, memory_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        rows = [
             {
                 "id": str(row.get("id", "")),
                 "content": str(row.get("content", "")),
@@ -30,13 +32,18 @@ class MemoryBrowser:
             }
             for row in self._relational.query("neuron", limit=limit)
         ]
+        if tier:
+            rows = [row for row in rows if row["tier"] == tier]
+        if memory_type:
+            rows = [row for row in rows if row["memory_type"] == memory_type]
+        return rows
 
-    def get(self, memory_id: str) -> dict | None:
+    def get(self, memory_id: str) -> dict[str, Any] | None:
         row = self._relational.get("neuron", memory_id)
         return dict(row) if row is not None else None
 
     @staticmethod
-    def detail(row: dict) -> str:
+    def detail(row: dict[str, Any]) -> str:
         pad = (row.get("pad_p", 0.0), row.get("pad_a", 0.0), row.get("pad_d", 0.0))
         return (
             f"ID        {row.get('id')}\n"

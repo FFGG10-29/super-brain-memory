@@ -99,6 +99,45 @@ class SettingsStore:
                     pass
         return self.load()
 
+    # ── 界面/网关偏好（同样只进用户级 QSettings）────────────────────────
+    def load_prefs(self) -> dict[str, Any]:
+        return {
+            "http_host": str(self._q.value("gateway/host", self._config.gateway.http_host) or "127.0.0.1"),
+            "http_port": _as_int(self._q.value("gateway/port", self._config.gateway.http_port), 8766),
+            "model_name": str(self._q.value("gateway/model", "super-brain-memory")),
+            "timer_interval_ms": _as_int(self._q.value("ui/timer_ms", self._config.ui.timer_interval_ms), 16),
+            "similarity_threshold": _as_float(
+                self._q.value("ui/threshold", self._config.activation.similarity_threshold), 0.32
+            ),
+            "max_labels": _as_int(self._q.value("ui/max_labels", self._config.ui.max_labels), 14),
+        }
+
+    def save_prefs(self, **prefs: Any) -> dict[str, Any]:
+        mapping = {
+            "http_host": "gateway/host",
+            "http_port": "gateway/port",
+            "model_name": "gateway/model",
+            "timer_interval_ms": "ui/timer_ms",
+            "similarity_threshold": "ui/threshold",
+            "max_labels": "ui/max_labels",
+        }
+        for key, value in prefs.items():
+            if key not in mapping:
+                raise KeyError(f"未知偏好项：{key}")
+            self._q.setValue(mapping[key], value)
+        self._q.sync()
+        if "http_host" in prefs:
+            self._config.gateway.http_host = str(prefs["http_host"])
+        if "http_port" in prefs:
+            self._config.gateway.http_port = int(prefs["http_port"])
+        if "timer_interval_ms" in prefs:
+            self._config.ui.timer_interval_ms = int(prefs["timer_interval_ms"])
+        if "similarity_threshold" in prefs:
+            self._config.activation.similarity_threshold = float(prefs["similarity_threshold"])
+        if "max_labels" in prefs:
+            self._config.ui.max_labels = int(prefs["max_labels"])
+        return self.load_prefs()
+
     def test_connection(self) -> dict[str, Any]:
         """只做本地校验，不发起带凭据的网络请求（避免 PAT 进入命令行/进程列表）。"""
         settings = self.load()
@@ -119,6 +158,20 @@ class SettingsStore:
                 else "请补全仓库地址 / PAT / git 可执行文件"
             ),
         }
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _default_keyring():

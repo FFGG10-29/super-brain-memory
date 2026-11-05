@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import random
 from collections.abc import Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -39,7 +40,7 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
         glow_extent = self.radius * (params.glow_multiplier + 2)
         super().__init__(-glow_extent, -glow_extent, glow_extent * 2, glow_extent * 2)
         self.node_id = node.id
-        self.data = node
+        self.node = node
         self.setPos(x, y)
         self.vx = 0.0
         self.vy = 0.0
@@ -48,7 +49,38 @@ class NeuronNode(QtWidgets.QGraphicsEllipseItem):
         self.flash_count = 0                  # 累计被激活次数（终点闪烁可观测）
         self._config = config
         self._update_brush()
-        self.setToolTip(f"{node.label}\nPAD{node.pad} / {node.tier}")
+        self.setToolTip(f"{node.content}\nPAD{node.pad} / {node.tier}")
+
+        # LivingMemory 风格记忆标签：小字 + 类型前缀，默认隐藏，由视图按优先级点亮
+        self.label_item = QtWidgets.QGraphicsSimpleTextItem(self)
+        snippet = " ".join(node.content.split())[:14]
+        prefix = "情绪" if node.is_emotion else "记忆"
+        self.label_item.setText(f"{prefix} ● {snippet}")
+        font = self.label_item.font()
+        font.setPointSize(max(6, params.label_font_size))
+        self.label_item.setFont(font)
+        self.label_item.setBrush(QtGui.QBrush(QtGui.QColor(params.label_color)))
+        self.label_item.setPos(self.radius * 1.2, -self.radius * 1.4)
+        self.label_item.setZValue(3)
+        self.label_item.setVisible(False)
+
+        # 高亮环：只圈住神经元本体，不用整块发光边界（否则圈大得离谱）
+        ring = self.radius * 1.7
+        self._ring = QtWidgets.QGraphicsEllipseItem(-ring, -ring, ring * 2, ring * 2, self)
+        self._ring.setPen(QtGui.QPen(QtGui.QColor(180, 235, 255, 190), 1.2))
+        self._ring.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        self._ring.setVisible(False)
+
+    def set_highlighted(self, highlighted: bool) -> None:
+        self._ring.setVisible(highlighted)
+
+    def set_dimmed(self, dimmed: bool) -> None:
+        opacity = self._config.ui.dim_opacity if dimmed else 1.0
+        self.setOpacity(opacity)
+        self.label_item.setOpacity(opacity)
+
+    def set_label_visible(self, visible: bool) -> None:
+        self.label_item.setVisible(visible)
 
     def _update_brush(self) -> None:
         params = self._config.ui
@@ -127,8 +159,8 @@ class NebulaView(QtWidgets.QGraphicsView):
     def __init__(self, config: BrainConfig | None = None, *, auto_animate: bool = True) -> None:
         super().__init__()
         self._config = config or get_config()
-        self.scene = QtWidgets.QGraphicsScene(self)
-        self.setScene(self.scene)
+        self.view_scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self.view_scene)
         self.setStyleSheet(f"background-color: {self._config.ui.background_color}; border: none;")
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
@@ -140,31 +172,109 @@ class NebulaView(QtWidgets.QGraphicsView):
         self.last_arrivals: list[str] = []
         self._origin: NeuronNode | None = None
 
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self._stardust = self._build_stardust()
+
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.animate)
         if auto_animate:
             self.timer.start(self._config.ui.timer_interval_ms)
 
+    # ── 背景星尘与缩放 ────────────────────────────────────────────────────
+    def _build_stardust(self) -> list[tuple[float, float, float]]:
+        rng = random.Random(20261105)
+        params = self._config.ui
+        return [
+            (rng.uniform(0, params.center_x * 2), rng.uniform(0, params.center_y * 2), rng.uniform(0.7, 2.1))
+            for _ in range(params.stardust_count)
+        ]
+
+    def drawBackground(self, painter: QtGui.QPainter, rect: QtCore.QRectF | QtCore.QRect) -> None:  # noqa: N802
+        params = self._config.ui
+        painter.fillRect(rect, QtGui.QColor(params.background_color))
+        color = QtGui.QColor(params.stardust_color)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(color.red(), color.green(), color.blue(), 165)))
+        for x, y, radius in self._stardust:
+            if rect.left() <= x <= rect.right() and rect.top() <= y <= rect.bottom():
+                painter.drawEllipse(QtCore.QPointF(x, y), radius, radius)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        current = self.transform().m11()
+        if 0.45 <= current * factor <= 3.0:
+            self.scale(factor, factor)
+
     # ── 真实数据入口 ──────────────────────────────────────────────────────
-    def set_graph(self, graph: ActivationGraph) -> None:
-        self.scene.clear()
+    def set_graph(self, graph: ActivationGraph, *, labels: bool = True) -> None:
+        self.view_scene.clear()
         # 固定画布：否则 sceneRect 会随节点包围盒变化，渲染时坐标被整体缩放/平移
         params = self._config.ui
-        self.scene.setSceneRect(0, 0, params.center_x * 2, params.center_y * 2)
+        self.view_scene.setSceneRect(0, 0, params.center_x * 2, params.center_y * 2)
         self.nodes.clear()
         self._node_by_id.clear()
         self._line_items.clear()
         self.pulses.clear()
         self._edges = [(edge.source, edge.target, edge.weight, edge.kind) for edge in graph.edges]
-        params = self._config.ui
         for node in graph.nodes:
             x, y = _stable_position(node.id, params.center_x, params.center_y)
             item = NeuronNode(node, x, y, config=self._config)
-            self.scene.addItem(item)
+            self.view_scene.addItem(item)
             self.nodes.append(item)
             self._node_by_id[node.id] = item
         self._ensure_origin()
+        self._refresh_labels(enabled=labels)
         self.update_lines()
+
+    def _refresh_labels(self, *, enabled: bool = True) -> None:
+        """按"情绪 > 高置信"优先级点亮有限标签；标签朝画面中心一侧摆放，减少互相压字。"""
+        limit = self._config.ui.max_labels
+        center_x = self._config.ui.center_x
+        ranked = sorted(
+            self.nodes, key=lambda node: (node.node.is_emotion, node.node.confidence), reverse=True
+        )
+        visible = {item.node_id for item in ranked[:limit]} if enabled else set()
+        for node in self.nodes:
+            on = node.node_id in visible
+            node.set_label_visible(on)
+            if not on:
+                continue
+            width = node.label_item.boundingRect().width()
+            offset = node.radius * 1.2
+            if node.x() > center_x:
+                node.label_item.setPos(-width - offset, -node.radius)
+            else:
+                node.label_item.setPos(offset, -node.radius)
+
+    def stats(self) -> dict[str, object]:
+        return {"nodes": len(self.nodes), "edges": len(self._edges), "pulses": len(self.pulses)}
+
+    def view_area(self) -> QtCore.QRectF:
+        return self.mapToScene(self.viewport().rect()).boundingRect()
+
+    # ── 高亮 / 定位 ───────────────────────────────────────────────────────
+    def highlight(self, node_ids: Sequence[str], *, dim_others: bool = True) -> None:
+        wanted = {str(node_id) for node_id in node_ids}
+        for node in self.nodes:
+            node.set_highlighted(node.node_id in wanted)
+            node.set_dimmed(dim_others and bool(wanted) and node.node_id not in wanted)
+            if node.node_id in wanted:
+                node.set_label_visible(True)
+
+    def clear_highlight(self) -> None:
+        for node in self.nodes:
+            node.set_highlighted(False)
+            node.set_dimmed(False)
+        self._refresh_labels()
+
+    def focus_on(self, node_id: str) -> bool:
+        node = self.node(node_id)
+        if node is None:
+            return False
+        self.centerOn(node)
+        self.highlight([node_id])
+        return True
 
     def _ensure_origin(self) -> None:
         """查询中心节点：所有"检索激活"光脉冲的发射源。"""
@@ -179,7 +289,7 @@ class NebulaView(QtWidgets.QGraphicsView):
         origin.base_color = QtGui.QColor("#FFD166")
         origin.setZValue(2)
         origin._update_brush()
-        self.scene.addItem(origin)
+        self.view_scene.addItem(origin)
         self._origin = origin
 
     def node(self, node_id: str) -> NeuronNode | None:
@@ -199,7 +309,7 @@ class NebulaView(QtWidgets.QGraphicsView):
             if len(self.pulses) >= self._config.activation.max_pulses:
                 break
             pulse = LightPulse(source, target, similarity=similarity, config=self._config)
-            self.scene.addItem(pulse)
+            self.view_scene.addItem(pulse)
             self.pulses.append(pulse)
             emitted += 1
         return emitted
@@ -221,7 +331,7 @@ class NebulaView(QtWidgets.QGraphicsView):
             if item is None:
                 item = QtWidgets.QGraphicsLineItem()
                 item.setZValue(-1)
-                self.scene.addItem(item)
+                self.view_scene.addItem(item)
                 self._line_items[key] = item
             item.setLine(first.x(), first.y(), second.x(), second.y())
             return item
@@ -246,12 +356,12 @@ class NebulaView(QtWidgets.QGraphicsView):
             alpha = int(255 * max(0.0, min(1.0, weight)))
             line = ensure_line(key, source, target)
             line.setPen(
-                QtGui.QPen(QtGui.QColor(120, 255, 220, alpha), 2.5 if kind == "synapse" else 1.8)
+                QtGui.QPen(QtGui.QColor(150, 225, 255, alpha), 2.5 if kind == "synapse" else 1.8)
             )
 
         for key, item in list(self._line_items.items()):
             if key not in wanted:
-                self.scene.removeItem(item)
+                self.view_scene.removeItem(item)
                 del self._line_items[key]
 
     def animate(self) -> None:
@@ -261,7 +371,7 @@ class NebulaView(QtWidgets.QGraphicsView):
         for pulse in self.pulses[:]:
             if not pulse.update_position():
                 self.last_arrivals.append(pulse.end_node.node_id)
-                self.scene.removeItem(pulse)
+                self.view_scene.removeItem(pulse)
                 self.pulses.remove(pulse)
 
     def pulse_count(self) -> int:

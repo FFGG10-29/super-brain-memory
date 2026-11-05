@@ -88,7 +88,8 @@ class HTTPAdapter:
         """构造服务实例（暴露给测试/一键启停脚本，便于 shutdown）。"""
         adapter = self
         host = host or self._config.gateway.http_host
-        port = int(port or self._config.gateway.http_port)
+        # port=0 是合法语义（内核分配随机空闲端口），不能被 `or` 吞掉
+        port = int(self._config.gateway.http_port if port is None else port)
 
         class Handler(BaseHTTPRequestHandler):
             def _respond(self, status: int, payload: dict) -> None:

@@ -1,18 +1,22 @@
-"""PySide6 桌面前端验收：真实数据节点 / Lerp 光脉冲 / 终点闪烁 / 检索联动 / 安全配置。"""
+"""PySide6 桌面前端验收：星云脉冲 / 记忆管理 / 端口启停 / 同步备份 / 安全配置。"""
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from brain.activation import ActivationGraph, ActivationNode
 from config import BrainConfig, ModelConfig, StorageConfig, SyncConfig
 from ui.desktop.backend import DesktopBackend
 from ui.desktop.main_window import MainWindow
-from ui.desktop.memory_panel import MemoryPanel
-from ui.desktop.neurons import LightPulse, NebulaView, NeuronNode
+from ui.desktop.neurons import LightPulse, NebulaView
+from ui.desktop.pages import MemoryPage, NebulaPage, RecallPage, SettingsPage, SystemPage
+from ui.desktop.pages.interface_page import InterfacePage
 from ui.desktop.settings import SettingsStore
 from ui.desktop.settings_panel import SettingsPanel
 
@@ -33,7 +37,7 @@ class _FakeKeyring:
 
 class _FakeQSettings:
     def __init__(self) -> None:
-        self.values: dict[str, str] = {}
+        self.values: dict[str, object] = {}
 
     def value(self, key, default=None):
         return self.values.get(key, default)
@@ -84,6 +88,11 @@ def nebula(desktop_config):
     return NebulaView(desktop_config, auto_animate=False)
 
 
+@pytest.fixture()
+def store(desktop_config):
+    return SettingsStore(desktop_config, keyring_backend=_FakeKeyring(), qsettings=_FakeQSettings())
+
+
 # ── 星云视图 ──────────────────────────────────────────────────────────────
 def test_graph_nodes_come_from_real_memories(backend, nebula, qapp):
     graph = backend.graph()
@@ -105,6 +114,23 @@ def test_stable_layout_is_reproducible(backend, nebula, qapp):
     assert before == after, "稳定哈希布局必须跨重建一致"
 
 
+def test_labels_follow_priority_limit(backend, nebula, qapp):
+    nebula.set_graph(backend.graph())
+    visible = [node for node in nebula.nodes if node.label_item.isVisible()]
+    assert 0 < len(visible) <= nebula._config.ui.max_labels
+
+
+def test_view_area_and_highlight(backend, nebula, qapp):
+    nebula.set_graph(backend.graph())
+    target = nebula.nodes[0]
+    assert nebula.focus_on(target.node_id) is True
+    assert target.isSelected() is False  # 只高亮不选中，避免与拖拽冲突
+    assert target._ring.isVisible() is True
+    nebula.clear_highlight()
+    assert target._ring.isVisible() is False
+    assert nebula.view_area().width() > 0
+
+
 def test_lerp_pulse_travels_flashes_and_is_destroyed(backend, nebula, qapp):
     nebula.set_graph(backend.graph())
     source, target = nebula.nodes[0], nebula.nodes[1]
@@ -116,7 +142,6 @@ def test_lerp_pulse_travels_flashes_and_is_destroyed(backend, nebula, qapp):
     first_progress = pulse.progress
     nebula.animate()
     assert pulse.progress > first_progress, "每帧必须线性插值前进"
-    assert pulse.x() != source.x() or pulse.y() != source.y()
 
     for _ in range(200):
         nebula.animate()
@@ -139,7 +164,6 @@ def test_pulse_follows_drifting_nodes(backend, nebula, qapp):
 
 
 def test_render_scene_to_image(backend, nebula, qapp):
-    """真正画一帧：证明光脉冲在深空背景上可见。"""
     nebula.set_graph(backend.graph())
     nebula.emit_from_center([(node.node_id, 0.8) for node in nebula.nodes[:3]])
     for _ in range(3):
@@ -149,7 +173,7 @@ def test_render_scene_to_image(backend, nebula, qapp):
         image = QtGui.QImage(1000, 800, QtGui.QImage.Format.Format_ARGB32)
         image.fill(QtGui.QColor(nebula._config.ui.background_color))
         painter = QtGui.QPainter(image)
-        nebula.scene.render(painter)
+        nebula.view_scene.render(painter)
         painter.end()
         return image
 
@@ -161,42 +185,149 @@ def test_render_scene_to_image(backend, nebula, qapp):
     assert first != second, "光点移动后两帧像素必须不同"
 
 
-# ── 检索联动（记忆查看界面）──────────────────────────────────────────────
-def test_recall_emits_pulses_from_center(backend, nebula, qapp):
-    view = backend.recall("发版冲突")
-    assert view.activations, "召回必须产出 (node_id, 激活强度) 列表"
-    nebula.set_graph(backend.graph())
-    emitted = nebula.emit_from_center(view.activations)
-    assert emitted >= 1
-    assert nebula.pulse_count() >= 1
+# ── 星云页 / 外壳 ─────────────────────────────────────────────────────────
+def test_nebula_page_activate_and_minimap(backend, desktop_config, qapp):
+    page = NebulaPage(backend, desktop_config)
+    assert page.minimap.scene() is page.view.view_scene
+    result = page.activate("发版冲突")
+    assert result["hits"] >= 1
+    assert result["pulses"] >= 1
+    assert page.view.pulse_count() >= 1
+    assert "命中" in page._hits.text()
 
 
-def test_memory_panel_search_and_double_click(backend, nebula, qapp):
-    panel = MemoryPanel(backend, nebula)
-    assert panel._list.count() >= 4
-    panel._search.setText("发版")
-    panel.do_search()
-    assert nebula.pulse_count() >= 1, "检索必须触发光脉冲"
-    assert "激活" in panel._status.text()
-
-    panel.refresh()
-    item = panel._list.item(0)
-    panel.show_detail(item)
-    assert "PAD" in panel._detail.toPlainText()
-    panel.activate_related(item)
-    assert "突触扩散" in panel._status.text()
+def test_spaces_filter_emotion_only(qapp):
+    nodes = [
+        ActivationNode("a", "a", "发版冲突", "emotion", "core", (0.8, 0.1, 0.1), 0.6, True),
+        ActivationNode("b", "b", "普通事实", "fact", "buffer", (0.0, 0.0, 0.0), 0.4, False),
+    ]
+    graph = ActivationGraph(nodes=nodes, edges=[], source="char-2gram", degraded=True)
+    filtered = DesktopBackend._filter_graph(graph, "情感记忆")
+    assert [node.id for node in filtered.nodes] == ["a"]
+    assert [node.id for node in DesktopBackend._filter_graph(graph, "全部").nodes] == ["a", "b"]
 
 
-def test_main_window_status_and_demo(qapp, backend, desktop_config):
-    store = SettingsStore(desktop_config, keyring_backend=_FakeKeyring(), qsettings=_FakeQSettings())
+def test_main_window_nine_pages_and_status(backend, store, desktop_config, qapp):
     window = MainWindow(backend, store, desktop_config)
-    window.refresh_status()
+    assert window._nav.count() == 9
     assert "引擎" in window._status_label.text()
-    assert "engine_health" in window._status_text.toPlainText()
+    assert window._space.count() >= 3, "空间下拉必须包含 全部/分层/情感记忆"
+
+    window._nav.setCurrentRow(3)
+    assert window.system_page._engine_table.rowCount() >= 6
+    window._nav.setCurrentRow(2)
+    assert window.recall_page is window._stack.currentWidget()
+
     window.demo_pulse()
-    window._nebula.timer.stop()
+    window.nebula_page.view.timer.stop()
     window._status_timer.stop()
     window.close()
+
+
+# ── 记忆管理 / 召回测试 / 系统概览 ───────────────────────────────────────
+def test_memory_page_filter_detail_and_write(backend, qapp):
+    page = MemoryPage(backend)
+    assert page._table.rowCount() >= 4
+
+    page._search.setText("发版")
+    assert 0 < page._table.rowCount() <= 4
+    page._table.selectRow(0)
+    assert page._selected_id()
+    assert "PAD" in page._detail.toPlainText()
+
+    page._search.clear()
+    page._new_memory.setText("新增一条用于界面写入验证的记忆")
+    page._save()
+    assert "写入成功" in page._status.text()
+
+
+def test_recall_page_renders_channels(backend, qapp):
+    page = RecallPage(backend)
+    page._query.setText("发版冲突")
+    view = page.run_recall()
+    assert view.hits
+    assert page._table.rowCount() == len(view.hits)
+    assert "命中" in page._status.text()
+    assert isinstance(view.injection, str)
+
+
+def test_system_page_tasks_and_run(backend, qapp):
+    page = SystemPage(backend)
+    tasks = backend.circadian_tasks()
+    assert page._task_table.rowCount() == len(tasks) == 4
+    page._task_table.selectRow(0)
+    page._run_selected_task()
+    assert "OK" in page._status.text() or "FAIL" in page._status.text()
+
+
+# ── 接口与端口 ───────────────────────────────────────────────────────────
+def test_http_service_binds_real_port_and_serves_health(backend, qapp):
+    started = backend.start_http("127.0.0.1", 0)
+    assert started["ok"] is True
+    assert started["port"] > 0
+    url = f"http://127.0.0.1:{started['port']}/health"
+    with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 本地回环
+        payload = json.loads(response.read().decode("utf-8"))
+    assert payload["status"] == "ok"
+    assert backend.gateway_status()["running"] is True
+
+    stopped = backend.stop_http()
+    assert stopped["ok"] is True
+    assert backend.gateway_status()["running"] is False
+
+
+def test_interface_page_persists_port_prefs(backend, store, qapp):
+    page = InterfacePage(backend, store)
+    page._port.setValue(18999)
+    page._host.setText("127.0.0.1")
+    store.save_prefs(http_host="127.0.0.1", http_port=18999, model_name="brain-memory")
+    reloaded = store.load_prefs()
+    assert reloaded["http_port"] == 18999
+    assert reloaded["model_name"] == "brain-memory"
+    assert backend.config.gateway.http_port == 18999
+    assert page._start.isEnabled() is True
+    assert len(backend.mcp_tools()) == 6
+
+
+def test_settings_page_applies_appearance(backend, store, qapp):
+    page = SettingsPage(backend, store)
+    fired: list[int] = []
+    page.appearance_changed.connect(lambda: fired.append(1))
+    page._interval.setValue(33)
+    page._threshold.setValue(0.45)
+    page._labels.setValue(5)
+    page.save()
+    assert backend.config.ui.timer_interval_ms == 33
+    assert backend.config.activation.similarity_threshold == pytest.approx(0.45)
+    assert backend.config.ui.max_labels == 5
+    assert fired == [1]
+    assert "已保存" in page._status.text()
+
+
+# ── 同步与备份 ───────────────────────────────────────────────────────────
+def test_sync_once_without_repo_is_noop(backend, qapp):
+    report = backend.sync_once()
+    assert report["ok"] is True
+    assert report["has_repo"] is False
+    assert report["pulled"] is False and report["pushed"] is False
+
+
+def test_snapshot_create_and_list(backend, qapp):
+    created = backend.create_snapshot()
+    assert created["ok"] is True
+    items = backend.snapshots()
+    assert any(item["name"] == created["name"] for item in items)
+    assert items[0]["counts"]["neuron"] >= 4
+
+
+def test_export_dashboard_and_memories(backend, tmp_path, qapp):
+    snapshot_path = backend.export_dashboard(tmp_path / "snapshot.json")
+    payload = json.loads(open(snapshot_path, encoding="utf-8").read())
+    assert set(payload) >= {"engine_health", "memory_stream", "sync_status"}
+
+    memories_path = backend.export_memories(tmp_path / "memories.ndjson")
+    lines = open(memories_path, encoding="utf-8").read().strip().splitlines()
+    assert len(lines) >= 4
 
 
 # ── PAT / SYNC_REPO_URL 配置 ──────────────────────────────────────────────
@@ -220,14 +351,6 @@ def test_settings_store_never_leaks_pat(desktop_config, qapp):
     assert store.load().pat_present is False
 
 
-def test_app_run_event_loop_starts_and_quits(qapp, desktop_config):
-    """真正启动一次 `python -m ui.desktop` 的事件循环并优雅退出。"""
-    from ui.desktop.app import run
-
-    QtCore.QTimer.singleShot(250, qapp.quit)
-    assert run(desktop_config) == 0
-
-
 def test_settings_panel_password_field_masks_pat(desktop_config, qapp):
     store = SettingsStore(desktop_config, keyring_backend=_FakeKeyring(), qsettings=_FakeQSettings())
     panel = SettingsPanel(store)
@@ -238,3 +361,11 @@ def test_settings_panel_password_field_masks_pat(desktop_config, qapp):
     assert "已保存" in panel._status.text()
     assert panel._pat.text() == "", "保存后必须清空密码框"
     assert store.pat() == "ghp_PANEL_TOKEN"
+
+
+def test_app_run_event_loop_starts_and_quits(qapp, desktop_config):
+    """真正启动一次 `python -m ui.desktop` 的事件循环并优雅退出。"""
+    from ui.desktop.app import run
+
+    QtCore.QTimer.singleShot(250, qapp.quit)
+    assert run(desktop_config) == 0

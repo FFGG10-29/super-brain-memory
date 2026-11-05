@@ -1,6 +1,6 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-05）：**72 passed**（含桌面前端 11 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-05）：**83 passed**（含桌面前端 22 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅
@@ -82,25 +82,35 @@
 `tests/test_pad_chain.py` 一段用例串起：①生成 ②建模 ③存储 ④检索 ⑤巩固 ⑥生命循环 ⑦同步 ⑧可视化。
 另有规则兜底用例（无 LLM 也不断链）与冷静期不改写已存 PAD 用例。
 
-## 桌面前端 PySide6 ✅（2026-11-05 新增）
+## 桌面前端 PySide6 · LivingMemory 控制台 ✅（2026-11-05 新增，同日重构）
 
 > 启动：`python -m ui.desktop`；离屏预览：`python scripts/nebula_preview.py` → `data/nebula_preview.png`
-> 验收：`pytest tests/test_desktop.py -q` → **11 passed**（含真实事件循环启停）
+> 验收：`pytest tests/test_desktop.py -q` → **22 passed**（含真实 socket 端口 + 事件循环启停）
+
+布局（对齐 LivingMemory）：左侧 220px 导航九页 · 顶栏（空间选择/返回全景/全局搜索/导出/管理数据/全屏）·
+中央星云 · 右下迷你地图 + 浮动按钮 · 底部统计状态栏。
 
 | 验收项 | 状态 | 证据 |
 |---|---|---|
-| 星云节点来自真实记忆库（非随机假数据） | ✅ | `DesktopBackend.graph()` → `ActivationService.build()`；4 条真实写入 → 4 节点 |
-| 语义突触线 = 真实余弦相似度 | ✅ | `brain/activation.py`；无 ONNX 模型时降级字符 2-gram 且 `degraded=True` 明示 |
-| 视觉近邻线 + 固定画布 | ✅ | `NebulaView.update_lines()`；`scene.setSceneRect(0,0,1000,800)` |
+| 星云节点来自真实记忆库（非随机假数据） | ✅ | `DesktopBackend.graph()` → `ActivationService.build()`；26 条真实写入 → 26 节点 |
+| 语义突触线 = 真实余弦相似度 | ✅ | `brain/activation.py`；无 ONNX 时降级字符 2-gram 且 `degraded=True` 明示 |
+| LivingMemory 视觉语言 | ✅ | `pages/nebula_page.py`：星尘 `drawBackground`、记忆标签（情绪优先/朝中心避让）、迷你地图视口矩形 |
+| 空间切换（全部/各分层/情感记忆） | ✅ | `state` 顶栏下拉 → `DesktopBackend._filter_graph`；`test_spaces_filter_emotion_only` |
 | Lerp 光脉冲 / 终点闪烁 / 跟随漂移节点 | ✅ | `test_lerp_pulse_travels_flashes_and_is_destroyed`、`test_pulse_follows_drifting_nodes` |
-| 一次检索 → 中心向 N 条命中齐射 | ✅ | `MemoryPanel.do_search` → `emit_from_center(activations)` |
-| 双击记忆 → 相似记忆突触扩散 | ✅ | `MemoryPanel.activate_related` → `emit_pulses` |
-| 真实渲染出画面 | ✅ | `test_render_scene_to_image`（两帧像素不同）+ 预览 PNG |
+| 检索 → 中心向 N 条命中齐射 + 高亮标签 | ✅ | 顶栏搜索 / 召回页「在星云中激活」→ `emit_from_center` |
+| 双击记忆 → 定位并高亮神经元 | ✅ | `MemoryPage.focus_requested` → `NebulaPage.focus` → `focus_on` |
+| 九页功能齐全 | ✅ | 星云 / 记忆管理 / 召回测试 / 系统概览 / 展示数据 / 接口与端口 / 同步与备份 / 设置 / 关于 |
+| **端口配置 + 一键启停（真实 socket）** | ✅ | `start_http("127.0.0.1", 0)` → 内核分配端口 → urllib 请求 `/health` 返回 `{"status":"ok"}` |
+| 端口/偏好持久化 | ✅ | `SettingsStore.load_prefs/save_prefs` → 用户级 QSettings，并即时回写 `config` |
+| MCP 工具清单与接入串 | ✅ | 6 个工具；agent_id + 令牌掩码；curl 示例随端口生成 |
+| 同步/快照/导出/调度可操作 | ✅ | `sync_once`（无仓库 no-op）、`create_snapshot` + 列表、导出 JSON/NDJSON、手动跑 circadian 任务 |
+| 真实渲染出画面 | ✅ | `test_render_scene_to_image`（两帧像素不同）+ 整窗 `window.grab()` 预览 PNG |
 | PAT / SYNC_REPO_URL 前端配置 | ✅ | `SettingsPanel` 密码框；`SettingsStore` 钥匙串 + QSettings |
 | PAT 不入库/不入事件/不回显 | ✅ | 内存替身用例断言明文不进 QSettings、状态只显示掩码 |
-| 动画/配色参数全外置 | ✅ | `config.UiConfig` / `ActivationConfig` |
+| 动画/配色/阈值参数全外置 | ✅ | `config.UiConfig` / `ActivationConfig`（帧率、阈值、标签数均可在设置页调整） |
 
 依赖已进 `requirements.txt`：`PySide6-Essentials==6.12.0`、`keyring==25.7.0`。
+预览图渲染注意：offscreen 平台字体库为空，脚本会显式注入 `C:/Windows/Fonts/msyh.ttc`，否则中文变豆腐块。
 
 ## 明确未做（不在本次七阶段任务内）
 

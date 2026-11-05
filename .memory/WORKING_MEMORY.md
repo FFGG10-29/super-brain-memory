@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + PySide6 桌面前端全部落地，72 用例全过**
+> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + LivingMemory 风格桌面控制台全部落地，83 用例全过**
 
 ## 1. 进度总览
 
@@ -15,9 +15,10 @@
 | 5 同步平面 | ✅ | projections/git_worker/snapshot；双机收敛、断网零丢失、幂等、冷启动重建全测过 |
 | 6 可视与打磨 | ✅ | 六面板数据源 + Dashboard + eval 基线 + 结构化日志 + 备份脚本 |
 | PAD 全链路 | ✅ 8/8 | `tests/test_pad_chain.py` |
-| PySide6 桌面前端 | ✅ | `ui/desktop/`：星云脉冲 + 记忆查看 + PAT/仓库配置；10 条用例 |
+| PySide6 桌面控制台 | ✅ | `ui/desktop/`：九页（星云/记忆/召回/系统/数据/接口端口/同步/设置/关于）；22 条用例 |
 
-启动：`python -m ui.desktop`（可交互）；`python scripts/nebula_preview.py`（离屏出图到 `data/nebula_preview.png`）。
+启动：`python -m ui.desktop`（可交互）；`python scripts/nebula_preview.py`（整窗离屏出图到 `data/nebula_preview.png`）。
+端口：接口与端口页可改 host/port 并一键启停 HTTP 适配器；偏好存用户级 QSettings。
 未做（明确边界）：官方 MCP SDK 传输装配、NiceGUI 图形页、真实 GPU/模型权重、真实 GitHub 私库联调。
 详见 `.memory/ACCEPTANCE.md` 末尾。
 
@@ -28,6 +29,7 @@
 - 未装（按降级实现）：`onnxruntime`、`llama-cpp-python`、`fastapi`、`mcp`、`nicegui`、`apscheduler`。
 - Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
 - Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；`SettingsStore.test_connection()` 因此只探测 `shutil.which("git")`。
+- Qt offscreen 平台字体库为空：预览脚本必须 `QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")`，否则中文全是方块。
 - shell 是 **PowerShell**：别用 `cd /d`；调脚本用绝对路径；命令行里 `$var` 会被 PowerShell 展开（探针会静默吃掉 Cypher 参数）。
 
 ## 3. 跑测试的正确姿势（沙箱限制，必看）

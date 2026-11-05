@@ -5,24 +5,44 @@ UI 只允许 import 本模块；它内部通过组合根 `build_app()` 装配，
 """
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass, field
+from typing import Any
+from pathlib import Path
 
 from brain.activation import ActivationGraph, ActivationService
 from brain.memory_browser import MemoryBrowser
 from config import BrainConfig, get_config
+from gateway.http_adapter import HTTPAdapter
+from gateway.mcp_server import MCPToolkit
+from gateway.registry import AgentRegistry
 from main import build_app
+from sync.git_worker import GitSyncWorker
+from sync.projections import EventProjector
+from sync.snapshot import SnapshotManager
 from ui.dashboard import Dashboard
 
-__all__ = ["DesktopBackend", "RecallView"]
+__all__ = ["DesktopBackend", "HttpState", "RecallView"]
 
 
 @dataclass
 class RecallView:
     query: str
-    hits: list[dict] = field(default_factory=list)
+    hits: list[dict[str, Any]] = field(default_factory=list)
     activations: list[tuple[str, float]] = field(default_factory=list)
     injection: str = ""
     degraded: bool = False
+
+
+@dataclass
+class HttpState:
+    running: bool = False
+    host: str = ""
+    port: int = 0
+    agent_id: str = ""
+    token_hint: str = ""
+    error: str = ""
 
 
 class DesktopBackend:
@@ -32,6 +52,11 @@ class DesktopBackend:
         self._activation: ActivationService | None = None
         self._browser: MemoryBrowser | None = None
         self._dashboard: Dashboard | None = None
+        self._gateway = None
+        self._http_server = None
+        self._http_thread: threading.Thread | None = None
+        self._http_state = HttpState()
+        self._sync_worker: GitSyncWorker | None = None
         if auto_start:
             self.start()
 
@@ -52,6 +77,7 @@ class DesktopBackend:
 
     def close(self) -> None:
         if self._app is not None:
+            self.stop_http()
             self._app.circadian.stop()
             self._app.journal.flush()
             self._app.close()
@@ -62,15 +88,40 @@ class DesktopBackend:
         return self._config
 
     # ── 星云数据 ──────────────────────────────────────────────────────────
-    def graph(self) -> ActivationGraph:
-        self.start()
-        assert self._activation is not None
-        return self._activation.build()
-
-    def memories(self, *, limit: int = 80) -> list[dict]:
+    def spaces(self) -> list[str]:
+        """顶栏"空间"下拉：全部 + 实际存在的分层 + 情感记忆。"""
         self.start()
         assert self._browser is not None
-        return self._browser.list(limit=limit)
+        tiers = sorted({str(row["tier"]) for row in self._browser.list(limit=500)})
+        return ["全部", *tiers, "情感记忆"]
+
+    def graph(self, *, space: str = "全部") -> ActivationGraph:
+        self.start()
+        assert self._activation is not None
+        return self._filter_graph(self._activation.build(), space)
+
+    @staticmethod
+    def _filter_graph(graph: ActivationGraph, space: str) -> ActivationGraph:
+        if space in ("", "全部", "all"):
+            return graph
+        if space == "情感记忆":
+            nodes = [node for node in graph.nodes if node.is_emotion]
+        else:
+            nodes = [node for node in graph.nodes if node.tier == space]
+        keep = {node.id for node in nodes}
+        return ActivationGraph(
+            nodes=nodes,
+            edges=[edge for edge in graph.edges if edge.source in keep and edge.target in keep],
+            source=graph.source,
+            degraded=graph.degraded,
+        )
+
+    def memories(
+        self, *, limit: int = 80, tier: str | None = None, memory_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.start()
+        assert self._browser is not None
+        return self._browser.list(limit=limit, tier=tier, memory_type=memory_type)
 
     def memory_detail(self, memory_id: str) -> str:
         self.start()
@@ -88,24 +139,29 @@ class DesktopBackend:
         hits = self._app.prefrontal.recall(
             query, agent_id=agent_id, limit=limit or self._config.recall.top_k
         )
-        rows = [
+        rows: list[dict[str, Any]] = [
             {
-                "id": hit.neuron.uuid7_id,
+                "id": str(hit.neuron.uuid7_id),
                 "content": hit.neuron.content,
-                "score": round(hit.score, 4),
+                "score": round(float(hit.score), 4),
                 "channels": list(hit.channels),
                 "pad": hit.neuron.pad.as_tuple(),
             }
             for hit in hits
         ]
-        similarities = dict(self._activation.activation_scores(query, [row["id"] for row in rows]))
-        max_score = max((row["score"] for row in rows), default=1.0) or 1.0
-        activations = [
+        hit_ids = [str(row["id"]) for row in rows]
+        similarities = dict(self._activation.activation_scores(query, hit_ids))
+        max_score = max((float(row["score"]) for row in rows), default=1.0) or 1.0
+        activations: list[tuple[str, float]] = [
             (
-                row["id"],
-                round(0.5 * similarities.get(row["id"], 0.0) + 0.5 * (row["score"] / max_score), 4),
+                hit_ids[index],
+                round(
+                    0.5 * similarities.get(hit_ids[index], 0.0)
+                    + 0.5 * (float(rows[index]["score"]) / max_score),
+                    4,
+                ),
             )
-            for row in rows
+            for index in range(len(rows))
         ]
         return RecallView(
             query=query,
@@ -127,14 +183,201 @@ class DesktopBackend:
         ]
         return targets[: self._config.activation.max_pulses]
 
-    def save_memory(self, content: str, *, agent_id: str = "desktop") -> dict:
+    def save_memory(self, content: str, *, agent_id: str = "desktop") -> dict[str, Any]:
         self.start()
         assert self._app is not None
         result = self._app.hippocampus.remember(content, agent_id=agent_id)
         return {"applied": result.applied, "id": result.neuron.uuid7_id, "reason": result.admission.reason}
 
     # ── 状态面板 ──────────────────────────────────────────────────────────
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         self.start()
         assert self._dashboard is not None
         return self._dashboard.snapshot()
+
+    # ── 网关：端口配置 + 一键启停 ────────────────────────────────────────
+    def gateway_status(self) -> dict[str, Any]:
+        return {
+            "running": self._http_state.running,
+            "host": self._http_state.host,
+            "port": self._http_state.port,
+            "agent_id": self._http_state.agent_id,
+            "token_hint": self._http_state.token_hint,
+            "error": self._http_state.error,
+            "config_host": self._config.gateway.http_host,
+            "config_port": self._config.gateway.http_port,
+        }
+
+    def start_http(self, host: str, port: int) -> dict[str, Any]:
+        """真实绑定端口并起后台线程；端口被占用时返回结构化错误而非抛栈。"""
+        self.start()
+        if self._http_state.running:
+            return {**self.gateway_status(), "ok": True, "message": "服务已在运行"}
+        try:
+            registry, _, adapter = self._ensure_gateway()
+            server = adapter.make_server(host=host, port=int(port))
+        except OSError as exc:
+            self._http_state = HttpState(error=f"端口绑定失败：{exc}")
+            return {"ok": False, "message": self._http_state.error, **self.gateway_status()}
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
+        thread.start()
+        self._http_server, self._http_thread = server, thread
+        agent_id, token = registry.register("desktop-ui")
+        actual_host, actual_port = server.server_address[0], int(server.server_address[1])
+        self._http_state = HttpState(
+            running=True, host=str(actual_host), port=actual_port,
+            agent_id=agent_id, token_hint=f"{token[:6]}…",
+        )
+        self._config.gateway.http_host = host
+        self._config.gateway.http_port = int(port)
+        return {**self.gateway_status(), "ok": True, "message": f"HTTP 适配器已启动 http://{actual_host}:{actual_port}"}
+
+    def stop_http(self) -> dict[str, Any]:
+        server, thread = self._http_server, self._http_thread
+        self._http_server, self._http_thread = None, None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._http_state = HttpState()
+        return {**self.gateway_status(), "ok": True, "message": "HTTP 适配器已停止"}
+
+    def _ensure_gateway(self):
+        if self._gateway is not None:
+            return self._gateway
+        self.start()
+        assert self._app is not None
+        registry = AgentRegistry(
+            self._app.storage.kv, timeseries=self._app.storage.timeseries, config=self._config
+        )
+        toolkit = MCPToolkit(
+            registry=registry,
+            hippocampus=self._app.hippocampus,
+            prefrontal=self._app.prefrontal,
+            relational=self._app.storage.relational,
+            engines=self._app.storage.all(),
+            config=self._config,
+        )
+        adapter = HTTPAdapter(registry=registry, toolkit=toolkit, config=self._config)
+        self._gateway = (registry, toolkit, adapter)
+        return self._gateway
+
+    @staticmethod
+    def mcp_tools() -> list[dict[str, Any]]:
+        return [
+            {"name": "save_memory", "desc": "写入记忆：丘脑路由 + SimHash 去重 + 六引擎落库"},
+            {"name": "recall_memory", "desc": "召回：FTS/向量/图谱/时间四通道 RRF + 重排序 + 注入"},
+            {"name": "timeline_query", "desc": "时间轴查询：按事件时间窗口取记忆"},
+            {"name": "profile_read", "desc": "读取 profile 类型记忆（画像槽位）"},
+            {"name": "conflict_report", "desc": "冲突报告：被封存/被推翻的记忆清单"},
+            {"name": "health_check", "desc": "六引擎健康检查"},
+        ]
+
+    # ── 生命循环：手动触发调度任务 ──────────────────────────────────────
+    def circadian_tasks(self) -> list[dict[str, Any]]:
+        self.start()
+        assert self._app is not None
+        return [
+            {"name": task.name, "at": f"{task.hour:02d}:{task.minute:02d}", "last_run": task.last_run or "—"}
+            for task in self._app.circadian.tasks
+        ]
+
+    def run_task(self, name: str) -> dict[str, Any]:
+        self.start()
+        assert self._app is not None
+        for task in self._app.circadian.tasks:
+            if task.name == name:
+                try:
+                    result = task.callback()
+                except Exception as exc:  # noqa: BLE001  单任务失败不拖垮 UI
+                    return {"ok": False, "task": name, "message": f"{type(exc).__name__}: {exc}"}
+                return {"ok": True, "task": name, "message": str(result)[:300] or "已执行"}
+        return {"ok": False, "task": name, "message": "任务不存在"}
+
+    # ── 同步与备份 ────────────────────────────────────────────────────────
+    def sync_once(self) -> dict[str, Any]:
+        """手动 pull → replay → push（无仓库/无网络时 git 步骤自动 no-op）。"""
+        self.start()
+        assert self._app is not None
+        if self._sync_worker is None:
+            projector = EventProjector(
+                relational=self._app.storage.relational,
+                vector=self._app.storage.vector,
+                graph=self._app.storage.graph,
+                hypergraph=self._app.storage.hypergraph,
+                timeseries=self._app.storage.timeseries,
+                kv=self._app.storage.kv,
+                embedder=self._app.embedder,
+            )
+            self._sync_worker = GitSyncWorker(
+                root=self._config.sync.local_repo_dir,
+                device_id=self._config.sync.device_id,
+                event_store=self._app.event_store,
+                projector=projector,
+                remote=self._config.sync.remote_name,
+                sync_interval_sec=self._config.sync.sync_interval_sec,
+                write_debounce_sec=self._config.sync.write_debounce_sec,
+            )
+        report = self._sync_worker.sync_once()
+        return {
+            "ok": report.ok,
+            "pulled": report.pulled,
+            "replayed": report.replayed,
+            "skipped": report.skipped,
+            "pushed": report.pushed,
+            "errors": report.errors,
+            "has_repo": self._sync_worker.has_repo,
+        }
+
+    def create_snapshot(self) -> dict[str, Any]:
+        self.start()
+        assert self._app is not None
+        manager = SnapshotManager(
+            self._config.sync.local_repo_dir, schema_version=self._config.sync.schema_version
+        )
+        stamp = self._app.journal.last_stamp()
+        path = manager.create(
+            self._app.storage.relational,
+            hlc_cutoff=stamp.to_token() if stamp is not None else "0:0:local",
+        )
+        return {"ok": True, "path": str(path), "name": path.name}
+
+    def snapshots(self) -> list[dict[str, Any]]:
+        root = Path(self._config.sync.local_repo_dir) / "snapshots"
+        if not root.exists():
+            return []
+        items: list[dict[str, Any]] = []
+        for folder in sorted(root.iterdir(), reverse=True):
+            manifest = folder / "manifest.json"
+            if not manifest.exists():
+                continue
+            try:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            items.append(
+                {
+                    "name": folder.name,
+                    "created_at_ms": payload.get("created_at_ms", 0),
+                    "hlc_cutoff": payload.get("hlc_cutoff", ""),
+                    "counts": payload.get("counts", {}),
+                }
+            )
+        return items
+
+    # ── 导出 ──────────────────────────────────────────────────────────────
+    def export_dashboard(self, path: str | Path) -> str:
+        target = Path(path)
+        target.write_text(
+            json.dumps(self.snapshot(), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+        return str(target)
+
+    def export_memories(self, path: str | Path, *, limit: int = 5000) -> str:
+        target = Path(path)
+        rows = self.memories(limit=limit)
+        with open(target, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        return str(target)

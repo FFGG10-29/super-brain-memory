@@ -181,8 +181,8 @@ class UiConfig(BaseSettings):
     emotion_node_color: str = "#FF3264"
     line_color: str = "#64C8FF"
     pulse_color: str = "#FFFFFF"
-    normal_node_radius: float = 7.0
-    emotion_node_radius: float = 12.0
+    normal_node_radius: float = 8.0
+    emotion_node_radius: float = 13.0
     center_x: float = 500.0
     center_y: float = 400.0
     center_pull: float = 0.0005                 # 向心力
@@ -192,7 +192,13 @@ class UiConfig(BaseSettings):
     link_distance: float = 180.0                # 视觉近邻连线半径
     proximity_line_alpha: int = 165             # 近邻线基础透明度（语义边更亮）
     pulse_radius: float = 6.0                   # 光点半径
-    flash_decay: float = 0.05                   # 终点闪烁衰减
+    flash_decay: float = 0.05
+    max_labels: int = 8                        # 同屏最多记忆标签（避免重叠）
+    stardust_count: int = 260                   # 背景星尘点数
+    stardust_color: str = "#33496B"
+    label_color: str = "#8FA6C4"
+    label_font_size: int = 10
+    dim_opacity: float = 0.28                   # 高亮时其余节点/连线透明度                   # 终点闪烁衰减
     glow_multiplier: float = 2.5
     window_width: int = 1400
     window_height: int = 900
