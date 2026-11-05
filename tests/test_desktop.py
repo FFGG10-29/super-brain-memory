@@ -207,9 +207,9 @@ def test_spaces_filter_emotion_only(qapp):
     assert [node.id for node in DesktopBackend._filter_graph(graph, "全部").nodes] == ["a", "b"]
 
 
-def test_main_window_nine_pages_and_status(backend, store, desktop_config, qapp):
+def test_main_window_pages_and_status(backend, store, desktop_config, qapp):
     window = MainWindow(backend, store, desktop_config)
-    assert window._nav.count() == 9
+    assert window._nav.count() == 10
     assert "引擎" in window._status_label.text()
     assert window._space.count() >= 3, "空间下拉必须包含 全部/分层/情感记忆"
 
@@ -257,7 +257,10 @@ def test_system_page_tasks_and_run(backend, qapp):
     assert page._task_table.rowCount() == len(tasks) == 4
     page._task_table.selectRow(0)
     page._run_selected_task()
-    assert "OK" in page._status.text() or "FAIL" in page._status.text()
+    assert "执行成功" in page._status.text() or "执行失败" in page._status.text()
+    # 中文注解：引擎表有「它在干什么」列，任务表有说明列
+    assert page._engine_table.columnCount() == 5
+    assert page._task_table.item(0, 2).text()
 
 
 # ── 接口与端口 ───────────────────────────────────────────────────────────

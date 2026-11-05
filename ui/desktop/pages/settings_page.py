@@ -1,22 +1,25 @@
-"""ui.desktop.pages.settings_page —— 配置中心：预设 / 全量参数 / 云端模型 / 内核重启。
+"""ui.desktop.pages.settings_page —— 配置中心：预设 + 全量参数自动表单。
 
-打包成软件后，所有参数在这里改，写用户目录差异补丁（%APPDATA%/super-brain/config.json），
-下次启动自动恢复；存储开关、模型来源等启动期参数点「应用并重启内核」即时生效，无需重装。
-密钥（GitHub PAT / 云端 API key）只进系统钥匙串，绝不进配置文件。
+模型接入（本地/云端、API key、本地模型文件）在独立的「模型配置」页。
+打包成软件后所有参数在这里改，写用户目录差异补丁，下次启动自动恢复；
+引擎开关等启动期参数点「应用并重启内核」即时生效，无需重装。
 """
 from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from config import BrainConfig
 from ui.desktop.backend import DesktopBackend
 from ui.desktop.settings import SettingsStore
-from ui.desktop.user_config import preset_names
+from ui.desktop.user_config import PRESET_NOTES, preset_names
 from ui.desktop.widgets import Card, ConfigEditor
 
 __all__ = ["SettingsPage"]
 
-_PRESET_TITLES = {"balanced": "均衡默认（出厂）", "performance": "性能全开", "lite": "低配省电"}
+_PRESET_TITLES = {
+    "balanced": "均衡默认（出厂 · 中肯推荐）",
+    "igpu": "核显 / 无独显（省电流畅）",
+    "dgpu": "独显（全火力）",
+}
 
 _UI_EXCLUDE = {
     "background_color", "node_color", "emotion_node_color", "line_color", "pulse_color",
@@ -28,7 +31,6 @@ _UI_EXCLUDE = {
 
 class SettingsPage(QtWidgets.QWidget):
     appearance_changed = QtCore.Signal()
-    kernel_restarted = QtCore.Signal()
 
     def __init__(self, backend: DesktopBackend, store: SettingsStore) -> None:
         super().__init__()
@@ -39,57 +41,25 @@ class SettingsPage(QtWidgets.QWidget):
         self._preset = QtWidgets.QComboBox()
         for name in preset_names():
             self._preset.addItem(_PRESET_TITLES.get(name, name), name)
+        self._preset_note = QtWidgets.QLabel("")
+        self._preset_note.setObjectName("hint")
+        self._preset_note.setWordWrap(True)
+        self._preset.currentIndexChanged.connect(self._show_preset_note)
         apply_preset = QtWidgets.QPushButton("应用预设")
         apply_preset.setObjectName("primary")
+        apply_preset.setToolTip("把该预设的一组参数写入配置并立即生效；存储/模型参数需再点「应用并重启内核」")
         apply_preset.clicked.connect(self._apply_preset)
         preset_row = QtWidgets.QHBoxLayout()
         preset_row.addWidget(QtWidgets.QLabel("一键预设"))
         preset_row.addWidget(self._preset, 1)
         preset_row.addWidget(apply_preset)
-        preset_card = Card("预设方案（应用后可再微调任意参数）")
+        preset_card = Card("预设方案 —— 按你的硬件选一个起点，之后任意参数都可微调（模型在「模型配置」页）")
         preset_card.body.addLayout(preset_row)
-
-        # ── 云端模型密钥 ──────────────────────────────────────────────────
-        self._cloud_key = QtWidgets.QLineEdit()
-        self._cloud_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self._cloud_key.setPlaceholderText("OpenAI 兼容 API key；留空=不改动")
-        save_key = QtWidgets.QPushButton("保存到钥匙串")
-        save_key.clicked.connect(self._save_cloud_key)
-        status = self._backend.model_status()
-        key_hint = QtWidgets.QLabel(
-            f"当前状态：云端地址 {'已配置' if status['cloud_ready'] else '未配置'} · "
-            f"key {'已存钥匙串/环境变量' if status['cloud_key_present'] else '未配置'}"
-        )
-        key_hint.setObjectName("hint")
-        key_card = Card("云端模型密钥（系统钥匙串；不写配置文件/事件日志）")
-        key_row = QtWidgets.QHBoxLayout()
-        key_row.addWidget(self._cloud_key, 1)
-        key_row.addWidget(save_key)
-        key_card.body.addLayout(key_row)
-        key_card.body.addWidget(key_hint)
+        preset_card.body.addWidget(self._preset_note)
+        self._show_preset_note()
 
         # ── 全量参数（自动表单）──────────────────────────────────────────
-        config = backend.config
-        self._editor = ConfigEditor(
-            (
-                ("存储引擎", config.storage),
-                ("模型（本地 / 云端）", config.model),
-                ("召回与精排", config.recall),
-                ("遗忘与强化（FSRS）", config.plasticity),
-                ("分层流动", config.tier),
-                ("丘脑准入与去重", config.thalamus),
-                ("情感阈值（PAD / 冷静期）", config.amygdala),
-                ("同步参数", config.sync),
-                ("网关", config.gateway),
-                ("星云激活", config.activation),
-                ("外观与动画", config.ui),
-            ),
-            excludes={
-                "同步参数": {"repo_url"},
-                "网关": {"mcp_token_secret"},
-                "外观与动画": _UI_EXCLUDE,
-            },
-        )
+        self._editor = self._build_editor()
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._editor)
@@ -98,12 +68,15 @@ class SettingsPage(QtWidgets.QWidget):
         # ── 操作 ──────────────────────────────────────────────────────────
         save = QtWidgets.QPushButton("保存配置")
         save.setObjectName("primary")
+        save.setToolTip("把所有参数写入用户配置文件并即时生效；悬停任意参数名可查看它管什么")
         save.clicked.connect(self.save)
         restart = QtWidgets.QPushButton("应用并重启内核")
         restart.setObjectName("primary")
+        restart.setToolTip("引擎开关等启动期参数需要这一步；记忆数据不会丢")
         restart.clicked.connect(self.restart_kernel)
         reset = QtWidgets.QPushButton("恢复出厂默认")
         reset.setObjectName("danger")
+        reset.setToolTip("清除全部自定义参数，回到出厂中肯值；记忆数据不受影响")
         reset.clicked.connect(self.reset_defaults)
         actions = QtWidgets.QHBoxLayout()
         actions.addWidget(save)
@@ -118,55 +91,15 @@ class SettingsPage(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 12)
         layout.addWidget(preset_card)
-        layout.addWidget(key_card)
         layout.addWidget(scroll, 1)
         layout.addLayout(actions)
         layout.addWidget(self._status)
 
-    # ── 动作 ──────────────────────────────────────────────────────────────
-    def _apply_preset(self) -> None:
-        name = str(self._preset.currentData())
-        result = self._backend.apply_preset(name)
-        self._status.setText(str(result["message"]))
-        if result.get("ok"):
-            self._reload_editor()
-            self.appearance_changed.emit()
-
-    def _save_cloud_key(self) -> None:
-        result = self._backend.save_cloud_key(self._cloud_key.text())
-        self._cloud_key.clear()
-        self._status.setText(str(result["message"]))
-
-    def save(self) -> None:
-        result = self._backend.save_settings_patch(self._editor.collect())
-        self._status.setText(str(result["message"]))
-        self.appearance_changed.emit()
-
-    def restart_kernel(self) -> None:
-        result = self._backend.restart()
-        self._status.setText(
-            f"{result['message']}（当前模型：{self._backend.model_status()['embedder']['kind']}）"
-        )
-        if result.get("ok"):
-            self.kernel_restarted.emit()
-            self.appearance_changed.emit()
-
-    def reset_defaults(self) -> None:
-        result = self._backend.reset_settings()
-        self._status.setText(str(result["message"]))
-        self._reload_editor()
-
-    def _reload_editor(self) -> None:
-        """用当前 config 值重建表单（预设/重置后刷新显示）。"""
-        layout = self.layout()
-        assert layout is not None
-        layout.replaceWidget(self._editor, QtWidgets.QWidget())
-        self._editor.deleteLater()
+    def _build_editor(self) -> ConfigEditor:
         config = self._backend.config
-        self._editor = ConfigEditor(
+        return ConfigEditor(
             (
                 ("存储引擎", config.storage),
-                ("模型（本地 / 云端）", config.model),
                 ("召回与精排", config.recall),
                 ("遗忘与强化（FSRS）", config.plasticity),
                 ("分层流动", config.tier),
@@ -183,14 +116,41 @@ class SettingsPage(QtWidgets.QWidget):
                 "外观与动画": _UI_EXCLUDE,
             },
         )
-        scroll_index = next(
-            (index for index in range(layout.count()) if layout.itemAt(index).widget() is not None
-             and isinstance(layout.itemAt(index).widget(), QtWidgets.QScrollArea)),
-            None,
-        )
-        if scroll_index is not None:
-            scroll_item = layout.itemAt(scroll_index)
-            assert scroll_item is not None
-            scroll_widget = scroll_item.widget()
-            assert isinstance(scroll_widget, QtWidgets.QScrollArea)
-            scroll_widget.setWidget(self._editor)
+
+    # ── 动作 ──────────────────────────────────────────────────────────────
+    def _show_preset_note(self) -> None:
+        name = str(self._preset.currentData())
+        self._preset_note.setText(PRESET_NOTES.get(name, ""))
+
+    def _apply_preset(self) -> None:
+        name = str(self._preset.currentData())
+        result = self._backend.apply_preset(name)
+        self._status.setText(str(result["message"]))
+        if result.get("ok"):
+            self._reload_editor()
+            self.appearance_changed.emit()
+
+    def save(self) -> None:
+        result = self._backend.save_settings_patch(self._editor.collect())
+        self._status.setText(str(result["message"]))
+        self.appearance_changed.emit()
+
+    def restart_kernel(self) -> None:
+        result = self._backend.restart()
+        self._status.setText(str(result["message"]))
+        if result.get("ok"):
+            self.appearance_changed.emit()
+
+    def reset_defaults(self) -> None:
+        result = self._backend.reset_settings()
+        self._status.setText(str(result["message"]))
+        self._reload_editor()
+
+    def _reload_editor(self) -> None:
+        """预设 / 恢复出厂后：用当前 config 值重建表单。"""
+        old = self._editor
+        self._editor = self._build_editor()
+        scroll = self.findChild(QtWidgets.QScrollArea)
+        if scroll is not None:
+            scroll.setWidget(self._editor)
+        old.deleteLater()

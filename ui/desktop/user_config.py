@@ -105,45 +105,60 @@ def apply_overrides(config: BrainConfig, patches: dict[str, Any]) -> list[str]:
     return changed
 
 
-# ── 预设（"两套默认配置"）────────────────────────────────────────────────
-# balanced：出厂默认（清空补丁即回默认，这里显式写关键项，便于用户看到基准）
-# performance：全引擎全开 + CUDA 尝试 + 高帧率 + 精排开
-# lite：低配设备：关重引擎、低帧率、跳过精排、云 LLM 优先、同步拉长
+# ── 预设（按硬件形态）────────────────────────────────────────────────────
+# balanced：出厂中肯基准（全引擎、CPU 推理、60fps、精排开）——不确定就用它
+# igpu：核显 / 无独显笔记本：模型全走 CPU、关精排、33fps 省电、同步放缓；功能完整
+# dgpu：独显（NVIDIA）：CUDA 加速、LLM 全层上 GPU、60fps、精排开、同步更勤
 PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "balanced": {
         "storage": {"engines_enabled": {
             "relational": True, "vector": True, "graph": True,
             "kv": True, "timeseries": True, "hypergraph": True,
         }},
-        "model": {"model_mode": "auto", "use_cuda": False},
-        "recall": {"rerank_enabled": True, "top_k": 5},
+        "model": {"embedding_backend": "local", "llm_backend": "local", "use_cuda": False, "llm_gpu_layers": -1},
+        "recall": {"rerank_enabled": True, "top_k": 5, "rrf_k_oversample": 4},
         "ui": {"timer_interval_ms": 16, "max_labels": 8, "stardust_count": 260},
-        "activation": {"max_nodes": 80},
+        "activation": {"max_nodes": 80, "max_pulses": 40},
         "sync": {"sync_interval_sec": 300},
     },
-    "performance": {
+    "igpu": {
         "storage": {"engines_enabled": {
             "relational": True, "vector": True, "graph": True,
             "kv": True, "timeseries": True, "hypergraph": True,
         }},
-        "model": {"model_mode": "auto", "use_cuda": True, "llm_gpu_layers": -1},
-        "recall": {"rerank_enabled": True, "top_k": 8, "rrf_k_oversample": 6},
-        "ui": {"timer_interval_ms": 16, "max_labels": 14, "stardust_count": 400},
-        "activation": {"max_nodes": 140, "max_pulses": 60},
-        "sync": {"sync_interval_sec": 120},
-    },
-    "lite": {
-        "storage": {"engines_enabled": {
-            "relational": True, "vector": False, "graph": True,
-            "kv": True, "timeseries": False, "hypergraph": False,
-        }},
-        "model": {"model_mode": "cloud", "use_cuda": False},
+        "model": {"embedding_backend": "local", "llm_backend": "cloud", "use_cuda": False, "llm_gpu_layers": 0},
         "recall": {"rerank_enabled": False, "top_k": 5, "rrf_k_oversample": 3},
         "ui": {"timer_interval_ms": 33, "max_labels": 6, "stardust_count": 120},
         "activation": {"max_nodes": 40, "max_pulses": 20},
         "sync": {"sync_interval_sec": 900},
         "gateway": {"default_rate_limit": 30},
     },
+    "dgpu": {
+        "storage": {"engines_enabled": {
+            "relational": True, "vector": True, "graph": True,
+            "kv": True, "timeseries": True, "hypergraph": True,
+        }},
+        "model": {"embedding_backend": "local", "llm_backend": "local", "use_cuda": True, "llm_gpu_layers": -1},
+        "recall": {"rerank_enabled": True, "top_k": 8, "rrf_k_oversample": 6},
+        "ui": {"timer_interval_ms": 16, "max_labels": 14, "stardust_count": 400},
+        "activation": {"max_nodes": 140, "max_pulses": 60},
+        "sync": {"sync_interval_sec": 120},
+    },
+}
+
+PRESET_NOTES: dict[str, str] = {
+    "balanced": (
+        "出厂推荐（中肯基准）：六引擎全开、CPU 推理、60fps、精排开。\n"
+        "适合大多数设备；不确定选哪个就用它，之后可在下方任意微调。"
+    ),
+    "igpu": (
+        "核显 / 无独显笔记本：本地 LLM 完全走 CPU、对话模型优先云端、关闭精排、\n"
+        "33fps 省电、星云节点减半、同步放缓。功能完整，只是更保守省电。"
+    ),
+    "dgpu": (
+        "独显（NVIDIA）：CUDA 加速、本地 LLM 全部层上 GPU、60fps、精排开、\n"
+        "星云节点更多、召回更宽、同步更频繁。效果最好，功耗最高。"
+    ),
 }
 
 

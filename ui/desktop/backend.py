@@ -227,7 +227,8 @@ class DesktopBackend:
         assert self._app is not None
         model = self._config.model
         return {
-            "mode": model.model_mode,
+            "embedding_backend": model.embedding_backend,
+            "llm_backend": model.llm_backend,
             "embedder": {
                 "kind": type(self._app.embedder).__name__,
                 "dim": self._app.embedder.dense_dim,

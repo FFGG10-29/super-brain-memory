@@ -213,58 +213,54 @@ def build_storage(config: BrainConfig) -> StorageSet:
 
 
 def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
-    """按 model_mode 装配三模型：local / cloud / auto。
+    """按每类模型各自的 backend（local/cloud）装配。
 
-    cloud 模式下某模型未配置（模型名留空或无 key）时自动退回本地实现并打印警告，
+    选了云端的模型：URL / 模型名 / key 任一缺失就退回本地实现并打印警告，
     保证"配置了一半"的设备也能启动 —— 不会因为云 API 抖动而拒绝开机。
     """
-    mode = config.model.model_mode
-    use_cloud = mode == "cloud"
-    if mode == "auto":
-        local_ready = (_resolve_model_dir(config, config.model.embedding_model) is not None)
-        use_cloud = not local_ready
-
-    if use_cloud and config.model.cloud_base_url:
-        from brain.cloud_models import CloudCredentials, CloudEmbedder, CloudLLM, load_cloud_api_key
+    model = config.model
+    credentials = None
+    if model.cloud_base_url:
+        from brain.cloud_models import CloudCredentials, load_cloud_api_key
 
         credentials = CloudCredentials(
-            config.model.cloud_base_url,
-            load_cloud_api_key(config),
-            timeout=config.model.cloud_timeout_sec,
+            model.cloud_base_url, load_cloud_api_key(config), timeout=model.cloud_timeout_sec
         )
-        embedder: Embedder
-        if config.model.cloud_embedding_model:
-            embedder = CloudEmbedder(
-                credentials, config.model.cloud_embedding_model, dense_dim=config.model.cloud_embed_dim
+
+    local_embed_dir = _resolve_model_dir(config, model.embedding_model)
+    if model.embedding_backend == "cloud":
+        if credentials is None or not model.cloud_embedding_model:
+            print("警告：Embedding 选了云端但 API 地址/模型名未配齐，退回本地/降级")
+            embedder: Embedder = BgeM3Embedder(
+                dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
             )
         else:
-            print("警告：cloud 模式未配置 cloud_embedding_model，embedding 退回本地/降级")
-            embedder = BgeM3Embedder(
-                dense_dim=config.model.dense_dim,
-                model_dir=_resolve_model_dir(config, config.model.embedding_model),
-                use_cuda=config.model.use_cuda,
-            )
-        llm: LocalLLM
-        if config.model.cloud_llm_model:
-            llm = CloudLLM(credentials, config.model.cloud_llm_model)
-        else:
-            print("警告：cloud 模式未配置 cloud_llm_model，抽取/总结退回本地/规则")
-            llm = QwenLocalLLM(
-                model_path=str(config.model.llm_gguf_dir / config.model.llm_model),
-                gpu_layers=config.model.llm_gpu_layers,
-            )
+            from brain.cloud_models import CloudEmbedder
+
+            embedder = CloudEmbedder(credentials, model.cloud_embedding_model, dense_dim=model.cloud_embed_dim)
     else:
         embedder = BgeM3Embedder(
-            dense_dim=config.model.dense_dim,
-            model_dir=_resolve_model_dir(config, config.model.embedding_model),
-            use_cuda=config.model.use_cuda,
+            dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
         )
+
+    local_llm_path = model.llm_gguf_dir / model.llm_model
+    if model.llm_backend == "cloud":
+        if credentials is None or not model.cloud_llm_model:
+            print("警告：LLM 选了云端但 API 地址/模型名未配齐，退回本地/规则")
+            llm: LocalLLM = QwenLocalLLM(
+                model_path=str(local_llm_path) if local_llm_path.exists() else None,
+                gpu_layers=model.llm_gpu_layers,
+            )
+        else:
+            from brain.cloud_models import CloudLLM
+
+            llm = CloudLLM(credentials, model.cloud_llm_model)
+    else:
         llm = QwenLocalLLM(
-            model_path=str(config.model.llm_gguf_dir / config.model.llm_model)
-            if (config.model.llm_gguf_dir / config.model.llm_model).exists()
-            else None,
-            gpu_layers=config.model.llm_gpu_layers,
+            model_path=str(local_llm_path) if local_llm_path.exists() else None,
+            gpu_layers=model.llm_gpu_layers,
         )
+
     reranker = create_reranker(
         model_dir=_resolve_model_dir(config, config.model.reranker_model),
         use_cuda=config.model.use_cuda,

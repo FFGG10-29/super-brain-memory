@@ -20,6 +20,7 @@ from ui.desktop.pages import (
     DataPage,
     InterfacePage,
     MemoryPage,
+    ModelPage,
     NebulaPage,
     RecallPage,
     SettingsPage,
@@ -37,6 +38,7 @@ _NAV = (
     ("召回测试", QtWidgets.QStyle.StandardPixmap.SP_BrowserReload),
     ("系统概览", QtWidgets.QStyle.StandardPixmap.SP_DesktopIcon),
     ("展示数据", QtWidgets.QStyle.StandardPixmap.SP_DriveHDIcon),
+    ("模型配置", QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon),
     ("接口与端口", QtWidgets.QStyle.StandardPixmap.SP_DriveNetIcon),
     ("同步与备份", QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton),
     ("设置", QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView),
@@ -61,6 +63,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recall_page = RecallPage(backend)
         self.system_page = SystemPage(backend)
         self.data_page = DataPage(backend)
+        self.model_page = ModelPage(backend)
         self.interface_page = InterfacePage(backend, store)
         self.sync_page = SyncPage(backend, store)
         self.settings_page = SettingsPage(backend, store)
@@ -77,6 +80,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recall_page,
             self.system_page,
             self.data_page,
+            self.model_page,
             self.interface_page,
             self.sync_page,
             self.settings_page,
@@ -214,7 +218,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recall_page.activate_requested.connect(self.activate_query)
         self.recall_page.focus_requested.connect(self.focus_memory)
         self.settings_page.appearance_changed.connect(self._apply_appearance)
-        self.settings_page.kernel_restarted.connect(self._refresh_current)
+        self.model_page.kernel_restarted.connect(self._refresh_current)
 
     def _install_shortcuts(self) -> None:
         for key, slot in (

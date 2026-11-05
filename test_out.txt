@@ -1,0 +1,36 @@
+﻿...............F...........F............................................ [ 75%]
+.......................F                                                 [100%]
+================================== FAILURES ===================================
+___________________ test_main_window_nine_pages_and_status ____________________
+tests\test_desktop.py:211: in test_main_window_nine_pages_and_status
+    window = MainWindow(backend, store, desktop_config)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ui\desktop\main_window.py:105: in __init__
+    self._wire_signals()
+ui\desktop\main_window.py:221: in _wire_signals
+    self.settings_page.kernel_restarted.connect(self._refresh_current)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'SettingsPage' object has no attribute 'kernel_restarted'
+__________________ test_app_run_event_loop_starts_and_quits ___________________
+tests\test_desktop.py:377: in test_app_run_event_loop_starts_and_quits
+    assert run(desktop_config) == 0
+           ^^^^^^^^^^^^^^^^^^^
+ui\desktop\app.py:18: in run
+    window = MainWindow(backend, SettingsStore(backend.config), backend.config)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ui\desktop\main_window.py:105: in __init__
+    self._wire_signals()
+ui\desktop\main_window.py:221: in _wire_signals
+    self.settings_page.kernel_restarted.connect(self._refresh_current)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'SettingsPage' object has no attribute 'kernel_restarted'
+______________ test_model_page_covers_all_model_fields_and_saves ______________
+tests\test_settings_center.py:316: in test_model_page_covers_all_model_fields_and_saves
+    page._editor._bindings  # noqa: B018  ȷ�ϰ󶨴���
+    ^^^^^^^^^^^^
+E   AttributeError: 'ModelPage' object has no attribute '_editor'
+=========================== short test summary info ===========================
+FAILED tests/test_desktop.py::test_main_window_nine_pages_and_status - Attrib...
+FAILED tests/test_desktop.py::test_app_run_event_loop_starts_and_quits - Attr...
+FAILED tests/test_settings_center.py::test_model_page_covers_all_model_fields_and_saves
+3 failed, 93 passed in 35.91s

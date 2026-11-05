@@ -5,6 +5,7 @@ from ui.desktop.pages.about_page import AboutPage
 from ui.desktop.pages.data_page import DataPage
 from ui.desktop.pages.interface_page import InterfacePage
 from ui.desktop.pages.memory_page import MemoryPage
+from ui.desktop.pages.model_page import ModelPage
 from ui.desktop.pages.nebula_page import NebulaPage
 from ui.desktop.pages.recall_page import RecallPage
 from ui.desktop.pages.settings_page import SettingsPage
@@ -16,6 +17,7 @@ __all__ = [
     "DataPage",
     "InterfacePage",
     "MemoryPage",
+    "ModelPage",
     "NebulaPage",
     "RecallPage",
     "SettingsPage",

@@ -143,6 +143,115 @@ FIELD_LABELS: dict[str, str] = {
 }
 
 
+FIELD_HINTS: dict[str, str] = {
+    # 存储
+    "sqlite_path": "主记忆库位置：所有记忆的唯一事实源。改路径等于搬家，旧数据不会自动迁移。",
+    "lancedb_path": "向量库位置：按语义相似度找记忆，是「联想」能力的来源。",
+    "kuzu_path": "关系图谱位置：记录「谁和谁有关」的网络。",
+    "lmdb_path": "KV 仓库位置：你的画像、当前情绪等轻量状态。",
+    "duckdb_path": "时序库位置：情绪轨迹与访问审计，只增不改。",
+    "sqlite_busy_timeout_ms": "数据库被占用时最多等多久（毫秒）。多端同时写报 database is locked 时可调大。",
+    "wal_autocheckpoint": "写入日志多大时自动合并进主库（页数），默认即可。",
+    "lmdb_map_size_mb": "KV 仓库的地址空间上限（不是实际占用），记忆很多时可加大。",
+    "lmdb_max_buckets": "KV 命名子库数量上限。",
+    "duckdb_threads": "时序分析的并行线程数，2 足够。",
+    "engines_enabled": "关掉的引擎读写为空但【不丢数据】：事件日志是唯一真源，重新打开可重放重建。",
+    # 模型
+    "dense_dim": "向量维度，必须与 embedding 模型匹配；修改需重建向量库。",
+    "embedding_model": "语义编码模型（BGE-M3），决定「听懂意思」的能力。",
+    "reranker_model": "二阶段精排模型，对召回结果排序。",
+    "llm_model": "本地小模型文件名（GGUF），用于结构化抽取与总结。",
+    "llm_gguf_dir": "本地模型文件所在目录。",
+    "use_cuda": "有 NVIDIA 显卡才勾选；核显 / 无独显保持关闭。",
+    "llm_gpu_layers": "本地 LLM 放上显卡的层数：-1=全部，0=完全用 CPU。",
+    "onnx_providers": "推理后端，保持默认 CPU 即可。",
+    "model_mode": "local=只用本地模型；cloud=优先云端 API；auto=本地有模型文件用本地，否则云端。",
+    "cloud_base_url": "OpenAI 兼容接口地址，如 https://api.openai.com/v1 或本地 vLLM 地址（不带尾斜杠）。",
+    "cloud_embedding_model": "云端向量模型名（如 text-embedding-3-small）；留空=向量继续用本地。",
+    "cloud_llm_model": "云端对话模型名（如 deepseek-chat）；留空=抽取总结继续用本地。",
+    "cloud_embed_dim": "云端返回的向量维度，必须与「向量维度」一致，否则报错提示重建。",
+    "cloud_timeout_sec": "云端请求超时秒数；超时自动退回本地能力，不会卡死。",
+    "cloud_api_key_env": "API key 的环境变量名；更推荐点上方「保存到钥匙串」。",
+    # 召回
+    "rrf_k_oversample": "每路检索多取几倍候选再精排：越大越准越慢。",
+    "rrf_constant": "多路融合的平滑常数，60 是论文标准值。",
+    "w_rrf": "检索名次在总分里的权重。",
+    "w_freshness": "越新的记忆越加分的权重。",
+    "w_synapse": "与其它记忆关联越强越加分的权重。",
+    "w_pad": "情绪越强烈越加分的权重。",
+    "w_confidence": "信息越可信越加分的权重。",
+    "top_k": "一次召回最终返回几条记忆。",
+    "p95_target_ms": "性能目标：95% 的召回应快于此毫秒数（用于评估对比，不限制实际请求）。",
+    "pad_salience_arousal_weight": "情绪显著性里「激动程度」的占比（其余是愉悦度）。",
+    "rerank_enabled": "精排明显提升准确度但更费时；核显 / 低配设备建议关闭。",
+    # 记忆与遗忘
+    "fsrs_difficulty_default": "新记忆的初始难度 D（1-10），越难忘得越快。",
+    "fsrs_stability_default": "新记忆的初始稳定度 S（约等于能记住的天数）。",
+    "fsrs_decay": "遗忘曲线底数，越小忘得越快。",
+    "reinforce_threshold": "一条记忆被想起多少次后触发巩固（强化）。",
+    "consolidate_confidence": "置信度高于此值的记忆有资格晋升核心层。",
+    "recall_layer_ceiling": "回忆层的置信度上限。",
+    "review_queue_ceiling": "可提取性低于此值的记忆进复核队列，提醒你回看。",
+    "fsrs_power": "遗忘幂函数的指数，一般不动。",
+    "fsrs_arousal_boost": "情绪越激动的事件记得越牢（闪光灯记忆效应）的加成。",
+    "tiers": "启用的记忆分层：缓冲（工作记忆）→ 核心 → 回忆 → 归档。",
+    "pyramid": "金字塔抽象层级：原始 → 事实 → 主题 → 世界观。",
+    "buffer_no_sync": "工作记忆不跨设备同步（省流量，默认开）。",
+    "archive_retrievability_threshold": "可提取性低于此值归档：退出常规召回，但还在库里。",
+    # 丘脑
+    "min_content_chars": "短于该字符数的内容直接拒收（过滤噪音）。",
+    "dedupe_hamming_threshold": "与近期记忆的指纹距离 ≤ 该值判定为重复，不再写入。",
+    "dedupe_cosine_threshold": "语义几乎相同的判定阈值（调到 1.0≈关闭近似去重）。",
+    "significance_threshold": "显著性低于此值只进缓冲区，不产生跨设备同步事件。",
+    "rate_limit_per_minute": "每分钟最多写入几条；留空=用网关默认限速。",
+    "significance_length_weight": "显著性里信息量（内容长度）的占比。",
+    "significance_pad_weight": "显著性里情绪强度的占比。",
+    "significance_confidence_weight": "显著性里可信度的占比。",
+    "significance_length_ref": "内容到多长算「信息量满」（字符）。",
+    "dedupe_window": "与最近多少条记忆比对去重。",
+    # 情感
+    "affinity_alpha": "好感度平滑系数：越小情绪越稳定，越大越喜怒形于色。",
+    "pad_smoothing": "单次事件对整体情绪基线的即时冲击比例。",
+    "negative_arousal_threshold": "既负面又激动超过该值 → 触发冷静期。",
+    "negative_valence_threshold": "愉悦度低于该值算负面情绪。",
+    "calm_period_ms": "冷静期持续多久；期间相关记忆召回打折（避免上头）。",
+    "calm_recall_penalty": "冷静期内的召回折扣（0-1，越小压得越狠）。",
+    # 同步 / 网关
+    "sync_interval_sec": "多久自动与远端同步一次（秒）。",
+    "write_debounce_sec": "写入后延迟几秒再推送（把连续写入合并成一次）。",
+    "segment_max_bytes": "单个事件段文件多大后滚动新建（约值即可）。",
+    "snapshot_monthly": "每月自动生成一次快照（状态备份，事件日志仍是真源）。",
+    "schema_version": "数据结构版本号，升级迁移用，不要手动改。",
+    "use_age_encrypt": "同步的事件用 age 加密后再进私库（内容更保险，稍耗 CPU）。",
+    "remote_name": "git 远端名称，默认 origin，一般不动。",
+    "device_id": "本设备在多端同步中的唯一标识，各设备必须不同（默认取主机名）。",
+    "mcp_host": "MCP 工具接口监听地址。",
+    "mcp_port": "MCP 工具接口端口。",
+    "http_host": "HTTP 接口默认监听地址（「接口与端口」页可临时改）。",
+    "http_port": "HTTP 接口默认端口（「接口与端口」页可临时改）。",
+    "default_rate_limit": "每个 agent 每分钟默认请求上限（防滥用）。",
+    "registry_enabled": "关闭后不做令牌校验，仅限本机调试，绝不建议对外开服务时关闭。",
+    # 星云
+    "similarity_threshold": "余弦相似度超过该值才画「突触线」：越小线越多越密。",
+    "max_nodes": "星云里最多画多少个记忆节点。",
+    "max_edges_per_node": "每个节点最多保留几条最强连线。",
+    "pulse_speed_base": "光点的基础飞行速度。",
+    "pulse_speed_similarity_gain": "相似度越高光点飞得越快的加成。",
+    "max_pulses": "同屏最多同时飞几个光点。",
+    "timer_interval_ms": "动画刷新间隔：16≈60fps；感觉卡顿就调大到 33。",
+    "max_labels": "同屏最多显示几个记忆标签。",
+    "stardust_count": "背景星尘点数，纯装饰。",
+    "dim_opacity": "搜索高亮时其它节点变暗的程度。",
+    "label_font_size": "记忆标签的字号。",
+    "glow_multiplier": "节点光晕大小倍率。",
+    "pulse_radius": "光点的大小。",
+    "flash_decay": "光点到达后节点高亮的消退速度。",
+    "link_distance": "距离多近的两个节点之间画淡色近邻线。",
+    "window_width": "启动时窗口宽度。",
+    "window_height": "启动时窗口高度。",
+}
+
+
 class ConfigEditor(QtWidgets.QWidget):
     """把 pydantic 子模型自动渲染成分组表单。
 
@@ -174,8 +283,11 @@ class ConfigEditor(QtWidgets.QWidget):
                 if name in excludes.get(title, set()):
                     continue
                 widget, getter = self._build_editor(hints.get(name, str), getattr(model, name), name)
+                hint = FIELD_HINTS.get(name, "")
+                key = f"{title}.{name}"
                 label = QtWidgets.QLabel(FIELD_LABELS.get(name, name))
-                label.setToolTip(f"{title}.{name}")
+                label.setToolTip(f"{hint}\n\n参数名：{key}" if hint else key)
+                widget.setToolTip(hint)
                 form.addRow(label, widget)
                 self._bindings.append((title, name, getter))
             card.body.addLayout(form)
