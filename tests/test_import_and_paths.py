@@ -114,6 +114,9 @@ def test_nebula_stays_alive_without_retrieval(backend, desktop_config, qapp):
 
     from ui.desktop.neurons import NebulaView
 
+    for text in ("静息态漂移验证一：缓存服务上线", "静息态漂移验证二：限流策略就绪",
+                 "静息态漂移验证三：回滚预案演练", "静息态漂移验证四：监控告警接入"):
+        backend.save_memory(text)
     random.seed(7)
     view = NebulaView(desktop_config, auto_animate=False)
     graph = backend.graph()
