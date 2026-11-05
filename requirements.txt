@@ -27,6 +27,9 @@ lmdb==3.0.0
 duckdb==2.0.0
 hypernetx==2.4.3
 
+# MCP 官方 SDK（外部 Agent 接入：WorkBuddy / CodeBuddy / DSH）
+mcp==1.30.0
+
 # 桌面前端（PySide6 星云视图 / PAT 钥匙串）
 PySide6-Essentials==6.12.0
 keyring==25.7.0
