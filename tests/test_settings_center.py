@@ -293,6 +293,12 @@ def test_settings_page_renders_all_groups(backend, desktop_config, qapp):
                     "星云激活", "外观与动画"):
         assert section in patch, f"缺分组：{section}"
 
+    # 高级参数默认折叠，但 collect 仍覆盖全部字段（折叠只影响可见性）
+    toggles = page.findChildren(QtWidgets.QCheckBox)
+    assert sum(1 for box in toggles if box.text() == "显示高级参数") >= 5
+    assert patch["召回与精排"]["w_rrf"] == backend.config.recall.w_rrf
+    assert patch["遗忘与强化（FSRS）"]["fsrs_decay"] == backend.config.plasticity.fsrs_decay
+
 
 def test_model_page_covers_all_model_fields_and_saves(backend, desktop_config, qapp):
     from ui.desktop.pages import ModelPage

@@ -5,8 +5,10 @@ UI 只允许 import 本模块；它内部通过组合根 `build_app()` 装配，
 """
 from __future__ import annotations
 
+import csv
 import json
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from pathlib import Path
@@ -33,6 +35,58 @@ from ui.desktop.user_config import (
 )
 
 __all__ = ["DesktopBackend", "HttpState", "RecallView"]
+
+
+def _parse_memory_file(path: Path) -> list[str]:
+    """把常见记忆文件解析成一条条正文；容错优先：解析不了的行跳过。"""
+    suffix = path.suffix.lower()
+    entries: list[str] = []
+    if suffix == ".json":
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if isinstance(payload, dict):
+            payload = payload.get("memories", [])
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, str) and item.strip():
+                    entries.append(item.strip())
+                elif isinstance(item, dict) and str(item.get("content", "")).strip():
+                    entries.append(str(item["content"]).strip())
+        return entries
+    if suffix in (".ndjson", ".jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, str) and item.strip():
+                entries.append(item.strip())
+            elif isinstance(item, dict) and str(item.get("content", "")).strip():
+                entries.append(str(item["content"]).strip())
+        return entries
+    if suffix == ".csv":
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames and "content" in reader.fieldnames:
+                    entries = [str(row["content"]).strip() for row in reader if str(row.get("content", "")).strip()]
+                else:
+                    handle.seek(0)
+                    plain = csv.reader(handle)
+                    entries = [row[0].strip() for row in plain if row and row[0].strip()]
+        except OSError:
+            return []
+        return entries
+    if suffix == ".md":
+        blocks = path.read_text(encoding="utf-8").split("\n\n")
+        return [block.strip() for block in blocks if len(block.strip()) >= 4]
+    # .txt 及其它：每行一条
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if len(line.strip()) >= 4]
 
 
 @dataclass
@@ -220,6 +274,62 @@ class DesktopBackend:
         assert self._app is not None
         result = self._app.hippocampus.remember(content, agent_id=agent_id)
         return {"applied": result.applied, "id": result.neuron.uuid7_id, "reason": result.admission.reason}
+
+    def import_memories(
+        self,
+        path: str | Path,
+        *,
+        agent_id: str = "import",
+        should_stop: Callable[[], bool] | None = None,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """批量导入记忆文件，逐条走完整写入流（丘脑路由 + 去重 + 六引擎 + 事件日志）。
+
+        支持格式：.txt（每行一条）/ .md（空行分段）/ .json（数组或 {"memories":[...]}）
+                  / .ndjson .jsonl（每行一个对象，兼容本软件导出的 memories.ndjson）/ .csv（含 content 列）。
+        """
+        self.start()
+        assert self._app is not None
+        file_path = Path(path)
+        if not file_path.exists():
+            return {"ok": False, "message": f"文件不存在：{file_path}"}
+        entries = _parse_memory_file(file_path)
+        if not entries:
+            return {
+                "ok": False,
+                "message": "没有解析到可导入的内容（txt 每行一条；md 空行分段；json 数组；ndjson 每行一个对象）",
+            }
+        applied = skipped = failed = 0
+        errors: list[str] = []
+        total = len(entries)
+        for index, text in enumerate(entries, start=1):
+            if should_stop is not None and should_stop():
+                break
+            try:
+                result = self._app.hippocampus.remember(text, agent_id=agent_id)
+                if result.applied:
+                    applied += 1
+                else:
+                    skipped += 1
+            except Exception as exc:  # noqa: BLE001  单条失败不中断整批
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"第 {index} 条 {type(exc).__name__}: {exc}")
+            if progress_cb is not None:
+                progress_cb(index, total)
+        stopped = should_stop is not None and should_stop()
+        return {
+            "ok": True,
+            "parsed": total,
+            "applied": applied,
+            "skipped": skipped,
+            "failed": failed,
+            "errors": errors,
+            "message": (
+                f"导入完成{'（已手动停止）' if stopped else ''}：解析 {total} 条 → "
+                f"写入 {applied}，重复跳过 {skipped}，失败 {failed}"
+            ),
+        }
 
     # ── 配置中心（打包后免重编译）────────────────────────────────────────
     def model_status(self) -> dict[str, object]:

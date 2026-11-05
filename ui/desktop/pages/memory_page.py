@@ -29,6 +29,12 @@ class MemoryPage(QtWidgets.QWidget):
         self._type.addItem("全部类型")
         self._tier.currentIndexChanged.connect(self._apply_filter)
         self._type.currentIndexChanged.connect(self._apply_filter)
+        import_btn = QtWidgets.QPushButton("批量导入")
+        import_btn.setToolTip(
+            "从文件批量导入记忆（走完整写入流 + 自动去重）：\n"
+            ".txt 每行一条 · .md 空行分段 · .json 数组 · .ndjson（导出格式）· .csv（含 content 列）"
+        )
+        import_btn.clicked.connect(self._import_file)
         refresh = QtWidgets.QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
 
@@ -36,6 +42,7 @@ class MemoryPage(QtWidgets.QWidget):
         filters.addWidget(self._search, 1)
         filters.addWidget(self._tier)
         filters.addWidget(self._type)
+        filters.addWidget(import_btn)
         filters.addWidget(refresh)
 
         self._table = QtWidgets.QTableWidget(0, len(_COLUMNS))
@@ -189,6 +196,44 @@ class MemoryPage(QtWidgets.QWidget):
         self.refresh()
         self._status.setText(f"写入成功 {result['id'][:8]}（新神经元已点亮）")
         self.focus_requested.emit(result["id"])
+
+    # ── 批量导入 ──────────────────────────────────────────────────────────
+    def _import_file(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择要导入的记忆文件",
+            "",
+            "记忆文件 (*.txt *.md *.json *.ndjson *.jsonl *.csv);;所有文件 (*)",
+        )
+        if not path:
+            return
+        progress = QtWidgets.QProgressDialog("正在导入记忆（自动去重）…", "停止", 0, 0, self)
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.show()
+        stopped = {"flag": False}
+        progress.canceled.connect(lambda: stopped.update(flag=True))
+        app = QtWidgets.QApplication.instance()
+
+        def on_progress(done: int, total: int) -> None:
+            progress.setLabelText(f"正在导入记忆（自动去重）… {done}/{total}")
+            if app is not None:
+                app.processEvents()
+
+        result = self._backend.import_memories(path, should_stop=lambda: stopped["flag"], progress_cb=on_progress)
+        progress.close()
+        self.refresh()
+        message = str(result.get("message", ""))
+        if result.get("ok"):
+            self._status.setText(message)
+            if result.get("applied"):
+                first_new = self._backend.memories(limit=1)
+                if first_new:
+                    self.focus_requested.emit(str(first_new[0]["id"]))
+        else:
+            self._status.setText(message)
+        for error in result.get("errors", [])[:3]:
+            self._status.setText(self._status.text() + f"\n{error}")
 
 
 def _format_time(ms: int) -> str:

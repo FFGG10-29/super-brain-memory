@@ -29,6 +29,31 @@ _UI_EXCLUDE = {
 }
 
 
+# 默认折叠的精调参数（勾选「显示高级参数」展开；出厂值已经过评测）
+_ADVANCED_FIELDS: dict[str, set[str]] = {
+    "召回与精排": {
+        "rrf_k_oversample", "rrf_constant", "w_rrf", "w_freshness", "w_synapse",
+        "w_pad", "w_confidence", "p95_target_ms", "pad_salience_arousal_weight",
+    },
+    "遗忘与强化（FSRS）": {
+        "fsrs_difficulty_default", "fsrs_stability_default", "fsrs_decay", "fsrs_power",
+        "reinforce_threshold", "consolidate_confidence", "recall_layer_ceiling",
+        "review_queue_ceiling", "fsrs_arousal_boost",
+    },
+    "分层流动": {"archive_retrievability_threshold"},
+    "丘脑准入与去重": {
+        "significance_length_weight", "significance_pad_weight",
+        "significance_confidence_weight", "significance_length_ref", "dedupe_window",
+    },
+    "情感阈值（PAD / 冷静期）": {"affinity_alpha", "pad_smoothing"},
+    "同步参数": {"segment_max_bytes", "schema_version"},
+    "存储引擎": {
+        "sqlite_busy_timeout_ms", "wal_autocheckpoint",
+        "lmdb_map_size_mb", "lmdb_max_buckets", "duckdb_threads",
+    },
+}
+
+
 class SettingsPage(QtWidgets.QWidget):
     appearance_changed = QtCore.Signal()
 
@@ -115,6 +140,7 @@ class SettingsPage(QtWidgets.QWidget):
                 "网关": {"mcp_token_secret"},
                 "外观与动画": _UI_EXCLUDE,
             },
+            advanced=_ADVANCED_FIELDS,
         )
 
     # ── 动作 ──────────────────────────────────────────────────────────────

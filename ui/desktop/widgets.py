@@ -267,10 +267,13 @@ class ConfigEditor(QtWidgets.QWidget):
         sections: Sequence[tuple[str, BaseModel]],
         *,
         excludes: dict[str, set[str]] | None = None,
+        advanced: dict[str, set[str]] | None = None,
     ) -> None:
+        """advanced：每组里默认折叠的「高级参数」字段名集合，卡片底部有展开开关。"""
         super().__init__()
         self._bindings: list[tuple[str, str, Any]] = []  # (section, field, getter)
         excludes = excludes or {}
+        advanced = advanced or {}
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
@@ -279,6 +282,18 @@ class ConfigEditor(QtWidgets.QWidget):
             form = QtWidgets.QFormLayout()
             form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             hints = get_type_hints(type(model))
+            adv_fields = advanced.get(title, set())
+            adv_form: QtWidgets.QFormLayout | None = None
+            toggle: QtWidgets.QCheckBox | None = None
+            if adv_fields:
+                toggle = QtWidgets.QCheckBox("显示高级参数")
+                toggle.setToolTip("这些是精调参数，出厂值已经过评测；不确定含义就保持默认")
+                adv_container = QtWidgets.QWidget()
+                adv_form = QtWidgets.QFormLayout(adv_container)
+                adv_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+                adv_form.setContentsMargins(0, 0, 0, 0)
+                adv_container.setVisible(False)
+                toggle.toggled.connect(adv_container.setVisible)
             fields = type(model).model_fields
             for name in fields:
                 if name in excludes.get(title, set()):
@@ -289,9 +304,14 @@ class ConfigEditor(QtWidgets.QWidget):
                 label = QtWidgets.QLabel(FIELD_LABELS.get(name, name))
                 label.setToolTip(f"{hint}\n\n参数名：{key}" if hint else key)
                 widget.setToolTip(hint)
-                form.addRow(label, widget)
+                target = adv_form if name in adv_fields and adv_form is not None else form
+                target.addRow(label, widget)
                 self._bindings.append((title, name, getter))
             card.body.addLayout(form)
+            if toggle is not None and adv_form is not None:
+                assert adv_form.parentWidget() is not None
+                card.body.addWidget(toggle)
+                card.body.addWidget(adv_form.parentWidget())
             layout.addWidget(card)
         layout.addStretch(1)
 
@@ -331,7 +351,27 @@ class ConfigEditor(QtWidgets.QWidget):
         # str / Path / 其它兜底
         edit = QtWidgets.QLineEdit("" if value is None else str(value))
         if "path" in field_name.lower() or "dir" in field_name.lower() or isinstance(value, Path):
-            edit.setPlaceholderText(str(Path.home()))
+            current = str(value) if isinstance(value, Path) else (edit.text() or str(Path.home()))
+            edit.setPlaceholderText(current)
+            browse = QtWidgets.QPushButton("浏览…")
+            browse.setToolTip("弹出系统文件/文件夹选择器；改路径只影响下次内核重启，且不会自动搬移旧数据")
+
+            def _browse(text_edit: QtWidgets.QLineEdit = edit, sample: str = current) -> None:
+                if sample.endswith((".lance", ".kuzu", ".lmdb")):
+                    chosen = QtWidgets.QFileDialog.getExistingDirectory(self, "选择存储目录", sample)
+                else:
+                    chosen, _ = QtWidgets.QFileDialog.getSaveFileName(self, "选择存储文件", sample)
+                if chosen:
+                    text_edit.setText(chosen)
+
+            browse.clicked.connect(_browse)
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            row_layout.addWidget(edit, 1)
+            row_layout.addWidget(browse)
+            return row, (lambda: Path(edit.text()) if isinstance(value, Path) else edit.text())
         return edit, (lambda: Path(edit.text()) if isinstance(value, Path) else edit.text())
 
     def _build_dict_editor(self, annotation: Any, value: dict[str, Any], field_name: str):

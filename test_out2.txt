@@ -1,0 +1,22 @@
+﻿FF...................                                                    [100%]
+================================== FAILURES ===================================
+_______________________ test_mcp_tools_cover_six_tools ________________________
+tests\test_mcp_stdio.py:38: in test_mcp_tools_cover_six_tools
+    server = build_server()
+             ^^^^^^^^^^^^^^
+gateway\mcp_stdio.py:52: in build_server
+    @server.list_tools()
+     ^^^^^^^^^^^^^^^^^
+E   AttributeError: 'Server' object has no attribute 'list_tools'
+__________________ test_mcp_save_recall_health_via_handlers ___________________
+tests\test_mcp_stdio.py:62: in test_mcp_save_recall_health_via_handlers
+    server = build_server()
+             ^^^^^^^^^^^^^^
+gateway\mcp_stdio.py:52: in build_server
+    @server.list_tools()
+     ^^^^^^^^^^^^^^^^^
+E   AttributeError: 'Server' object has no attribute 'list_tools'
+=========================== short test summary info ===========================
+FAILED tests/test_mcp_stdio.py::test_mcp_tools_cover_six_tools - AttributeErr...
+FAILED tests/test_mcp_stdio.py::test_mcp_save_recall_health_via_handlers - At...
+2 failed, 19 passed in 31.54s
