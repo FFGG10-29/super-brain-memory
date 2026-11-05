@@ -106,9 +106,10 @@ FIELD_LABELS: dict[str, str] = {
     "dense_dim": "向量维度", "embedding_model": "Embedding 模型", "reranker_model": "精排模型",
     "llm_model": "本地 LLM 文件", "llm_gguf_dir": "模型目录", "use_cuda": "启用 CUDA",
     "llm_gpu_layers": "GPU 层数 (-1=全部)", "onnx_providers": "ONNX 提供方",
-    "model_mode": "模型来源", "cloud_base_url": "云端 API 地址", "cloud_embedding_model": "云端 Embedding 模型",
-    "cloud_llm_model": "云端对话模型", "cloud_embed_dim": "云端向量维度", "cloud_timeout_sec": "云端超时 (s)",
-    "cloud_api_key_env": "Key 环境变量名",
+    "embed_backend": "Embedding 来源", "embed_base_url": "Embedding API 地址", "embed_model": "Embedding 模型名",
+    "embed_dim": "云端向量维度", "embed_timeout_sec": "Embedding 超时 (s)", "embed_api_key_env": "Embedding Key 环境变量名",
+    "llm_backend": "LLM 来源", "llm_base_url": "LLM API 地址", "llm_model": "LLM 模型名",
+    "llm_timeout_sec": "LLM 超时 (s)", "llm_api_key_env": "LLM Key 环境变量名",
     # 召回
     "rrf_k_oversample": "超采样倍数", "rrf_constant": "RRF 常数", "w_rrf": "名次权重", "w_freshness": "新鲜度权重",
     "w_synapse": "突触权重", "w_pad": "情绪权重", "w_confidence": "置信度权重", "top_k": "返回条数",

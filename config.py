@@ -67,16 +67,19 @@ class ModelConfig(BaseSettings):
     llm_gpu_layers: int = -1                             # n_gpu_layers 递减降级
     onnx_providers: list[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
     # 模型来源：local=全本地；cloud=云端 OpenAI 兼容 API（未配齐自动退本地）；auto=本地有模型文件用本地，否则云
-    # 每类模型独立选择本地 / 云端（OpenAI 兼容）。URL 与 API key 全局共享一份。
-    # 典型组合：embedding=local（维度稳定）+ llm=cloud（云端更强）。
-    embedding_backend: Literal["local", "cloud"] = "local"
+    # 每条通道独立选择本地 / 云端（OpenAI 兼容），地址与 key 各自独立
+    # —— Embedding 和 LLM 可以是两家不同供应商（如 OpenAI 向量 + DeepSeek 对话）。
+    embed_backend: Literal["local", "cloud"] = "local"
+    embed_base_url: str = ""                             # 如 https://api.openai.com/v1（不带尾斜杠）
+    embed_model: str = ""                                # 如 text-embedding-3-small
+    embed_dim: int = 1024                                # 云端向量维度，必须与 dense_dim 一致
+    embed_timeout_sec: int = 30
+    embed_api_key_env: str = "EMBED_API_KEY"             # key 来源：钥匙串(embed_api_key) > 该环境变量
     llm_backend: Literal["local", "cloud"] = "local"
-    cloud_base_url: str = ""                             # 如 https://api.openai.com/v1（不带尾斜杠）
-    cloud_embedding_model: str = ""                      # embedding 选云端时必填，如 text-embedding-3-small
-    cloud_llm_model: str = ""                            # llm 选云端时必填，如 deepseek-chat
-    cloud_embed_dim: int = 1024                          # 云端向量维度，必须与 dense_dim 一致
-    cloud_timeout_sec: int = 30
-    cloud_api_key_env: str = "CLOUD_API_KEY"             # API key 来源：钥匙串 > 该环境变量；永不入配置文件
+    llm_base_url: str = ""                               # 如 https://api.deepseek.com/v1
+    llm_model: str = ""                                  # 如 deepseek-chat / gpt-4o-mini
+    llm_timeout_sec: int = 30
+    llm_api_key_env: str = "LLM_API_KEY"
 
 
 class RecallConfig(BaseSettings):

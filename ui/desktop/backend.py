@@ -227,7 +227,7 @@ class DesktopBackend:
         assert self._app is not None
         model = self._config.model
         return {
-            "embedding_backend": model.embedding_backend,
+            "embed_backend": model.embed_backend,
             "llm_backend": model.llm_backend,
             "embedder": {
                 "kind": type(self._app.embedder).__name__,
@@ -236,8 +236,10 @@ class DesktopBackend:
             },
             "reranker": {"kind": type(self._app.reranker).__name__, "degraded": self._app.reranker.degraded},
             "llm": {"kind": type(self._app.llm).__name__, "degraded": self._app.llm.degraded},
-            "cloud_ready": bool(model.cloud_base_url),
-            "cloud_key_present": bool(load_cloud_api_key(self._config, keyring_backend=self._keyring)),
+            "embed_ready": bool(model.embed_base_url and model.embed_model),
+            "llm_ready": bool(model.llm_base_url and model.llm_model),
+            "embed_key_present": bool(load_cloud_api_key(self._config, "embed", keyring_backend=self._keyring)),
+            "llm_key_present": bool(load_cloud_api_key(self._config, "llm", keyring_backend=self._keyring)),
         }
 
     def save_settings_patch(self, patches: dict[str, dict[str, object]]) -> dict[str, object]:
@@ -279,20 +281,21 @@ class DesktopBackend:
             "message": f"已应用预设「{name}」（{len(changed)} 项）；存储/模型参数需重启内核",
         }
 
-    def save_cloud_key(self, key: str) -> dict[str, object]:
+    def save_cloud_key(self, channel: str, key: str) -> dict[str, object]:
+        """按通道（embed / llm）保存各自供应商的 API key 到系统钥匙串。"""
         ring = self._keyring
         if ring is None:
-            env = self._config.model.cloud_api_key_env
+            env = getattr(self._config.model, f"{channel}_api_key_env", "")
             return {"ok": False, "message": f"系统钥匙串不可用：请改用环境变量 {env}"}
         if key.strip():
-            ring.set_password("super-brain-v21", "cloud_api_key", key.strip())
-            message = "云端 API key 已写入系统钥匙串（不入配置文件/事件日志）"
+            ring.set_password("super-brain-v21", f"{channel}_api_key", key.strip())
+            message = f"{channel} 通道 API key 已写入系统钥匙串（不入配置文件/事件日志）"
         else:
             try:
-                ring.delete_password("super-brain-v21", "cloud_api_key")
+                ring.delete_password("super-brain-v21", f"{channel}_api_key")
             except Exception:  # noqa: BLE001
                 pass
-            message = "已清除钥匙串中的云端 API key"
+            message = f"已清除钥匙串中的 {channel} 通道 API key"
         return {"ok": True, "message": message}
 
     # ── 状态面板 ──────────────────────────────────────────────────────────

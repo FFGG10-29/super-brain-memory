@@ -213,48 +213,54 @@ def build_storage(config: BrainConfig) -> StorageSet:
 
 
 def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
-    """按每类模型各自的 backend（local/cloud）装配。
+    """按每条通道（embed / llm）各自的 backend 与供应商装配。
 
-    选了云端的模型：URL / 模型名 / key 任一缺失就退回本地实现并打印警告，
+    Embedding 与 LLM 可以是两家不同供应商（地址 / key 各自独立）。
+    选了云端的通道：URL / 模型名任一缺失就退回本地实现并打印警告，
     保证"配置了一半"的设备也能启动 —— 不会因为云 API 抖动而拒绝开机。
     """
     model = config.model
-    credentials = None
-    if model.cloud_base_url:
-        from brain.cloud_models import CloudCredentials, load_cloud_api_key
-
-        credentials = CloudCredentials(
-            model.cloud_base_url, load_cloud_api_key(config), timeout=model.cloud_timeout_sec
-        )
 
     local_embed_dir = _resolve_model_dir(config, model.embedding_model)
-    if model.embedding_backend == "cloud":
-        if credentials is None or not model.cloud_embedding_model:
+    embedder: Embedder
+    if model.embed_backend == "cloud":
+        if model.embed_base_url and model.embed_model:
+            from brain.cloud_models import CloudCredentials, CloudEmbedder, load_cloud_api_key
+
+            credentials = CloudCredentials(
+                model.embed_base_url,
+                load_cloud_api_key(config, "embed"),
+                timeout=model.embed_timeout_sec,
+            )
+            embedder = CloudEmbedder(credentials, model.embed_model, dense_dim=model.embed_dim)
+        else:
             print("警告：Embedding 选了云端但 API 地址/模型名未配齐，退回本地/降级")
-            embedder: Embedder = BgeM3Embedder(
+            embedder = BgeM3Embedder(
                 dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
             )
-        else:
-            from brain.cloud_models import CloudEmbedder
-
-            embedder = CloudEmbedder(credentials, model.cloud_embedding_model, dense_dim=model.cloud_embed_dim)
     else:
         embedder = BgeM3Embedder(
             dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
         )
 
     local_llm_path = model.llm_gguf_dir / model.llm_model
+    llm: LocalLLM
     if model.llm_backend == "cloud":
-        if credentials is None or not model.cloud_llm_model:
+        if model.llm_base_url and model.llm_model:
+            from brain.cloud_models import CloudCredentials, CloudLLM, load_cloud_api_key
+
+            credentials = CloudCredentials(
+                model.llm_base_url,
+                load_cloud_api_key(config, "llm"),
+                timeout=model.llm_timeout_sec,
+            )
+            llm = CloudLLM(credentials, model.llm_model)
+        else:
             print("警告：LLM 选了云端但 API 地址/模型名未配齐，退回本地/规则")
-            llm: LocalLLM = QwenLocalLLM(
+            llm = QwenLocalLLM(
                 model_path=str(local_llm_path) if local_llm_path.exists() else None,
                 gpu_layers=model.llm_gpu_layers,
             )
-        else:
-            from brain.cloud_models import CloudLLM
-
-            llm = CloudLLM(credentials, model.cloud_llm_model)
     else:
         llm = QwenLocalLLM(
             model_path=str(local_llm_path) if local_llm_path.exists() else None,

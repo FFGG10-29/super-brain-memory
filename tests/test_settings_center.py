@@ -112,7 +112,7 @@ def test_preset_igpu_tunes_for_integrated_gpu(backend):
     assert backend.config.model.use_cuda is False
     assert backend.config.model.llm_gpu_layers == 0, "LLM 完全走 CPU"
     assert backend.config.model.llm_backend == "cloud", "核显模式对话模型优先云端"
-    assert backend.config.model.embedding_backend == "local", "向量维度稳定优先：embedding 保持本地"
+    assert backend.config.model.embed_backend == "local", "向量维度稳定优先：embedding 保持本地"
     assert backend.config.ui.timer_interval_ms == 33
     assert "model" in load_overrides()
     assert set(preset_names()) == {"balanced", "igpu", "dgpu"}
@@ -202,12 +202,13 @@ def fake_openai():
 
 
 def test_cloud_mode_embedding_and_llm(desktop_config, fake_openai):
-    desktop_config.model.embedding_backend = "cloud"
+    desktop_config.model.embed_backend = "cloud"
     desktop_config.model.llm_backend = "cloud"
-    desktop_config.model.cloud_base_url = fake_openai
-    desktop_config.model.cloud_embedding_model = "text-embed-test"
-    desktop_config.model.cloud_llm_model = "chat-test"
-    desktop_config.model.cloud_embed_dim = 8
+    desktop_config.model.embed_base_url = fake_openai
+    desktop_config.model.llm_base_url = fake_openai
+    desktop_config.model.embed_model = "text-embed-test"
+    desktop_config.model.llm_model = "chat-test"
+    desktop_config.model.embed_dim = 8
 
     app = build_app(desktop_config)
     try:
@@ -228,11 +229,10 @@ def test_cloud_mode_embedding_and_llm(desktop_config, fake_openai):
 
 def test_mixed_mode_local_embedding_cloud_llm(desktop_config, fake_openai):
     """典型组合：本地向量（维度稳定）+ 云端 LLM（更强）。"""
-    desktop_config.model.embedding_backend = "local"
+    desktop_config.model.embed_backend = "local"
     desktop_config.model.llm_backend = "cloud"
-    desktop_config.model.cloud_base_url = fake_openai
-    desktop_config.model.cloud_llm_model = "chat-test"
-    desktop_config.model.cloud_embed_dim = 8
+    desktop_config.model.llm_base_url = fake_openai
+    desktop_config.model.llm_model = "chat-test"
 
     app = build_app(desktop_config)
     try:
@@ -244,9 +244,10 @@ def test_mixed_mode_local_embedding_cloud_llm(desktop_config, fake_openai):
 
 def test_cloud_backend_missing_config_falls_back_to_local(desktop_config):
     """选了云端但 URL/模型名没配齐 → 该类模型退本地，其余不受影响。"""
-    desktop_config.model.embedding_backend = "cloud"   # 无 URL、无模型名
+    desktop_config.model.embed_backend = "cloud"   # 无 URL、无模型名
     desktop_config.model.llm_backend = "cloud"
-    desktop_config.model.cloud_base_url = ""
+    desktop_config.model.embed_base_url = ""
+    desktop_config.model.llm_base_url = ""
     app = build_app(desktop_config)
     try:
         assert type(app.embedder).__name__ == "BgeM3Embedder", "未配齐云端 embedding 必须退本地实现"
@@ -265,18 +266,22 @@ def test_backend_restart_applies_saved_overrides(backend, monkeypatch):
     assert backend.config.ui.max_labels == 5
     assert backend.config.recall.top_k == 7
     assert any("重启前的记忆" in row["content"] for row in backend.memories(limit=50))
-    assert backend.model_status()["cloud_key_present"] is False
+
 
 
 def test_backend_save_cloud_key_uses_keyring(backend):
     ring = _FakeKeyring()
     backend._keyring = ring
-    result = backend.save_cloud_key("sk-test-123")
-    assert result["ok"] is True
-    assert ring.values[("super-brain-v21", "cloud_api_key")] == "sk-test-123"
-    assert backend.model_status()["cloud_key_present"] is True
-    backend.save_cloud_key("")
-    assert backend.model_status()["cloud_key_present"] is False
+    assert backend.save_cloud_key("embed", "sk-embed-123")["ok"] is True
+    assert backend.save_cloud_key("llm", "sk-llm-456")["ok"] is True
+    assert ring.values[("super-brain-v21", "embed_api_key")] == "sk-embed-123"
+    assert ring.values[("super-brain-v21", "llm_api_key")] == "sk-llm-456", "两通道 key 各自独立"
+    assert backend.model_status()["embed_key_present"] is True
+    assert backend.model_status()["llm_key_present"] is True
+    backend.save_cloud_key("embed", "")
+    backend.save_cloud_key("llm", "")
+    assert backend.model_status()["embed_key_present"] is False
+    assert backend.model_status()["llm_key_present"] is False
 
 
 def test_settings_page_renders_all_groups(backend, desktop_config, qapp):
@@ -294,23 +299,26 @@ def test_model_page_covers_all_model_fields_and_saves(backend, desktop_config, q
 
     page = ModelPage(backend)
     patch = page.collect()["model"]
-    for field in ("embedding_backend", "llm_backend", "cloud_base_url", "cloud_embedding_model",
-                  "cloud_llm_model", "cloud_embed_dim", "dense_dim", "use_cuda", "llm_gpu_layers"):
+    for field in ("embed_backend", "llm_backend", "embed_base_url", "embed_model", "embed_dim",
+                  "llm_base_url", "llm_model", "dense_dim", "use_cuda", "llm_gpu_layers"):
         assert field in patch, f"模型页缺字段：{field}"
 
-    page._embed_backend.setCurrentIndex(1)
-    page._llm_backend.setCurrentIndex(1)
-    page._embed_model.setText("text-embed-x")
-    page._llm_model.setText("chat-x")
-    page._cloud_url.setText("http://127.0.0.1:9")
+    page._widget("embed", "backend").setCurrentIndex(1)
+    page._widget("llm", "backend").setCurrentIndex(1)
+    page._widget("embed", "model").setText("text-embed-x")
+    page._widget("llm", "model").setText("chat-x")
+    page._widget("embed", "url").setText("http://127.0.0.1:9")
+    page._widget("llm", "url").setText("https://api.deepseek.com/v1")
     result = backend.save_settings_patch(page.collect())
     assert result["ok"] is True
-    assert backend.config.model.embedding_backend == "cloud"
+    assert backend.config.model.embed_backend == "cloud"
     assert backend.config.model.llm_backend == "cloud"
-    assert "model.embedding_backend" in result["restart_needed"]
+    assert backend.config.model.embed_base_url == "http://127.0.0.1:9"
+    assert backend.config.model.llm_base_url == "https://api.deepseek.com/v1", "两家供应商地址各自独立"
+    assert "model.embed_backend" in result["restart_needed"]
     restarted = backend.restart()
     assert restarted["ok"] is True
-    assert backend.model_status()["embedding_backend"] == "cloud"
+    assert backend.model_status()["embed_backend"] == "cloud"
 
     # 修改一个运行期参数 + 一个启动期参数
     backend_save = backend.save_settings_patch({

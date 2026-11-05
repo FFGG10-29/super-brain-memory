@@ -25,16 +25,17 @@ __all__ = ["CloudCredentials", "CloudEmbedder", "CloudLLM", "load_cloud_api_key"
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def load_cloud_api_key(config, *, keyring_backend: Any | None = None) -> str:
-    """钥匙串优先，其次环境变量；都没有返回空串。"""
+def load_cloud_api_key(config, channel: str, *, keyring_backend: Any | None = None) -> str:
+    """按通道（embed / llm）读 API key：钥匙串 > 各自环境变量；都没有返回空串。"""
     if keyring_backend is not None:
         try:
-            value = keyring_backend.get_password("super-brain-v21", "cloud_api_key")
+            value = keyring_backend.get_password("super-brain-v21", f"{channel}_api_key")
             if value:
                 return value
         except Exception:  # noqa: BLE001
             pass
-    return os.environ.get(config.model.cloud_api_key_env, "")
+    env_name = getattr(config.model, f"{channel}_api_key_env", "")
+    return os.environ.get(env_name, "")
 
 
 class CloudCredentials:
