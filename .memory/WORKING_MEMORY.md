@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + 桌面控制台 + 配置中心（免重编译）全部落地，93 用例全过**
+> 最后更新：2026-11-05 ｜ 当前阶段：**生产就绪评估完成，代码已推送 GitHub 私库（FFGG10-29/super-brain-memory），待显卡机实测**，113 用例全过
 
 ## 1. 进度总览
 
@@ -15,74 +15,75 @@
 | 5 同步平面 | ✅ | projections/git_worker/snapshot；双机收敛、断网零丢失、幂等、冷启动重建全测过 |
 | 6 可视与打磨 | ✅ | 六面板数据源 + Dashboard + eval 基线 + 结构化日志 + 备份脚本 |
 | PAD 全链路 | ✅ 8/8 | `tests/test_pad_chain.py` |
-| PySide6 桌面控制台 | ✅ | `ui/desktop/`：九页（星云/记忆/召回/系统/数据/接口端口/同步/设置/关于）；22 条用例 |
-| 配置中心（免重编译） | ✅ | 设置页预设×3 + 全量参数自动表单；存储引擎开关；local/cloud/auto 模型；内核热重启；10 条用例 |
+| PySide6 桌面控制台 | ✅ | `ui/desktop/`：十页导航（星云/记忆/召回/系统/数据/**模型配置**/接口端口/同步/设置/关于） |
+| 配置中心（免重编译） | ✅ | 预设（均衡/核显/独显）+ 全量参数自动表单（高级参数折叠）+ 存储引擎开关 + 模型双通道（embed/llm 独立供应商）+ 内核热重启 |
+| 语义合并 + 聚类摘要 | ✅ | `brain/memory_consolidator.py`：写入裁决 add/update/merge/skip；夜间聚簇 LLM 主题摘要；`tests/test_semantic_merge.py` |
+| MCP stdio 接入 | ✅ | `gateway/mcp_stdio.py`：save/recall/timeline/profile/conflict/health 六工具，外部 Agent（WorkBuddy/CodeBuddy/DSH）可挂载 |
+| 记忆批量导入 | ✅ | txt/md/json/ndjson/csv → 完整写入流；导出 ndjson 双向打通 |
+| 评估报告 | ✅ | `.memory/EVALUATION.md`（对标 Mem0/Letta/Zep/腾讯，两大短板已补齐）+ `.memory/LIFECYCLE_TRACE.md`（MCP 记忆全链路案例） |
 
-启动：`python -m ui.desktop`（可交互）；`python scripts/nebula_preview.py`（整窗离屏出图到 `data/nebula_preview.png`）。
-端口：接口与端口页可改 host/port 并一键启停 HTTP 适配器；偏好存用户级 QSettings。
-未做（明确边界）：官方 MCP SDK 传输装配、NiceGUI 图形页、真实 GPU/模型权重、真实 GitHub 私库联调。
-详见 `.memory/ACCEPTANCE.md` 末尾。
+启动：`python -m ui.desktop`；改完代码重启：`powershell -File scripts/restart_frontend.ps1`。
+离屏整窗截图：`python scripts/desktop_screenshots.py` → `data/screenshots/`。
+演示数据：`python scripts/seed_demo.py`（先关桌面窗口，Kùzu 单进程写）。
 
 ## 2. 环境事实（已实测，别重复摸索）
 
-- 解释器：项目内 `.venv`（Python 3.11.5）。系统 PATH 上的 `python` 是 KiCad 自带的，**只有 pydantic/numpy，缺全部存储依赖**，不要用它跑测试。
-- 已装：`duckdb 2.0.0` / `lancedb 0.41.0` / `kuzu 0.11.3` / `lmdb 3.0.0` / `hypernetx 2.4.3` / `pydantic 2.14.2` / `PySide6-Essentials 6.12.0` / `keyring 25.7.0` / `pytest 9.2.0`。完整锁定见 `requirements.txt`（16 包）。
-- 未装（按降级实现）：`onnxruntime`、`llama-cpp-python`、`fastapi`、`mcp`、`nicegui`、`apscheduler`。
+- 解释器：项目内 `.venv`（Python 3.11.5）。系统 PATH 上的 `python` 是 KiCad 自带的，**缺全部依赖**，别用它跑任何东西。
+- 已装：`duckdb 2.0.0` / `lancedb 0.41.0` / `kuzu 0.11.3` / `lmdb 3.0.0` / `hypernetx 2.4.3` / `pydantic 2.14.2` / `PySide6-Essentials 6.12.0` / `keyring 25.7.0` / `mcp 1.30.0`（**必须 <2**，2.x 改了 API）/ `pytest 9.2.0`。锁定见 `requirements.txt`。
+- 未装（按降级实现）：`onnxruntime`、`llama-cpp-python`、`fastapi`、`nicegui`、`apscheduler`。
+- GitHub：gh CLI 已登录账号 **FFGG10-29**；私库 `github.com/FFGG10-29/super-brain-memory`（remote origin 已配）。事件同步库建议另建（代码库与事件总线分开）。
 - Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
-- Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；`SettingsStore.test_connection()` 因此只探测 `shutil.which("git")`。
-- Qt offscreen 平台字体库为空：预览脚本必须 `QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")`，否则中文全是方块。
-- 用户配置：`%APPDATA%/super-brain/config.json` 存与出厂默认的**差异补丁**（Path 序列化为字符串，apply 时还原）；测试用 `SUPER_BRAIN_CONFIG_DIR` 重定向；密钥（GitHub PAT / 云端 key）只进钥匙串，绝不进该文件。
-- 存储引擎开关语义：relational 恒开（唯一事实源）；关闭的引擎是空实现占位（写 no-op、读空），事件仍在 journal，重开后重放/快照重建 —— 不要给关闭引擎抛异常。
-- shell 是 **PowerShell**：别用 `cd /d`；调脚本用绝对路径；命令行里 `$var` 会被 PowerShell 展开（探针会静默吃掉 Cypher 参数）。
+- Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；字体库为空，截图脚本须注入 `msyh.ttc`。
+- 用户配置：`%APPDATA%/super-brain/config.json` 存差异补丁；测试经 conftest 的 `SUPER_BRAIN_CONFIG_DIR` 重定向（曾因未隔离污染真实配置导致前端启动崩溃——已修，别回退）。密钥只进钥匙串。
+- 存储引擎开关语义：relational 恒开；关闭=空实现占位，事件可重放重建。
+- shell 是 **PowerShell**：别用 `cd /d`；命令行内嵌 Python 代码时避免三引号字符串（PowerShell 转义会碎），改写临时脚本文件执行。
 
 ## 3. 跑测试的正确姿势（沙箱限制，必看）
-
-本机有 safe-delete 钩子拦截 `shutil.rmtree`，**pytest 默认 basetemp 会触发 `SystemExit: 1` 把所有用例变成 ERROR**（不是代码 bug）：
 
 ```powershell
 Set-Location -LiteralPath 'B:\Desktop\BaiduSyncdisk\desktop\VSProject\my_brain_backend'
 & '.\.venv\Scripts\python.exe' -m pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"
 ```
 
-- `--basetemp` 必须指向**当次不存在的新目录**（复用同一路径会在 session 开始时删旧目录而崩）。
-- 不要把 basetemp 放在项目内（同属被保护目录）。
+- `--basetemp` 必须指向当次不存在的新目录（safe-delete 钩子会拦截 rmtree）。
 - 自检：`& '.\.venv\Scripts\python.exe' main.py --self-check`（实测冷启动 0.5~0.9s）。
 
 ## 4. 引擎 API 已核实（0.41/0.11 与旧文档不同，照此写）
 
 ### lancedb 0.41
-- `db.list_tables()`（`table_names()` 已废弃），返回 TableListing，用 `getattr(listing,"tables",listing)` 兼容。
-- 稠密列必须 `pa.list_(pa.float32(), dim)`（fixed_size_list），维度不符在 add 时报错 → 已用作维度校验。
+- `db.list_tables()`（`table_names()` 已废弃）；稠密列必须 `pa.list_(pa.float32(), dim)`。
 - 检索：`tbl.search(vec).metric("cosine").where("is_active = true", prefilter=True).limit(k).to_list()`。
-- 全文：`tbl.create_index("text", config=lancedb.index.FTS(), replace=True)`，检索 `tbl.search(q, query_type="fts")`。
-- **没有"无查询的 where 扫描"**：`tbl.search()` 不接受空查询 → 稀疏通道要先 `to_arrow()` 全量取行再内存打分。
+- **没有"无查询的 where 扫描"**：稀疏通道先 `to_arrow()` 全量取行再内存打分。
 
 ### kuzu 0.11
-- 一个进程一个 `kuzu.Database`；`HypergraphDB` 通过 `KuzuGraphDB.database` 复用，禁止另开。
-- 参数 `$name` 字典传入；`MERGE ... ON CREATE SET ... ON MATCH SET` 实测幂等。
-- `get_as_df()` 依赖 pandas（未装）→ 统一 `get_column_names()` + `has_next()/get_next()`。
+- 一个进程一个 `kuzu.Database`（**桌面实例与脚本不能同时打开**，灌数据先关窗口）；超图复用同一 Database。
+- 参数 `$name` 字典传入；`get_as_df()` 依赖 pandas（未装）→ 用 `get_column_names()` + `has_next()/get_next()`。
 
 ### duckdb 2.0
-- 单写多读：同进程多连接写同一文件冲突 → 单连接 + `conn.cursor()` 每线程隔离 + 写锁。
+- 单写多读：单连接 + `conn.cursor()` 每线程隔离 + 写锁。
 
 ## 5. 已确立的关键设计约定（改动前先读 .memory/DECISIONS.md）
 
-- 记忆自身的 **PAD 不做基线平滑**（保留事件原始色彩）；平滑只用于 Agent 情绪基线（ADR-007）。
+- 记忆自身的 **PAD 不做基线平滑**；平滑只用于 Agent 情绪基线（ADR-007）。
 - 存储层契约是 `Mapping`，实体只活在 `models/`、`brain/`（ADR-002）。
-- 投影失败不回滚事实：SQLite 先落库，outbox 留待重试；embedder 缺失时向量投影标 skipped（可从主库重建）。
-- 归档（tier=archive）不参与常规召回（已有用例锁定）。
-- 冷静期只影响召回权重与注入语气，**不改写已存记忆的 PAD**。
+- 投影失败不回滚事实；归档不参与常规召回；冷静期不改写已存 PAD。
+- 语义合并兜底安全：LLM 失败/裁决非法一律 add，绝不静默丢信息（ADR-010 配套）。
+- FTS 中文整串查询命中 0 → 兜底 LIKE；语义合并候选探测用 **4 字滑窗片段**（改写句无公共前缀）。
+- Qt `QGraphicsView.scene`/`QGraphicsItem.data` 是保留方法名，项目用 `view_scene`/`node`（ADR-008）。
+- `Switch.setChecked` 必须同步滑块位置（否则初始渲染看起来是关）。
 
-## 6. 下一步（可选收尾，不在七阶段任务内）
+## 6. 下一步（显卡机实测路线）
 
-1. `pip install mcp` 后完成 `mcp_server.serve()` 的 Streamable HTTP 传输装配（工具面已就绪）。
-2. 配置 `SYNC_REPO_URL` + PAT，联调 `git_worker` 真实 pull/push（离线路径已测）。
-3. 桌面前端已完成（`python -m ui.desktop`）；`pip install nicegui` 后可选启用 Web 看板（JSON 兜底已可用）。
-4. 放入真实 ONNX/GGUF 权重，跑一次 `eval.compare()` 出换模型对比报告。
-5. 生产前必须设置 `GW_MCP_TOKEN_SECRET`，否则令牌进程重启即失效。
+1. 显卡机 clone：`git clone https://github.com/FFGG10-29/super-brain-memory` → venv + `pip install -r requirements.txt`。
+2. 模型权重放 `data/models/`（BGE-M3 / bge-reranker ONNX、Qwen GGUF）→ 应用「独显」预设 → `--self-check` 验证 CUDA。
+3. 设 `GW_MCP_TOKEN_SECRET`；跑一次「快照 → 删库 → 恢复」演练。
+4. 事件同步库：可另建 `super-brain-memory-events` 私库，把 `SYNC_REPO_URL` 填进「同步与备份」页（代码库与事件总线分开）。
+5. WorkBuddy/CodeBuddy/DSH 的 mcp.json 指向 `python -m gateway.mcp_stdio`（见 `gateway/mcp_stdio.py` docstring）。
+6. PyInstaller 单 exe 打包（onnxruntime/llama-cpp/kuzu hidden imports 有坑）放实测之后。
 
 ## 7. 已知坑
 
-- `sqlite3` 的 FTS5 `unicode61` 对中文两字查询命中 0 条 → 已加 LIKE 兜底（查的是 fts 表的 `body` 列，不是主表不存在的 `content` 列）。
-- `sorted()` 混排中文/英文时 ASCII 在前，测试里比较集合别比较列表。
+- `sqlite3` FTS5 `unicode61` 中文整串查询命中 0 → LIKE 兜底查 `body` 列。
+- `sorted()` 混排中英文 ASCII 在前，测试比较集合别比较列表。
 - 不要给 `.gitignore` 加 `.memory`；该目录必须提交。
+- pytest 进程内 `SUPER_BRAIN_CONFIG_DIR` 是**进程级共享临时目录**，测试写入会跨用例可见。

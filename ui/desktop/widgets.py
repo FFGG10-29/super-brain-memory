@@ -25,6 +25,12 @@ class Switch(QtWidgets.QAbstractButton):
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._animate)
 
+    def setChecked(self, checked: bool) -> None:  # noqa: N802
+        """编程式设置必须同步滑块位置，否则初始渲染看起来是"关"。"""
+        super().setChecked(checked)
+        self._pos = 1.0 if checked else 0.0
+        self.update()
+
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802
         return QtCore.QSize(44, 24)
 
