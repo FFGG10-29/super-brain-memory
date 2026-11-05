@@ -233,6 +233,9 @@ class Prefrontal:
     def _rerank(self, query: str, candidates: list[RecallHit], top_k: int) -> list[RecallHit]:
         if not candidates:
             return []
+        if not self._config.recall.rerank_enabled:
+            # 低配设备/追求低延迟：跳过交叉编码精排，保留 RRF 顺序
+            return candidates[: max(top_k * self._config.recall.rrf_k_oversample, top_k)]
         order = self._reranker.rerank(
             query,
             [(hit.neuron.uuid7_id, hit.neuron.content) for hit in candidates],

@@ -1,6 +1,6 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-05）：**83 passed**（含桌面前端 22 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-05）：**93 passed**（含配置中心 10 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅
@@ -111,6 +111,21 @@
 
 依赖已进 `requirements.txt`：`PySide6-Essentials==6.12.0`、`keyring==25.7.0`。
 预览图渲染注意：offscreen 平台字体库为空，脚本会显式注入 `C:/Windows/Fonts/msyh.ttc`，否则中文变豆腐块。
+
+## 配置中心（打包后免重编译）✅（2026-11-05）
+
+> 设置页 = 一键预设 + 全量参数自动表单；差异补丁存 `%APPDATA%/super-brain/config.json`；密钥只进钥匙串
+> 验收：`pytest tests/test_settings_center.py -q` → **10 passed**（含本地假 OpenAI 服务器）
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 一键预设 ×3（均衡默认 / 性能全开 / 低配省电） | ✅ | `user_config.PRESETS`；lite 预设关向量/精排、拉长同步 |
+| 存储引擎开关（是否全打开） | ✅ | `engines_enabled`：relational 恒开（事实源）；其余关=空实现占位，**事件仍在 journal，重开可重放重建**；写入流不中断 |
+| 本地模型开关 + 云端大模型 API | ✅ | `model_mode=local/cloud/auto`；OpenAI 兼容 `/embeddings` `/chat/completions`（urllib 零 SDK）；失败自动退本地/规则 |
+| 云端 API key 安全 | ✅ | 钥匙串 > 环境变量；不写配置文件/事件日志/界面明文 |
+| 全量参数前端可调（免重编译） | ✅ | `ConfigEditor` 自动表单 11 组：存储/模型/召回/FSRS 遗忘/分层/丘脑准入/情感阈值/同步/网关/星云激活/外观；新增 config 字段零 UI 代码 |
+| 内核热重启 | ✅ | `DesktopBackend.restart()`：应用用户补丁重建引擎，数据保留 |
+| 精排开关 | ✅ | `recall.rerank_enabled=False` 跳过交叉编码（低配省电） |
 
 ## 明确未做（不在本次七阶段任务内）
 

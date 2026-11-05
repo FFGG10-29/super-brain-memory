@@ -214,6 +214,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recall_page.activate_requested.connect(self.activate_query)
         self.recall_page.focus_requested.connect(self.focus_memory)
         self.settings_page.appearance_changed.connect(self._apply_appearance)
+        self.settings_page.kernel_restarted.connect(self._refresh_current)
 
     def _install_shortcuts(self) -> None:
         for key, slot in (

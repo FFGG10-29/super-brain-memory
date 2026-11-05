@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + LivingMemory 风格桌面控制台全部落地，83 用例全过**
+> 最后更新：2026-11-05 ｜ 当前阶段：**七阶段 + 桌面控制台 + 配置中心（免重编译）全部落地，93 用例全过**
 
 ## 1. 进度总览
 
@@ -16,6 +16,7 @@
 | 6 可视与打磨 | ✅ | 六面板数据源 + Dashboard + eval 基线 + 结构化日志 + 备份脚本 |
 | PAD 全链路 | ✅ 8/8 | `tests/test_pad_chain.py` |
 | PySide6 桌面控制台 | ✅ | `ui/desktop/`：九页（星云/记忆/召回/系统/数据/接口端口/同步/设置/关于）；22 条用例 |
+| 配置中心（免重编译） | ✅ | 设置页预设×3 + 全量参数自动表单；存储引擎开关；local/cloud/auto 模型；内核热重启；10 条用例 |
 
 启动：`python -m ui.desktop`（可交互）；`python scripts/nebula_preview.py`（整窗离屏出图到 `data/nebula_preview.png`）。
 端口：接口与端口页可改 host/port 并一键启停 HTTP 适配器；偏好存用户级 QSettings。
@@ -30,6 +31,8 @@
 - Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
 - Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；`SettingsStore.test_connection()` 因此只探测 `shutil.which("git")`。
 - Qt offscreen 平台字体库为空：预览脚本必须 `QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")`，否则中文全是方块。
+- 用户配置：`%APPDATA%/super-brain/config.json` 存与出厂默认的**差异补丁**（Path 序列化为字符串，apply 时还原）；测试用 `SUPER_BRAIN_CONFIG_DIR` 重定向；密钥（GitHub PAT / 云端 key）只进钥匙串，绝不进该文件。
+- 存储引擎开关语义：relational 恒开（唯一事实源）；关闭的引擎是空实现占位（写 no-op、读空），事件仍在 journal，重开后重放/快照重建 —— 不要给关闭引擎抛异常。
 - shell 是 **PowerShell**：别用 `cd /d`；调脚本用绝对路径；命令行里 `$var` 会被 PowerShell 展开（探针会静默吃掉 Cypher 参数）。
 
 ## 3. 跑测试的正确姿势（沙箱限制，必看）

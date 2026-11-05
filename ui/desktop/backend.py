@@ -12,6 +12,7 @@ from typing import Any
 from pathlib import Path
 
 from brain.activation import ActivationGraph, ActivationService
+from brain.cloud_models import load_cloud_api_key
 from brain.memory_browser import MemoryBrowser
 from config import BrainConfig, get_config
 from gateway.http_adapter import HTTPAdapter
@@ -22,6 +23,14 @@ from sync.git_worker import GitSyncWorker
 from sync.projections import EventProjector
 from sync.snapshot import SnapshotManager
 from ui.dashboard import Dashboard
+from ui.desktop.settings import default_keyring
+from ui.desktop.user_config import (
+    apply_overrides,
+    clear_overrides,
+    load_overrides,
+    preset_patch,
+    save_overrides,
+)
 
 __all__ = ["DesktopBackend", "HttpState", "RecallView"]
 
@@ -57,6 +66,8 @@ class DesktopBackend:
         self._http_thread: threading.Thread | None = None
         self._http_state = HttpState()
         self._sync_worker: GitSyncWorker | None = None
+        self._applied_overrides: list[str] = []
+        self._keyring = default_keyring()
         if auto_start:
             self.start()
 
@@ -64,6 +75,8 @@ class DesktopBackend:
     def start(self) -> None:
         if self._app is not None:
             return
+        # 打包后免重编译的关键：启动前把用户目录里的配置补丁应用到运行期 config
+        self.applied_overrides = apply_overrides(self._config, load_overrides())
         app = build_app(self._config)
         self._app = app
         self._activation = ActivationService(app.storage.relational, app.embedder, self._config)
@@ -82,6 +95,25 @@ class DesktopBackend:
             self._app.journal.flush()
             self._app.close()
             self._app = None
+
+    def restart(self) -> dict[str, object]:
+        """应用配置后重启内核（存储开关 / 模型模式 / 维度等启动期参数）。"""
+        self.close()
+        self._gateway = None
+        self._sync_worker = None
+        try:
+            self.start()
+        except Exception as exc:  # noqa: BLE001  重启失败要把错误带回 UI
+            return {"ok": False, "message": f"内核重启失败：{type(exc).__name__}: {exc}"}
+        return {"ok": True, "message": f"内核已按新配置重启（应用 {len(self.applied_overrides)} 项改动）"}
+
+    @property
+    def applied_overrides(self) -> list[str]:
+        return list(self._applied_overrides)
+
+    @applied_overrides.setter
+    def applied_overrides(self, value: list[str]) -> None:
+        self._applied_overrides = value
 
     @property
     def config(self) -> BrainConfig:
@@ -188,6 +220,79 @@ class DesktopBackend:
         assert self._app is not None
         result = self._app.hippocampus.remember(content, agent_id=agent_id)
         return {"applied": result.applied, "id": result.neuron.uuid7_id, "reason": result.admission.reason}
+
+    # ── 配置中心（打包后免重编译）────────────────────────────────────────
+    def model_status(self) -> dict[str, object]:
+        self.start()
+        assert self._app is not None
+        model = self._config.model
+        return {
+            "mode": model.model_mode,
+            "embedder": {
+                "kind": type(self._app.embedder).__name__,
+                "dim": self._app.embedder.dense_dim,
+                "degraded": self._app.embedder.degraded,
+            },
+            "reranker": {"kind": type(self._app.reranker).__name__, "degraded": self._app.reranker.degraded},
+            "llm": {"kind": type(self._app.llm).__name__, "degraded": self._app.llm.degraded},
+            "cloud_ready": bool(model.cloud_base_url),
+            "cloud_key_present": bool(load_cloud_api_key(self._config, keyring_backend=self._keyring)),
+        }
+
+    def save_settings_patch(self, patches: dict[str, dict[str, object]]) -> dict[str, object]:
+        """保存到用户配置文件（差异补丁）+ 即时写回运行期 config。
+
+        存储开关 / 模型模式 / 维度等启动期参数需要重启内核才完全生效，
+        返回值里列出这些项，UI 提示用户点「应用并重启内核」。
+        """
+        merged = save_overrides(patches)
+        changed = apply_overrides(self._config, merged)
+        restart_needed = [
+            name for name in changed
+            if name.split(".", 1)[0] in ("storage", "model") or name == "recall.rerank_enabled"
+        ]
+        return {
+            "ok": True,
+            "changed": changed,
+            "restart_needed": restart_needed,
+            "message": (
+                "已保存并即时生效"
+                if not restart_needed
+                else f"已保存；{len(restart_needed)} 项属启动期参数，请点「应用并重启内核」"
+            ),
+        }
+
+    def reset_settings(self) -> dict[str, object]:
+        clear_overrides()
+        return {"ok": True, "message": "已清除用户配置（恢复出厂默认；重启内核后完全生效）"}
+
+    def apply_preset(self, name: str) -> dict[str, object]:
+        patch = preset_patch(name)
+        if not patch:
+            return {"ok": False, "message": f"预设不存在：{name}"}
+        save_overrides(patch)
+        changed = apply_overrides(self._config, patch)
+        return {
+            "ok": True,
+            "changed": changed,
+            "message": f"已应用预设「{name}」（{len(changed)} 项）；存储/模型参数需重启内核",
+        }
+
+    def save_cloud_key(self, key: str) -> dict[str, object]:
+        ring = self._keyring
+        if ring is None:
+            env = self._config.model.cloud_api_key_env
+            return {"ok": False, "message": f"系统钥匙串不可用：请改用环境变量 {env}"}
+        if key.strip():
+            ring.set_password("super-brain-v21", "cloud_api_key", key.strip())
+            message = "云端 API key 已写入系统钥匙串（不入配置文件/事件日志）"
+        else:
+            try:
+                ring.delete_password("super-brain-v21", "cloud_api_key")
+            except Exception:  # noqa: BLE001
+                pass
+            message = "已清除钥匙串中的云端 API key"
+        return {"ok": True, "message": message}
 
     # ── 状态面板 ──────────────────────────────────────────────────────────
     def snapshot(self) -> dict[str, Any]:

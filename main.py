@@ -50,6 +50,13 @@ from engine.reranker import create_reranker
 from gateway.http_adapter import HTTPAdapter
 from gateway.mcp_server import MCPToolkit
 from gateway.registry import AgentRegistry
+from storage.disabled import (
+    DisabledGraph,
+    DisabledHypergraph,
+    DisabledKV,
+    DisabledTimeSeries,
+    DisabledVector,
+)
 from storage.graph_db import KuzuGraphDB
 from storage.hypergraph_db import GraphHypergraph
 from storage.kv_store import LmdbKVStore
@@ -154,22 +161,47 @@ def _resolve_model_dir(config: BrainConfig, candidate: str) -> str | None:
 
 
 def build_storage(config: BrainConfig) -> StorageSet:
-    """按 config 装配六个基座。顺序有依赖：图谱必须先于超图（共享 Database）。"""
+    """按 config 装配六个基座。顺序有依赖：图谱必须先于超图（共享 Database）。
+
+    引擎开关：relational 是唯一事实源强制启用；其余可关（空实现占位，
+    事件仍在 journal，重开后可重放/快照重建 —— 架构 §八）。
+    """
+    engines = config.storage.engines_enabled
     relational = SqliteRelationalDB(
         config.storage.sqlite_path,
         schema_version=config.sync.schema_version,
         busy_timeout_ms=config.storage.sqlite_busy_timeout_ms,
         wal_autocheckpoint=config.storage.wal_autocheckpoint,
     )
-    vector = LanceVectorDB(config.storage.lancedb_path, dense_dim=config.model.dense_dim)
-    graph = KuzuGraphDB(config.storage.kuzu_path)
-    kv = LmdbKVStore(
-        config.storage.lmdb_path,
-        map_size_mb=config.storage.lmdb_map_size_mb,
-        max_buckets=config.storage.lmdb_max_buckets,
+    vector: VectorRepository
+    graph: GraphRepository
+    if engines.get("vector", True):
+        vector = LanceVectorDB(config.storage.lancedb_path, dense_dim=config.model.dense_dim)
+    else:
+        vector = DisabledVector()
+    if engines.get("graph", True):
+        graph = KuzuGraphDB(config.storage.kuzu_path)
+    else:
+        graph = DisabledGraph()
+    kv: KVRepository = (
+        LmdbKVStore(
+            config.storage.lmdb_path,
+            map_size_mb=config.storage.lmdb_map_size_mb,
+            max_buckets=config.storage.lmdb_max_buckets,
+        )
+        if engines.get("kv", True)
+        else DisabledKV()
     )
-    timeseries = DuckDBTimeSeries(config.storage.duckdb_path, threads=config.storage.duckdb_threads)
-    hypergraph = GraphHypergraph(graph)
+    timeseries: TimeSeriesRepository = (
+        DuckDBTimeSeries(config.storage.duckdb_path, threads=config.storage.duckdb_threads)
+        if engines.get("timeseries", True)
+        else DisabledTimeSeries()
+    )
+    hypergraph: HypergraphRepository = (
+        GraphHypergraph(graph)
+        if engines.get("hypergraph", True) and engines.get("graph", True)
+        else DisabledHypergraph()
+    )
     return StorageSet(
         relational=relational,
         vector=vector,
@@ -180,25 +212,71 @@ def build_storage(config: BrainConfig) -> StorageSet:
     )
 
 
-def build_app(config: BrainConfig | None = None) -> BrainApp:
-    """组合根入口。三模型只构造不预热（懒加载），冷启动不碰磁盘上的大文件。"""
-    config = config or get_config()
-    storage = build_storage(config)
+def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
+    """按 model_mode 装配三模型：local / cloud / auto。
 
-    embedder = BgeM3Embedder(
-        dense_dim=config.model.dense_dim,
-        model_dir=_resolve_model_dir(config, config.model.embedding_model),
-        use_cuda=config.model.use_cuda,
-    )
+    cloud 模式下某模型未配置（模型名留空或无 key）时自动退回本地实现并打印警告，
+    保证"配置了一半"的设备也能启动 —— 不会因为云 API 抖动而拒绝开机。
+    """
+    mode = config.model.model_mode
+    use_cloud = mode == "cloud"
+    if mode == "auto":
+        local_ready = (_resolve_model_dir(config, config.model.embedding_model) is not None)
+        use_cloud = not local_ready
+
+    if use_cloud and config.model.cloud_base_url:
+        from brain.cloud_models import CloudCredentials, CloudEmbedder, CloudLLM, load_cloud_api_key
+
+        credentials = CloudCredentials(
+            config.model.cloud_base_url,
+            load_cloud_api_key(config),
+            timeout=config.model.cloud_timeout_sec,
+        )
+        embedder: Embedder
+        if config.model.cloud_embedding_model:
+            embedder = CloudEmbedder(
+                credentials, config.model.cloud_embedding_model, dense_dim=config.model.cloud_embed_dim
+            )
+        else:
+            print("警告：cloud 模式未配置 cloud_embedding_model，embedding 退回本地/降级")
+            embedder = BgeM3Embedder(
+                dense_dim=config.model.dense_dim,
+                model_dir=_resolve_model_dir(config, config.model.embedding_model),
+                use_cuda=config.model.use_cuda,
+            )
+        llm: LocalLLM
+        if config.model.cloud_llm_model:
+            llm = CloudLLM(credentials, config.model.cloud_llm_model)
+        else:
+            print("警告：cloud 模式未配置 cloud_llm_model，抽取/总结退回本地/规则")
+            llm = QwenLocalLLM(
+                model_path=str(config.model.llm_gguf_dir / config.model.llm_model),
+                gpu_layers=config.model.llm_gpu_layers,
+            )
+    else:
+        embedder = BgeM3Embedder(
+            dense_dim=config.model.dense_dim,
+            model_dir=_resolve_model_dir(config, config.model.embedding_model),
+            use_cuda=config.model.use_cuda,
+        )
+        llm = QwenLocalLLM(
+            model_path=str(config.model.llm_gguf_dir / config.model.llm_model)
+            if (config.model.llm_gguf_dir / config.model.llm_model).exists()
+            else None,
+            gpu_layers=config.model.llm_gpu_layers,
+        )
     reranker = create_reranker(
         model_dir=_resolve_model_dir(config, config.model.reranker_model),
         use_cuda=config.model.use_cuda,
     )
-    llm_path = config.model.llm_gguf_dir / config.model.llm_model
-    llm = QwenLocalLLM(
-        model_path=str(llm_path) if llm_path.exists() else None,
-        gpu_layers=config.model.llm_gpu_layers,
-    )
+    return embedder, reranker, llm
+
+
+def build_app(config: BrainConfig | None = None) -> BrainApp:
+    """组合根入口。三模型只构造不预热（懒加载），冷启动不碰磁盘上的大文件。"""
+    config = config or get_config()
+    storage = build_storage(config)
+    embedder, reranker, llm = _build_models(config)
     clock = HybridLogicalClock(config.sync.device_id)
 
     # 同步平面写入端：本地事件段（fsync 后回执），Pull/Push 由 git_worker 负责

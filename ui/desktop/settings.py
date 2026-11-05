@@ -55,7 +55,7 @@ class SettingsStore:
         qsettings: Any | None = None,
     ) -> None:
         self._config = config or get_config()
-        self._keyring = keyring_backend if keyring_backend is not None else _default_keyring()
+        self._keyring = keyring_backend if keyring_backend is not None else default_keyring()
         self._q = qsettings if qsettings is not None else QSettings("super-brain", "desktop")
 
     def _read_pat(self) -> tuple[str | None, str]:
@@ -174,7 +174,7 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
-def _default_keyring():
+def default_keyring():
     try:
         import keyring  # pyright: ignore[reportMissingImports]
     except Exception:  # noqa: BLE001

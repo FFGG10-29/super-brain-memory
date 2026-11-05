@@ -43,6 +43,15 @@ class StorageConfig(BaseSettings):
     lmdb_map_size_mb: int = 256                         # LMDB 地址空间上限
     lmdb_max_buckets: int = 64                          # 命名子库上限
     duckdb_threads: int = 2                             # 时序分析并行度
+    # 引擎开关：False = 用空实现占位（写操作 no-op、读操作空结果）。
+    # 事件日志是唯一真源：关掉通道不丢数据，重新打开后可用快照/重放重建。
+    # relational 是唯一事实源，强制启用，不提供开关。
+    engines_enabled: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "relational": True, "vector": True, "graph": True,
+            "kv": True, "timeseries": True, "hypergraph": True,
+        }
+    )
 
 
 class ModelConfig(BaseSettings):
@@ -57,6 +66,14 @@ class ModelConfig(BaseSettings):
     use_cuda: bool = False                               # CUDA→CPU 自动降级
     llm_gpu_layers: int = -1                             # n_gpu_layers 递减降级
     onnx_providers: list[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
+    # 模型来源：local=全本地；cloud=云端 OpenAI 兼容 API（未配齐自动退本地）；auto=本地有模型文件用本地，否则云
+    model_mode: Literal["local", "cloud", "auto"] = "auto"
+    cloud_base_url: str = ""                             # 如 https://api.openai.com/v1（不带尾斜杠）
+    cloud_embedding_model: str = ""                      # 云端 embedding 模型名（留空=云模式不换 embedding）
+    cloud_llm_model: str = ""                            # 云端 chat 模型名（留空=云模式不换 LLM）
+    cloud_embed_dim: int = 1024                          # 云端向量维度，必须与 dense_dim 一致
+    cloud_timeout_sec: int = 30
+    cloud_api_key_env: str = "CLOUD_API_KEY"             # API key 来源：钥匙串 > 该环境变量；永不入配置文件
 
 
 class RecallConfig(BaseSettings):
@@ -73,6 +90,7 @@ class RecallConfig(BaseSettings):
     top_k: int = 5
     p95_target_ms: int = 800                             # CPU 单次召回 P95
     pad_salience_arousal_weight: float = 0.6             # PAD 显著性里唤醒度的占比
+    rerank_enabled: bool = True                          # False=跳过交叉编码精排（省时省电，低配设备）
 
 
 class PlasticityConfig(BaseSettings):

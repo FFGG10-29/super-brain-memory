@@ -80,3 +80,24 @@
   让内核分配空闲端口，避免 CI 端口冲突（`make_server` 已修正 `port or default` 吞 0 的问题）。
 - **UI 一致性**：所有颜色/字号走 `theme.stylesheet()`，页面禁止内联大段样式；
   动画参数走 `config.UiConfig`，设置页改完即时生效（`appearance_changed` 信号）。
+
+## ADR-010 配置中心：差异补丁 + 预设 + 自动表单 + 空引擎占位
+
+- **决策**：打包后所有参数前端可调、免重编译。
+  1) 用户配置只存"与出厂默认的深合并差异补丁"（`%APPDATA%/super-brain/config.json`），
+     软件升级新增参数自动落默认值；`DesktopBackend.start()` 前应用补丁；
+  2) 三套预设（均衡默认 / 性能全开 / 低配省电）= 一组补丁；
+  3) 设置页用 `ConfigEditor` 按 pydantic 注解自动渲染（bool→勾选、Literal→下拉、
+     dict[str,bool]→逐键勾选、Path→文本框），新增 config 字段零 UI 代码；
+  4) 存储引擎开关：relational 恒开；关闭=空实现占位（写 no-op、读空、health 标"已关闭"），
+     事件日志是唯一真源，重开后可重放重建；
+  5) 模型 `local/cloud/auto` 三态：云端走 OpenAI 兼容 HTTP（urllib），失败抛
+     EngineUnavailable 走既有降级，未配齐自动退本地，保证"配一半"也能开机；
+  6) 启动期参数（引擎开关/模型模式/维度）保存后提示「应用并重启内核」，
+     `DesktopBackend.restart()` 关旧引擎→重放补丁→重建，数据不丢。
+- **理由**：多端安装意味着设备能力差异大（有无 GPU、磁盘大小、是否常离线），
+  编译期常量无法适配；差异补丁比全量导出安全（升级不丢用户调参）；
+  空实现占位而非跳过装配，保证依赖图（hippocampus→六库）结构稳定，测试与生产同构。
+- **How to apply**：新增可调参数 = 在 `config.py` 对应子模型加字段 + `FIELD_LABELS` 加中文名，
+  UI 自动出现；需要重启生效的参数加进 `save_settings_patch` 的 restart_needed 判定；
+  新密钥一律走钥匙串（account 约定见 `SettingsStore`），配置文件里只允许非敏感值。

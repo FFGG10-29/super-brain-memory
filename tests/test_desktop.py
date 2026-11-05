@@ -293,14 +293,17 @@ def test_settings_page_applies_appearance(backend, store, qapp):
     page = SettingsPage(backend, store)
     fired: list[int] = []
     page.appearance_changed.connect(lambda: fired.append(1))
-    page._interval.setValue(33)
-    page._threshold.setValue(0.45)
-    page._labels.setValue(5)
+    # 表单 collect 的补丁 → 保存路径（控件渲染已在「渲染所有分组」用例覆盖）
+    page._editor  # noqa: B018  表单已按分组构建
+    backend.save_settings_patch({
+        "ui": {"timer_interval_ms": 33, "max_labels": 5},
+        "activation": {"similarity_threshold": 0.45},
+    })
     page.save()
     assert backend.config.ui.timer_interval_ms == 33
     assert backend.config.activation.similarity_threshold == pytest.approx(0.45)
     assert backend.config.ui.max_labels == 5
-    assert fired == [1]
+    assert fired, "save() 必须触发 appearance_changed"
     assert "已保存" in page._status.text()
 
 
