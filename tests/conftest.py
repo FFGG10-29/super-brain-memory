@@ -4,10 +4,15 @@
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
+
+# 任何测试都不许污染真实用户配置（%APPDATA%/super-brain）——必须在 import config 前设置
+os.environ["SUPER_BRAIN_CONFIG_DIR"] = tempfile.mkdtemp(prefix="brain_test_config_")
 
 from brain.amygdala import Amygdala
 from brain.hippocampus import Hippocampus
