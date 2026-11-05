@@ -1,0 +1,30 @@
+# ── 阶段 1~6 可选依赖（不进阶段 0 基线，按阶段按需安装）────────────────
+# 原则：阶段 0 冷启动不得被重型依赖拖慢；三模型必须保持「懒加载 + 缺包降级」。
+# 安装示例：.venv\Scripts\python.exe -m pip install -r requirements-optional.txt
+#           （或只挑对应阶段那几行单独装）
+
+# 阶段 1/2 算力层：BGE-M3 稠密+稀疏 / 精排 / Qwen3-0.6B GGUF
+# 有 N 卡用 onnxruntime-gpu，纯 CPU 用 onnxruntime；二者只装一个
+# onnxruntime>=1.17
+# onnxruntime-gpu>=1.17
+# llama-cpp-python>=0.2        # Windows 编译需 CMake + MSVC，建议用预编译 wheel
+
+# 阶段 4 网关多端
+# mcp>=1.2                     # 官方 MCP SDK（Streamable HTTP）
+# fastapi>=0.110
+# uvicorn>=0.29
+# sse-starlette>=2.1
+# httpx>=0.27
+
+# 阶段 5 同步平面
+# GitPython>=3.1               # git_worker pull→重放→push
+
+# 阶段 6 可视与打磨
+# nicegui>=1.4
+# apscheduler>=3.10
+
+# ── 预留扩展位（当前代码未直接使用，勿盲目安装）──────────────────────
+# sqlalchemy>=2.0             # 当前 SQLite 用标准库 sqlite3 + thread-local
+# simhash>=2.1.1              # 当前 brain/thalamus.py 自实现 3-gram SimHash
+# sentence-transformers>=2.7  # 仅 BGE-M3 加载辅助，ONNX 路径不需要
+# asyncio-mqtt>=0.16          # v2 路线图：近实时通道

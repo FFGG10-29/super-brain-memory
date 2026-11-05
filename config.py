@@ -1,0 +1,196 @@
+"""超级大脑 v2.1 —— 一切参数外置。
+
+所有可调参数集中于此，通过 .env / 环境变量覆盖。认知层与网关层只读取本配置，
+不直接硬编码任何阈值、权重、端口或私钥。
+"""
+from __future__ import annotations
+
+import re
+import socket
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 项目根（my_brain_backend/ 的父目录，用于定位 data/ 与仓库）
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _default_device_id() -> str:
+    """设备标识默认取主机名（同步平面按 device_id 分目录，必须跨设备唯一可辨）。
+
+    只保留安全字符：journal 目录名要进 Git 与文件系统，避免中文/空格带来的路径歧义。
+    """
+    host = socket.gethostname().strip().lower()
+    safe = re.sub(r"[^a-z0-9._-]+", "-", host).strip("-")
+    return f"dev-{safe or 'unknown'}"
+
+
+class StorageConfig(BaseSettings):
+    """六引擎物理基座连接参数。"""
+    model_config = SettingsConfigDict(env_prefix="STORAGE_")
+
+    sqlite_path: Path = DATA_DIR / "relational.db"      # 元数据主库 + FTS5
+    lancedb_path: Path = DATA_DIR / "vector.lance"      # 向量库
+    kuzu_path: Path = DATA_DIR / "graph.kuzu"           # 图谱 / 超图编码
+    lmdb_path: Path = DATA_DIR / "kv.lmdb"              # KV 画像
+    duckdb_path: Path = DATA_DIR / "timeseries.db"      # 时序 OLAP
+    sqlite_busy_timeout_ms: int = 5000                  # WAL busy_timeout
+    wal_autocheckpoint: int = 1000
+    lmdb_map_size_mb: int = 256                         # LMDB 地址空间上限
+    lmdb_max_buckets: int = 64                          # 命名子库上限
+    duckdb_threads: int = 2                             # 时序分析并行度
+
+
+class ModelConfig(BaseSettings):
+    """算力层三模型。藏于接口之后，可整体换远端 API。"""
+    model_config = SettingsConfigDict(env_prefix="MODEL_")
+
+    dense_dim: int = 1024                                # BGE-M3 稠密维度
+    embedding_model: str = "BAAI/bge-m3"                 # 稠密+稀疏
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"      # 交叉编码精排
+    llm_model: str = "qwen3-0.6b-q8_0.gguf"             # 严格 JSON 抽取/总结
+    llm_gguf_dir: Path = DATA_DIR / "models"
+    use_cuda: bool = False                               # CUDA→CPU 自动降级
+    llm_gpu_layers: int = -1                             # n_gpu_layers 递减降级
+    onnx_providers: list[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
+
+
+class RecallConfig(BaseSettings):
+    """检索融合权重与配额，全进 config 靠 eval 调参。"""
+    model_config = SettingsConfigDict(env_prefix="RECALL_")
+
+    rrf_k_oversample: int = 4                            # 各路超采样 k×4
+    rrf_constant: int = 60                               # 1/(k+rank)
+    w_rrf: float = 1.0                                   # RRF 名次
+    w_freshness: float = 0.6                             # 新鲜度
+    w_synapse: float = 0.8                               # 突触强度
+    w_pad: float = 0.5                                   # PAD 显著性
+    w_confidence: float = 0.7                            # 置信度
+    top_k: int = 5
+    p95_target_ms: int = 800                             # CPU 单次召回 P95
+    pad_salience_arousal_weight: float = 0.6             # PAD 显著性里唤醒度的占比
+
+
+class PlasticityConfig(BaseSettings):
+    """FSRS 三变量遗忘/强化曲线参数（离线再拟合）。"""
+    model_config = SettingsConfigDict(env_prefix="PLAST_")
+
+    fsrs_difficulty_default: float = 5.0                 # D 难度
+    fsrs_stability_default: float = 1.0                  # S 稳定度
+    fsrs_decay: float = 0.9                              # 幂律衰减底数
+    reinforce_threshold: int = 3                         # 访问≥N 次触发巩固
+    consolidate_confidence: float = 0.95                 # 核心层阈值
+    recall_layer_ceiling: float = 0.95
+    review_queue_ceiling: float = 0.5                    # <0.5 入复核队列
+    fsrs_power: float = 0.9                              # 幂律衰减指数
+    fsrs_arousal_boost: float = 0.5                      # 高唤醒对稳定度增长的加成（闪光灯记忆）
+
+
+class TierConfig(BaseSettings):
+    """分层 × 金字塔正交流动。"""
+    model_config = SettingsConfigDict(env_prefix="TIER_")
+
+    tiers: list[Literal["buffer", "core", "recall", "archive"]] = \
+        Field(default_factory=lambda: ["buffer", "core", "recall", "archive"])
+    pyramid: list[Literal["raw", "fact", "topic", "worldview"]] = \
+        Field(default_factory=lambda: ["raw", "fact", "topic", "worldview"])
+    buffer_no_sync: bool = True                          # 工作记忆不跨脑同步
+    archive_retrievability_threshold: float = 0.15       # R 低于此值归档（退出常规召回）
+
+
+class ThalamusConfig(BaseSettings):
+    """丘脑门控：准入、去重、显著性、限流。"""
+    model_config = SettingsConfigDict(env_prefix="THAL_")
+
+    min_content_chars: int = 4                           # 过短内容直接拒收
+    dedupe_hamming_threshold: int = 3                     # SimHash 汉明距离 ≤3 视为重复
+    dedupe_cosine_threshold: float = 0.95                 # 向量近邻去重阈值
+    significance_threshold: float = 0.30                  # 低于此值只进缓冲区，不产生跨设备事件
+    rate_limit_per_minute: int | None = None              # None → 用 gateway.default_rate_limit
+    significance_length_weight: float = 0.3               # 显著性：信息量占比
+    significance_pad_weight: float = 0.5                  # 显著性：情绪显著性占比
+    significance_confidence_weight: float = 0.2           # 显著性：置信度占比
+    significance_length_ref: int = 200                    # 信息量饱和长度（字符）
+    dedupe_window: int = 200                              # 近邻去重窗口（最近 N 条）
+
+
+class AmygdalaConfig(BaseSettings):
+    """杏仁核：PAD 精算、好感度低通积分、情绪边界。"""
+    model_config = SettingsConfigDict(env_prefix="AMYG_")
+
+    affinity_alpha: float = 0.15                          # 好感度低通系数（越小越慢变）
+    pad_smoothing: float = 0.5                            # PAD 与历史均值的平滑比例
+    negative_arousal_threshold: float = 0.6               # 高负唤醒触发冷静期
+    negative_valence_threshold: float = -0.3              # P 低于此值算负面
+    calm_period_ms: int = 6 * 60 * 60 * 1000              # 冷静期时长（6h）
+    calm_recall_penalty: float = 0.3                      # 冷静期内该 Agent 记忆的召回折扣
+
+
+class SyncConfig(BaseSettings):
+    """同步平面：GitHub 私有库事件总线。"""
+    model_config = SettingsConfigDict(env_prefix="SYNC_")
+
+    repo_url: str = ""                                   # 私库地址（Git PAT 单独存）
+    local_repo_dir: Path = DATA_DIR / "brain-sync"
+    device_id: str = Field(default_factory=_default_device_id)  # 设备标识（默认取主机名）
+    sync_interval_sec: int = 300                         # 定时拉推间隔
+    write_debounce_sec: float = 2.0                      # 写入触发防抖
+    segment_max_bytes: int = 50 * 1024 * 1024            # 段滚动阈值 ~50MB
+    snapshot_monthly: bool = True
+    schema_version: int = 1
+    use_age_encrypt: bool = False                        # 敏感内容 age 对称加密
+    remote_name: str = "origin"
+
+
+class GatewayConfig(BaseSettings):
+    """接入平面：MCP + HTTP 适配器 + 注册中心。"""
+    model_config = SettingsConfigDict(env_prefix="GW_")
+
+    mcp_host: str = "0.0.0.0"
+    mcp_port: int = 8765
+    mcp_token_secret: str = Field(default="", repr=False)  # 令牌签发密钥
+    http_host: str = "0.0.0.0"
+    http_port: int = 8766
+    default_rate_limit: int = 60                         # 丘脑按 agent 限速(/min)
+    registry_enabled: bool = True
+
+
+class BrainConfig(BaseSettings):
+    """全局组合根配置。"""
+    model_config = SettingsConfigDict(env_prefix="BRAIN_", env_file=".env")
+
+    app_name: str = "super-brain"
+    log_level: str = "INFO"
+    cold_start_timeout_sec: int = 30                     # 冷启动<30s
+    namespace_policy: Literal["private", "group", "global"] = "private"
+
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    recall: RecallConfig = Field(default_factory=RecallConfig)
+    plasticity: PlasticityConfig = Field(default_factory=PlasticityConfig)
+    tier: TierConfig = Field(default_factory=TierConfig)
+    thalamus: ThalamusConfig = Field(default_factory=ThalamusConfig)
+    amygdala: AmygdalaConfig = Field(default_factory=AmygdalaConfig)
+    sync: SyncConfig = Field(default_factory=SyncConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+
+
+# 单例配置（懒加载于 main.py）
+_config: BrainConfig | None = None
+
+
+def get_config() -> BrainConfig:
+    global _config
+    if _config is None:
+        _config = BrainConfig()
+    return _config
+
+
+def reset_config() -> None:
+    """测试 / 重配置时重置单例。"""
+    global _config
+    _config = None

@@ -1,0 +1,30 @@
+# 运行期数据与密钥，禁止入库
+data/
+.env
+*.pat
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+backups/
+
+# 工作记忆目录必须随仓库同步到 GitHub（见 .memory/README.md）
+!.memory/
+!.memory/**
+
+# 本地库文件（六引擎落盘产物）
+*.db
+*.db-wal
+*.db-shm
+*.lance/
+*.kuzu/
+*.lmdb/
+brain-sync/

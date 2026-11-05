@@ -1,0 +1,21 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "include": [
+    "main.py",
+    "config.py",
+    "core",
+    "models",
+    "storage",
+    "engine",
+    "brain",
+    "sync",
+    "workers",
+    "gateway",
+    "ui",
+    "eval",
+    "tests"
+  ],
+  "exclude": ["**/.venv", "**/__pycache__", "data"]
+}

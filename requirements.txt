@@ -1,0 +1,32 @@
+# ── 超级大脑 v2.1 · 阶段 0 可运行基线（冻结版本）──────────────────────
+# 实测环境：Windows / Python 3.11.5 / 2026-11-05
+# 建立：python -m venv .venv
+#       .venv\Scripts\python.exe -m pip install -r requirements.txt
+# 验证：.venv\Scripts\python.exe scripts/verify_baseline.py
+#       .venv\Scripts\python.exe main.py --self-check
+#
+# 精确锁定而非 >= 的理由：lancedb / kuzu 项目年轻、schema 与 API 变动快，
+# 与「自建版本号表 + 启动校验」的风险缓解策略配套。升级任一版本前必须
+# 重跑 verify_baseline + pytest 全套，并同步 .memory/DECISIONS.md。
+# 后续阶段（算力/网关/UI/调度）的可选依赖见 requirements-optional.txt。
+
+# 配置与实体
+pydantic==2.14.2
+pydantic-settings==2.16.2
+python-dotenv==1.2.4
+structlog==26.1.0
+
+# 数值与列存（lancedb 依赖，向量 schema 用 fixed_size_list）
+numpy==2.4.6
+pyarrow==26.0.1
+
+# 六引擎（SQLite 用标准库 sqlite3，无需额外包）
+lancedb==0.41.0
+kuzu==0.11.3
+lmdb==3.0.0
+duckdb==2.0.0
+hypernetx==2.4.3
+
+# 测试
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
