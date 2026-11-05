@@ -16,7 +16,24 @@ from ui.desktop.backend import DesktopBackend
 from ui.desktop.settings import SettingsStore
 from ui.desktop.widgets import Card
 
-__all__ = ["InterfacePage", "agent_handoff_text", "mcp_command"]
+__all__ = ["InterfacePage", "mcp_command", "mcp_json_text"]
+
+
+def bridge_token_text() -> str:
+    """读出本机桥接令牌全文（桌面内核启动 HTTP 时写入 mcp_bridge.json）。"""
+    from core.runtime_paths import read_local_token
+
+    try:
+        from core.runtime_paths import local_bridge_path
+
+        payload = json.loads(local_bridge_path().read_text(encoding="utf-8"))
+        token = str(payload.get("token") or "")
+        if token:
+            return token
+    except (OSError, ValueError):
+        pass
+    # 服务没开也要能复制：令牌是持久化的，与运行状态无关
+    return read_local_token()
 
 
 def mcp_command() -> tuple[str, list[str]]:
@@ -40,38 +57,37 @@ def mcp_command() -> tuple[str, list[str]]:
     return str(Path(sys.executable)), ["-m", "gateway.mcp_stdio"]
 
 
-def agent_handoff_text() -> str:
-    """「复制给 Agent」的完整文本：配置 JSON + 让它自己动手的指令。
+def mcp_json_text(mode: str = "http") -> str:
+    """标准 MCP 配置片段：直接粘进 Agent 的「添加 MCP 连接 → 导入 JSON」。
 
-    command 指向 `%LOCALAPPDATA%\\SuperBrain\\bin\\super-brain-mcp.cmd` 这个**固定启动器**，
-    桌面端每次启动都会按当前安装位置重写它——软件从 B 盘搬到 D 盘也不用改这段配置。
+    http 模式：Streamable HTTP，一个 URL + Bearer 令牌，跨语言客户端零依赖；
+    stdio 模式：本机启动器，不需要令牌（进程即信任）。
     """
-    command, args = mcp_command()
-    server: dict[str, object] = {"command": command}
-    if args:
-        server["args"] = args
-    snippet = json.dumps({"mcpServers": {"super-brain-memory": server}}, ensure_ascii=False, indent=2)
-    arg_text = f"，args = {args}" if args else "，不需要 args"
-    return f"""把下面这段 JSON 合并进你的 MCP 配置（mcp.json / 设置 → MCP 服务器），然后重启或重载 MCP：
+    if mode == "stdio":
+        command, args = mcp_command()
+        server: dict[str, object] = {"type": "stdio", "command": command}
+        if args:
+            server["args"] = args
+        return json.dumps({"mcpServers": {"super-brain-memory": server}}, ensure_ascii=False, indent=2)
 
-{snippet}
+    from config import get_config
 
-或者直接把下面这段话发给我，由我帮你写：
-「请在我的 MCP 配置中加入名为 super-brain-memory 的 stdio 服务器：
-  command = {command}{arg_text}
- 这是本机长期记忆中枢：所有 Agent 共享同一份记忆，不要按 agent 隔离，也不需要填端口或令牌。
- 配好后先调用 health_check 确认可用；之后用 save_memory 记录事实/偏好，
- 用 recall_memory 查询，用 timeline_query 看时间线。」
-
-说明：
-· 真正的程序路径都收在启动器里（%LOCALAPPDATA%\\SuperBrain\\bin\\super-brain-mcp.cmd），
-  桌面端每次启动都会按**当前安装位置**自动刷新它——软件从 B 盘搬到 D 盘，这段配置不用改；
-  外面只引用系统 cmd.exe，所以换盘、换用户名下的安装目录都不会失效。
-· 记忆只有一个库：任何 Agent 写的记忆，其它 Agent 立刻能召回；agent_id 只用于审计与限流。
-· 请求进桌面内核的入口队列，由丘脑逐条准入 → 海马体写入 → 六引擎投影，
-  Agent 不会各自打开数据库（Kùzu 单写锁，绝不允许多进程直连）。
-· 桌面端随软件启动就会开 HTTP 桥接；关窗口只是收进托盘，接入不中断。"""
-
+    gateway = get_config().gateway
+    host = gateway.http_host if gateway.http_host not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    url = f"http://{host}:{gateway.http_port}/mcp"
+    return json.dumps(
+        {
+            "mcpServers": {
+                "super-brain-memory": {
+                    "type": "streamable-http",
+                    "url": url,
+                    "headers": {"Authorization": f"Bearer {bridge_token_text()}"},
+                }
+            }
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 class InterfacePage(QtWidgets.QWidget):
@@ -102,11 +118,15 @@ class InterfacePage(QtWidgets.QWidget):
         self._stop.setEnabled(False)
         self._health = QtWidgets.QPushButton("浏览器打开 /health")
         self._health.clicked.connect(self.open_health)
+        self._copy_token = QtWidgets.QPushButton("复制桥接令牌")
+        self._copy_token.setToolTip("复制完整令牌：给需要直接调 HTTP /mcp/call 的 Agent 用")
+        self._copy_token.clicked.connect(self.copy_bridge_token)
         self._health.setEnabled(False)
         buttons = QtWidgets.QHBoxLayout()
         buttons.addWidget(self._start)
         buttons.addWidget(self._stop)
         buttons.addWidget(self._health)
+        buttons.addWidget(self._copy_token)
         buttons.addStretch(1)
 
         self._state = QtWidgets.QLabel("未启动")
@@ -158,27 +178,34 @@ class InterfacePage(QtWidgets.QWidget):
         cred_card.body.addWidget(self._credentials)
 
         # ── 一键复制给 Agent（MCP 配置片段 + 一段说明）────────────────────
+        self._mode = QtWidgets.QComboBox()
+        self._mode.addItem("streamable-http（URL + 令牌，推荐）", "http")
+        self._mode.addItem("stdio（本机启动器，不需要令牌）", "stdio")
+        self._mode.currentIndexChanged.connect(lambda _index: self._refresh_snippet())
+
         self._agent_snippet = QtWidgets.QTextEdit()
         self._agent_snippet.setReadOnly(True)
-        self._agent_snippet.setPlainText(agent_handoff_text())
-        self._agent_snippet.setMinimumHeight(210)
+        self._agent_snippet.setPlainText(mcp_json_text("http"))
+        self._agent_snippet.setMinimumHeight(190)
         self._agent_snippet.setStyleSheet(
             "font-family: Consolas, 'Cascadia Mono', monospace; font-size: 11px;"
         )
-        copy_btn = QtWidgets.QPushButton("复制给 Agent")
+        copy_btn = QtWidgets.QPushButton("复制 MCP JSON")
         copy_btn.setObjectName("primary")
-        copy_btn.setToolTip("复制这段内容和说明；发给 CodeBuddy / DSH / Cursor / Claude 等，它会自己写 MCP 配置")
+        copy_btn.setToolTip("复制标准 mcpServers 片段，粘贴到 Agent 的「添加 MCP 连接 → 导入 JSON」")
         copy_btn.clicked.connect(self.copy_agent_config)
         self._copy_hint = QtWidgets.QLabel("")
         self._copy_hint.setObjectName("hint")
         copy_row = QtWidgets.QHBoxLayout()
+        copy_row.addWidget(self._mode, 1)
         copy_row.addWidget(copy_btn)
         copy_row.addWidget(self._copy_hint, 1)
 
-        agent_card = Card("复制给 Agent —— 一段配置完成接入（stdio 桥接，本机无需填端口/令牌）")
+        agent_card = Card("复制给 Agent —— 标准 MCP JSON（粘贴即用）")
         agent_note = QtWidgets.QLabel(
-            "所有 Agent 共享同一份记忆：stdio 进程只做协议翻译，读写统一由桌面内核里的"
-            "丘脑/海马体裁决，请求在入口排队逐条执行，Agent 不会各自打开数据库。"
+            "把下面的 JSON 粘到 Agent 的「添加 MCP 连接 → 导入 JSON」即可。"
+            "streamable-http 走 http://127.0.0.1:8766/mcp（令牌已内置）；stdio 走本机启动器。"
+            "两种方式都是**同一份记忆**：所有 Agent 共享，写入统一由丘脑准入、入口排队执行。"
         )
         agent_note.setObjectName("hint")
         agent_note.setWordWrap(True)
@@ -204,11 +231,31 @@ class InterfacePage(QtWidgets.QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         self._refresh_ui()
+        # 服务启停 / 令牌变化后自动刷新 JSON，避免复制到过期配置
+        self._token_timer = QtCore.QTimer(self)
+        self._token_timer.timeout.connect(self._refresh_ui)
+        self._token_timer.start(5000)
 
     # ── 复制接入配置 ──────────────────────────────────────────────────────
+    def _refresh_snippet(self) -> None:
+        mode = str(self._mode.currentData() or "http")
+        self._agent_snippet.setPlainText(mcp_json_text(mode))
+
     def copy_agent_config(self) -> None:
+        self._refresh_snippet()
         QtGui.QGuiApplication.clipboard().setText(self._agent_snippet.toPlainText())
-        self._copy_hint.setText("已复制到剪贴板：发给任意 Agent，它就能自己配好 MCP")
+        if self._mode.currentData() == "http" and not bridge_token_text():
+            self._copy_hint.setText("已复制，但令牌为空：先启动 HTTP 服务再复制")
+            return
+        self._copy_hint.setText("已复制：粘到 Agent 的「添加 MCP 连接 → 导入 JSON」即可")
+
+    def copy_bridge_token(self) -> None:
+        token = bridge_token_text()
+        if not token:
+            self._copy_hint.setText("令牌尚未生成：HTTP 服务启动后才有")
+            return
+        QtGui.QGuiApplication.clipboard().setText(token)
+        self._copy_hint.setText("已复制完整桥接令牌（调 /mcp/call 时放 X-Super-Brain-Bridge 头）")
 
     # ── 启停 ──────────────────────────────────────────────────────────────
     def start_service(self) -> None:
@@ -251,10 +298,15 @@ class InterfacePage(QtWidgets.QWidget):
         if running:
             base = f"http://{status['host']}:{status['port']}"
             self._endpoint.setText(f"GET {base}/health · POST {base}/search · POST {base}/v1/chat/completions")
+            token = bridge_token_text()
             self._credentials.setText(
-                f"agent_id = {status['agent_id']} · token = {status['token_hint']}"
-                f"（完整令牌见 mcp_bridge.json） · 入口排队 {status.get('queue_depth', 0)} 条"
+                f"agent_id = {status['agent_id']}\n"
+                f"桥接令牌（完整，可直接复制）：{token or '（尚未生成）'}\n"
+                f"入口排队 {status.get('queue_depth', 0)} 条 · POST /mcp/call 时放 "
+                f"X-Super-Brain-Bridge 头（或 Authorization: Bearer <token>）"
             )
+            self._copy_token.setEnabled(bool(token))
+            self._refresh_snippet()
             model = self._model.text().strip() or "super-brain-memory"
             self._curl.setPlainText(
                 f"curl {base}/health\n\n"
@@ -267,4 +319,5 @@ class InterfacePage(QtWidgets.QWidget):
         else:
             self._endpoint.setText("")
             self._credentials.setText("服务未运行：默认应随软件启动；检查 设置 → 网关 →「启动即开 HTTP」")
+            self._copy_token.setEnabled(False)
             self._curl.setPlainText("# 启动服务后这里会给出可直接复制运行的 curl 示例")

@@ -73,7 +73,11 @@ class RouterExtractor:
         self._llm = llm
         self._config = config or get_config()
 
-    def extract(self, content: str, *, agent_id: str = "") -> Extraction:
+    def extract(self, content: str, *, agent_id: str = "", use_llm: bool = True) -> Extraction:
+        # 批量导入走规则抽取：LLM 单条 0.3~1s，几百条会拖成几分钟，
+        # 而导入内容本来就是用户自己的正文，不需要再让模型"理解"一遍。
+        if not use_llm:
+            return self._rule_extract(content)
         try:
             payload = self._llm.complete_json(
                 _SYSTEM_PROMPT,

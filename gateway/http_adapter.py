@@ -30,15 +30,22 @@ __all__ = ["HTTPAdapter"]
 
 
 class HTTPAdapter:
-    def __init__(self, *, registry: AgentRegistry, toolkit: MCPToolkit, config: BrainConfig | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        registry: AgentRegistry,
+        toolkit: MCPToolkit,
+        config: BrainConfig | None = None,
+        bridge_token: str = "",
+    ) -> None:
         self._registry = registry
         self._toolkit = toolkit
         self._config = config or get_config()
-        # 本机桥接专用：/mcp/call 用小范围共享密钥认证，再映射到一个服务端注册的 agent。
-        # 不用 registry 签发的令牌——未配 GW_MCP_TOKEN_SECRET 时签名密钥是进程内临时值，
-        # 桌面重启后旧令牌立刻失效，多 Agent 的 stdio 进程会莫名 401。
-        self._bridge_token = secrets.token_urlsafe(24)
+        # 本机桥接专用：/mcp 与 /mcp/call 用小范围共享密钥认证，再映射到一个服务端注册的 agent。
+        # 令牌由调用方（桌面后端）持久化后传进来——**重启软件不变**，复制的 MCP JSON 才长期有效。
+        self._bridge_token = bridge_token or secrets.token_urlsafe(24)
         self._bridge_agent_token: str | None = None
+        self._mcp_sessions: dict[str, float] = {}
         # 入口即闸门：所有 Agent 的工具调用先入队，再由**唯一的工作线程**逐个执行。
         # 六引擎与 ONNX 会话都不是并发安全的；更重要是语义——记忆必须由中枢统一裁决
         # （丘脑准入、去重、冲突消解），不能被多个请求穿插着直写存储。
@@ -86,6 +93,10 @@ class HTTPAdapter:
         if method.upper() == "GET" and path.rstrip("/") in ("/health", "/v1/health"):
             return 200, {"status": "ok", "app": self._config.app_name, "ts_ms": int(time.time() * 1000)}
 
+        # 标准 MCP Streamable HTTP：Agent 的「添加 MCP 连接 → 导入 JSON」直接可用
+        if path.rstrip("/") == "/mcp":
+            return self._handle_mcp(method, headers, body)
+
         # 桥接通道先于令牌校验：只认 mcp_bridge.json 里那把密钥（本机文件 + 本机回环）
         if method.upper() == "POST" and path.rstrip("/") == "/mcp/call":
             supplied = str(
@@ -129,6 +140,77 @@ class HTTPAdapter:
         self._jobs.put((tool, args, headers, future))
         return future.result(timeout=300)
 
+    # ── 标准 MCP over HTTP（Streamable HTTP，JSON 响应）───────────────────
+    def _mcp_authorized(self, headers: dict) -> bool:
+        # 三选一：专用头 / Bearer 里放桥接令牌（多数 MCP 客户端只会带 Authorization）/ registry 令牌
+        supplied = str(headers.get("X-Super-Brain-Bridge") or headers.get("x-super-brain-bridge") or "")
+        if supplied and hmac.compare_digest(supplied, self._bridge_token):
+            return True
+        bearer = self._bearer(headers)
+        if bearer and hmac.compare_digest(bearer, self._bridge_token):
+            return True
+        try:
+            self._registry.verify(bearer)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _mcp_error(self, request_id: object, code: int, message: str) -> tuple[int, dict]:
+        return 200, {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+    def _handle_mcp(self, method: str, headers: dict, body: dict) -> tuple:
+        """最小但合规的 Streamable HTTP：POST JSON-RPC → JSON 响应。
+
+        不实现服务端主动 SSE（我们不需要 server-initiated 消息），客户端按 spec
+        接受 `Content-Type: application/json` 的即时响应。
+        """
+        from gateway.mcp_stdio import MCP_TOOL_DEFS
+
+        if method.upper() != "POST":
+            return 405, {"error": "method_not_allowed", "message": "只支持 POST JSON-RPC"}
+        if not self._mcp_authorized(headers):
+            return 401, {"error": "unauthorized", "message": "MCP 令牌无效"}
+
+        request_id = body.get("id")
+        action = str(body.get("method") or "")
+        params = body.get("params") or {}
+
+        if action == "initialize":
+            session = secrets.token_hex(16)
+            self._mcp_sessions[session] = time.time()
+            result = {
+                "protocolVersion": body.get("params", {}).get("protocolVersion") or "2024-11-05",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "super-brain-memory", "version": "2.2"},
+            }
+            return 200, {"jsonrpc": "2.0", "id": request_id, "result": result}, {"Mcp-Session-Id": session}
+
+        if action.startswith("notifications/"):
+            return 202, {}
+
+        if action == "ping":
+            return 200, {"jsonrpc": "2.0", "id": request_id, "result": {}}
+
+        if action == "tools/list":
+            return 200, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": MCP_TOOL_DEFS}}
+
+        if action == "tools/call":
+            name = str(params.get("name") or "")
+            args = params.get("arguments") or {}
+            if not isinstance(args, dict):
+                return self._mcp_error(request_id, -32602, "arguments 必须是对象")
+            payload = self._call_tool(name, args, headers=self._bridge_credentials())
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}],
+                    "isError": False,
+                },
+            }
+
+        return self._mcp_error(request_id, -32601, f"未知方法：{action}")
+
     def _chat_completions(self, body: dict, headers: dict) -> tuple[int, dict]:
         messages = body.get("messages") or []
         last_user = ""
@@ -163,9 +245,15 @@ class HTTPAdapter:
         port = int(self._config.gateway.http_port if port is None else port)
 
         class Handler(BaseHTTPRequestHandler):
-            def _respond(self, status: int, payload: dict) -> None:
-                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            def _respond(self, status: int, payload: dict, extra: dict | None = None) -> None:
                 self.send_response(status)
+                for key, value in (extra or {}).items():
+                    self.send_header(key, str(value))
+                if status == 202:  # MCP 通知：202 + 空体
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                raw = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
@@ -180,8 +268,10 @@ class HTTPAdapter:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         self._respond(400, {"error": "invalid_json"})
                         return
-                status, payload = adapter.handle(method, self.path.split("?")[0], headers=dict(self.headers), body=body)
-                self._respond(status, payload)
+                result = adapter.handle(method, self.path.split("?")[0], headers=dict(self.headers), body=body)
+                status, payload = result[0], result[1]
+                extra = result[2] if len(result) > 2 else None
+                self._respond(status, payload, extra)
 
             def do_GET(self) -> None:  # noqa: N802
                 self._dispatch("GET")

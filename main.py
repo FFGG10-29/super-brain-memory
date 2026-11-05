@@ -587,7 +587,13 @@ def serve_forever(config: BrainConfig | None = None) -> int:
         engines=app.storage.all(),
         config=config,
     )
-    http = HTTPAdapter(registry=registry, toolkit=toolkit, config=config)
+    # 让 MCP 桥接令牌稳定：优先复用已持久化的 mcp_token.txt，否则生成并写回
+    from core.runtime_paths import read_local_token, write_local_token
+    import secrets as _secrets
+    _bridge_token = read_local_token() or _secrets.token_urlsafe(24)
+    if not read_local_token():
+        write_local_token(_bridge_token)
+    http = HTTPAdapter(registry=registry, toolkit=toolkit, config=config, bridge_token=_bridge_token)
     projector = EventProjector(
         relational=app.storage.relational, vector=app.storage.vector, graph=app.storage.graph,
         hypergraph=app.storage.hypergraph, timeseries=app.storage.timeseries, kv=app.storage.kv,

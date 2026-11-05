@@ -18,6 +18,7 @@ from typing import Any
 from PySide6.QtCore import QSettings
 
 from config import BrainConfig, get_config
+from ui.desktop.secret_store import SecretStore
 
 __all__ = ["SettingsStore", "SyncSettings"]
 
@@ -57,17 +58,17 @@ class SettingsStore:
         self._config = config or get_config()
         self._keyring = keyring_backend if keyring_backend is not None else default_keyring()
         self._q = qsettings if qsettings is not None else QSettings("super-brain", "desktop")
+        # 钥匙串不可用时落 DPAPI 加密文件，保证「填一次就一直是它」
+        self._secrets = SecretStore(keyring_backend=self._keyring, service=_SERVICE)
 
     def _read_pat(self) -> tuple[str | None, str]:
-        if self._keyring is not None:
-            try:
-                value = self._keyring.get_password(_SERVICE, _PAT_ACCOUNT)
-                if value:
-                    return value, "keyring"
-            except Exception:  # noqa: BLE001  钥匙串不可用时静默回退到 env
-                pass
-        env_value = os.environ.get("GITHUB_PAT") or ""
-        return (env_value, "env") if env_value else (None, "none")
+        value = self._secrets.get(_PAT_ACCOUNT)
+        if not value:
+            return None, "none"
+        backend = self._secrets.backend_of(_PAT_ACCOUNT)
+        if backend != "none":
+            return value, backend
+        return value, "env"
 
     def load(self) -> SyncSettings:
         repo_url = str(self._q.value(_REPO_KEY, "") or "") or self._config.sync.repo_url
@@ -86,17 +87,12 @@ class SettingsStore:
         self._config.sync.repo_url = repo_url
 
         if pat is not None:
-            if self._keyring is None:
+            backend = self._secrets.set(_PAT_ACCOUNT, pat)
+            if pat.strip() and backend == "none":
                 raise RuntimeError(
-                    "系统钥匙串不可用：请把 PAT 放到环境变量 GITHUB_PAT，不要写进项目文件"
+                    "PAT 保存失败：系统钥匙串与加密文件都不可写。"
+                    "可临时把 GITHUB_PAT 放进环境变量，或检查 %APPDATA%/super-brain 目录权限"
                 )
-            if pat.strip():
-                self._keyring.set_password(_SERVICE, _PAT_ACCOUNT, pat.strip())
-            else:
-                try:
-                    self._keyring.delete_password(_SERVICE, _PAT_ACCOUNT)
-                except Exception:  # noqa: BLE001
-                    pass
         return self.load()
 
     # ── 界面/网关偏好（同样只进用户级 QSettings）────────────────────────

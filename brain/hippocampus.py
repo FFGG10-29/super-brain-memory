@@ -105,8 +105,9 @@ class Hippocampus:
         namespace: str = "private",
         device_id: str | None = None,
         now_ms: int | None = None,
+        use_llm: bool = True,
     ) -> WriteResult:
-        extraction = self._extractor.extract(content, agent_id=agent_id)
+        extraction = self._extractor.extract(content, agent_id=agent_id, use_llm=use_llm)
         affect = self._amygdala.ingest(agent_id, extraction.pad, now_ms=now_ms)
 
         neuron = self._extractor.to_neuron(
@@ -132,7 +133,8 @@ class Hippocampus:
 
         # 语义合并裁决（Mem0 式）：LLM 判定 add/update/merge/skip
         merge = None
-        if self._consolidator is not None and self._config.merge.merge_enabled:
+        # use_llm=False 是批量导入的快速通道：合并裁决也要调 LLM，一起跳过
+        if use_llm and self._consolidator is not None and self._config.merge.merge_enabled:
             merge = self._consolidator.decide(neuron.content, agent_id=agent_id, namespace=namespace)
             if merge.action == "skip":
                 return WriteResult(neuron=neuron, admission=admission, applied=False, merge=merge)

@@ -50,6 +50,32 @@ def _isolate_user_config(tmp_path, monkeypatch):
     clear_overrides()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_qsettings(monkeypatch):
+    """隔离用户级 QSettings / 钥匙串。
+
+    同步 worker 会读 QSettings 里的仓库地址：不隔离的话，跑测试会拿用户真实仓库地址
+    去 git init + push（真会推上去），还会读到真实 PAT。测试一律用内存替身。
+    """
+    import ui.desktop.settings as settings_module
+
+    class _MemorySettings:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.values: dict[str, object] = {}
+
+        def value(self, key, default=None):
+            return self.values.get(key, default)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+        def sync(self):
+            return None
+
+    monkeypatch.setattr(settings_module, "QSettings", _MemorySettings)
+    monkeypatch.setattr(settings_module, "default_keyring", lambda: None)
+
+
 @pytest.fixture()
 def brain_config(tmp_path) -> BrainConfig:
     return BrainConfig(

@@ -30,7 +30,10 @@
 | 便携发行 + GPU 探针 | ✅ 已出包 | `dist/super-brain/`（onedir，9.6GB 含 3.35GB 权重）；冻结包实测 `verdict=GPU_OK`、`all_on_gpu=true`、`sparse_enabled=true`。流程见 §8 |
 | 多 Agent 共享（外置大脑） | ✅ | 所有 Agent 写同一命名空间、召回不过滤（`gateway/mcp_server.py`）；stdio 进程经 `mcp_bridge.json` 转发给桌面内核，不各自开库 |
 | 入口排队（中枢裁决） | ✅ | `gateway/http_adapter.py`：`queue.Queue` + 唯一工作线程 FIFO，`queue_depth` 显示在接口页 |
-| 一键复制 MCP 配置 | ✅ | 接口页「复制给 Agent」；command 指向 `%LOCALAPPDATA%\SuperBrain\bin\super-brain-mcp.cmd`，每次启动按当前安装位置重写，换盘不用改配置 |
+| 一键复制 MCP 配置 | ✅ | 接口页「复制 MCP JSON」：`streamable-http`（`http://127.0.0.1:8766/mcp` + Bearer 令牌，粘进 Agent 的「添加 MCP 连接」）或 `stdio`（本机启动器）。不再输出大段说明文字 |
+| MCP over HTTP 端点 | ✅ | `HTTPAdapter._handle_mcp`：`POST /mcp` 支持 initialize / notifications / tools/list / tools/call / ping，返回 `Mcp-Session-Id`；认证接受 `X-Super-Brain-Bridge` 或 `Authorization: Bearer <桥接令牌>` |
+| 桥接令牌持久化 | ✅ | 令牌落 `%APPDATA%/super-brain/mcp_token.txt`，服务启动优先复用 —— 重启软件后已复制的 JSON 不会失效（此前每次启动都换新 token，是「老是 token 错误」的根因） |
+| 批量导入快速通道 | ✅ | `import_memories(fast=True)` → `remember(use_llm=False)`：跳过 LLM 抽取与语义合并裁决（仍保留丘脑准入/SimHash/embedding/六引擎/事件日志），导入走后台线程 + 进度信号 |
 | 单一数据目录 | ✅ | 设置页「数据保存位置」一处；改路径=写配置+关内核+复制+重启+回读，失败回滚；旧文件名(`r.db`)也能正确迁移 |
 | 托盘驻留 + 开机自启 | ✅ | `tray.py` / `autostart.py`：叉窗口只隐藏、单实例唤回、托盘「完全退出」；自启命令带 `--tray` |
 | 首页资源仪表 + 模型运行总览 | ✅ | `system_stats.py`（psutil + nvidia-smi，2s 采样）；星云页顶部 CPU/内存/显卡；模型页顶部三通道 × 本地/远程 × 设备 × 状态 |
@@ -48,7 +51,7 @@
 - 未装（按降级实现）：`fastapi`、`nicegui`、`apscheduler`、`GitPython`（git_worker 走 CLI 兜底）。
 - 本机算力：**GTX 1060 / SM 6.1 / 6143 MiB / 驱动 581.57（CUDA Driver 13.0）**。三模型权重已落位 `data/models/`：`BAAI/bge-m3/model.onnx(+_data)`、`bge-m3/sparse_head.onnx`、`bge-reranker-v2-m3/model.onnx`、`qwen3-0.6b-q8_0.gguf`（合计约 3GB）。安装步骤与 CUDA DLL 归集记录在 `requirements-optional.txt`，重装轮子后按注释把 `nvidia\\cuda_runtime`/`nvidia\\cublas` 的 DLL 拷回 `llama_cpp\\lib`（另有一份暂存 `data\\wheels\\cuda_dlls\\`）。
 - `--probe-models --json` 的 `verdict` 取值：`GPU_OK` / `GPU_PARTIAL` / `MODEL_MISSING` / `CPU_ONLY` / `GPU_FELL_BACK_TO_CPU`（判定条件见 `main.py::probe_models`）。**判断 CUDA 是否生效只认本探针**，`--self-check` 只构造对象，证明不了加载。
-- 用例基线：**129 passed**（桌面 22 / 用户控制 6 / 增量与索引 4 / 配置中心 16 / MCP 5）。
+- 用例基线：**134 passed**（桌面 26 / 用户控制 6 / 增量与索引 4 / 配置中心 16 / MCP 6）。
 - GitHub：gh CLI 已登录账号 **FFGG10-29**；私库 `github.com/FFGG10-29/super-brain-memory`（remote origin 已配）。事件同步库建议另建（代码库与事件总线分开）。
 - Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
 - Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；字体库为空，截图脚本须注入 `msyh.ttc`。

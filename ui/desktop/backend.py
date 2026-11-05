@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import secrets
 import shutil
 import threading
 import time
@@ -21,10 +22,16 @@ from brain.cloud_models import load_cloud_api_key
 from brain.memory_browser import MemoryBrowser
 from config import BrainConfig, get_config
 from core.ids import new_uuid7
-from core.runtime_paths import clear_local_bridge, write_local_bridge
+from core.runtime_paths import (
+    clear_local_bridge,
+    read_local_token,
+    write_local_bridge,
+    write_local_token,
+)
 from gateway.http_adapter import HTTPAdapter
 from gateway.mcp_server import MCPToolkit
 from gateway.registry import AgentRegistry
+from ui.desktop.settings import SettingsStore
 from main import build_app, gpu_runtime_info
 from sync.git_worker import GitSyncWorker
 from sync.projections import EventProjector
@@ -60,10 +67,25 @@ def _parse_memory_file(path: Path) -> list[str]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return []
+        # 「原汤化原食」：导出过的文件都能原样导回来
+        # - export_memories → NDJSON（每行一条记录，走下面的 ndjson 分支）
+        # - export_dashboard → {"memory_stream": {"items": [...]}, ...}
+        # - 手写/第三方 → {"memories": [...]} 或直接数组
+        items: object = payload
         if isinstance(payload, dict):
-            payload = payload.get("memories", [])
-        if isinstance(payload, list):
-            for item in payload:
+            stream = payload.get("memory_stream")
+            if isinstance(stream, dict) and isinstance(stream.get("items"), list):
+                items = stream["items"]
+            elif isinstance(payload.get("memories"), list):
+                items = payload["memories"]
+            elif isinstance(payload.get("neurons"), list):
+                items = payload["neurons"]
+            elif isinstance(payload.get("items"), list):
+                items = payload["items"]
+            else:
+                items = []
+        if isinstance(items, list):
+            for item in items:
                 if isinstance(item, str) and item.strip():
                     entries.append(item.strip())
                 elif isinstance(item, dict) and str(item.get("content", "")).strip():
@@ -697,6 +719,7 @@ class DesktopBackend:
         agent_id: str = "import",
         should_stop: Callable[[], bool] | None = None,
         progress_cb: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> dict[str, Any]:
         """批量导入记忆文件，逐条走完整写入流（丘脑路由 + 去重 + 六引擎 + 事件日志）。
 
@@ -721,7 +744,9 @@ class DesktopBackend:
             if should_stop is not None and should_stop():
                 break
             try:
-                result = self._app.hippocampus.remember(text, agent_id=agent_id)
+                # fast=True：跳过 LLM 抽取与语义合并裁决（每条约省 0.5~2s），
+                # 仍保留丘脑准入/SimHash 去重/embedding/六引擎投影/事件日志
+                result = self._app.hippocampus.remember(text, agent_id=agent_id, use_llm=not fast)
                 if result.applied:
                     applied += 1
                 else:
@@ -910,8 +935,10 @@ class DesktopBackend:
         # 桥接密钥用 adapter 自己的（与 registry 令牌解耦：未配 GW_MCP_TOKEN_SECRET 时，
         # registry 的签名密钥是进程内临时值，重启即失效，不适合给常驻的 stdio 代理用）
         bridge_token = getattr(adapter, "bridge_token", token)
+        # 监听地址可能是 0.0.0.0（通配），本机客户端连不上它 —— 桥接文件一律写回环地址
+        bridge_host = "127.0.0.1" if str(actual_host) in ("", "0.0.0.0", "::", "::0") else str(actual_host)
         write_local_bridge(
-            host=str(actual_host), port=actual_port, token=str(bridge_token), agent_id=agent_id
+            host=bridge_host, port=actual_port, token=str(bridge_token), agent_id=agent_id
         )
         return {**self.gateway_status(), "ok": True, "message": f"HTTP 适配器已启动 http://{actual_host}:{actual_port}"}
 
@@ -926,6 +953,14 @@ class DesktopBackend:
         self._http_state = HttpState()
         clear_local_bridge()
         return {**self.gateway_status(), "ok": True, "message": "HTTP 适配器已停止（MCP 桥接同时失效）"}
+
+    def _bridge_token(self) -> str:
+        """持久化令牌：优先沿用已存的，没有才生成并落盘（重启软件不变）。"""
+        token = read_local_token()
+        if not token:
+            token = secrets.token_urlsafe(24)
+            write_local_token(token)
+        return token
 
     def _ensure_gateway(self):
         if self._gateway is not None:
@@ -943,7 +978,10 @@ class DesktopBackend:
             engines=self._app.storage.all(),
             config=self._config,
         )
-        adapter = HTTPAdapter(registry=registry, toolkit=toolkit, config=self._config)
+        adapter = HTTPAdapter(
+            registry=registry, toolkit=toolkit, config=self._config,
+            bridge_token=self._bridge_token(),  # 持久化令牌：重启软件后复制的 JSON 仍有效
+        )
         self._gateway = (registry, toolkit, adapter)
         return self._gateway
 
@@ -994,11 +1032,17 @@ class DesktopBackend:
                 kv=self._app.storage.kv,
                 embedder=self._app.embedder,
             )
+            # 仓库地址与 PAT 存在 QSettings / 钥匙串：必须在构造 worker 时喂进去，
+            # 否则 has_repo 永远 False，点「立即同步」只会 SKIP（历史 bug）。
+            store = SettingsStore(self._config, keyring_backend=self._keyring)
+            sync_settings = store.load()
             self._sync_worker = GitSyncWorker(
                 root=self._config.sync.local_repo_dir,
                 device_id=self._config.sync.device_id,
                 event_store=self._app.event_store,
                 projector=projector,
+                repo_url=sync_settings.repo_url,
+                token=store.pat(),
                 remote=self._config.sync.remote_name,
                 sync_interval_sec=self._config.sync.sync_interval_sec,
                 write_debounce_sec=self._config.sync.write_debounce_sec,
@@ -1012,6 +1056,49 @@ class DesktopBackend:
             "pushed": report.pushed,
             "errors": report.errors,
             "has_repo": self._sync_worker.has_repo,
+        }
+
+    def backfill_events(self, *, limit: int = 5000) -> dict[str, Any]:
+        """把本地已有记忆补写成 ingest 事件，让它们能参与跨设备同步。
+
+        为什么需要它：同步只搬**事件日志**，不搬 data 目录里的二进制库；而默认
+        `tier.buffer_no_sync=True` 时，新写入的 buffer 层记忆本就不进事件流。
+        所以「以前写在本机的记忆」在配置好仓库后不会自动出现，必须显式回填一次。
+
+        幂等：event_id 由 neuron id 派生（`backfill-<id>`），重复执行只补缺的部分。
+        """
+        self.start()
+        assert self._app is not None
+        existing = {
+            str(event.get("event_id"))
+            for event in self._app.journal.iter_events(include_self=True)
+        }
+        rows = self._app.storage.relational.query("neuron", active_only=True, limit=limit)
+        appended = 0
+        for row in rows:
+            event_id = f"backfill-{row['id']}"
+            if event_id in existing:
+                continue
+            self._app.journal.append({
+                "event_id": event_id,
+                "agent_id": str(row.get("source_agent") or "backfill"),
+                "type": "ingest",
+                "payload": {
+                    "neuron": dict(row),
+                    "extraction": {"source": "backfill", "entities": [], "relations": []},
+                },
+            })
+            existing.add(event_id)
+            appended += 1
+        self._app.journal.flush()
+        return {
+            "ok": True,
+            "scanned": len(rows),
+            "appended": appended,
+            "message": (
+                f"扫描 {len(rows)} 条活跃记忆，补写 {appended} 条事件"
+                if appended else f"扫描 {len(rows)} 条记忆，没有需要补的事件"
+            ),
         }
 
     def create_snapshot(self) -> dict[str, Any]:

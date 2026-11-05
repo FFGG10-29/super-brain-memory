@@ -322,6 +322,112 @@ def test_settings_page_applies_appearance(backend, store, qapp):
 
 
 # ── 同步与备份 ───────────────────────────────────────────────────────────
+def test_import_fast_mode_skips_llm_extraction(backend, tmp_path):
+    """批量导入默认走规则抽取：不许再为每条正文调用一次 LLM（那是慢的根因）。"""
+
+    class _NoLLM:
+        def complete_json(self, *_args, **_kwargs):
+            raise AssertionError("快速导入不应调用 LLM")
+
+    from brain.router_extractor import RouterExtractor
+
+    extractor = RouterExtractor(_NoLLM())
+    result = extractor.extract("用户偏好直接给结论，不要铺垫", agent_id="t", use_llm=False)
+    assert result.memory_type, "规则抽取必须给出记忆类型"
+
+    import json
+
+    path = tmp_path / "import_fast.json"
+    path.write_text(json.dumps({"memories": [
+        {"content": "快速导入一：缓存分层与向量召回方案"},
+        {"content": "快速导入二：周五发版改双人复核"},
+        {"content": "快速导入三：深夜复盘情绪与事故相关"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    report = backend.import_memories(str(path), fast=True)
+    assert report["ok"] is True and report["parsed"] == 3, report
+    assert report["applied"] + report["skipped"] == 3
+
+
+def test_import_accepts_exported_dashboard_snapshot(backend, tmp_path):
+    """原汤化原食：导出的 brain_snapshot_*.json 必须能直接导回来。"""
+    import json
+
+    snapshot = {
+        "engine_health": {"engines": []},
+        "memory_stream": {
+            "items": [
+                {"id": "m1", "content": "导入回归：缓存分层与向量召回", "memory_type": "fact"},
+                {"id": "m2", "content": "导入回归：发版流程双人复核", "memory_type": "fact"},
+            ],
+            "count": 2,
+        },
+    }
+    path = tmp_path / "brain_snapshot_test.json"
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+
+    result = backend.import_memories(str(path))
+
+    assert result["ok"] is True, result
+    assert result["parsed"] == 2, result
+    assert result["applied"] + result["skipped"] == 2, result
+    contents = [str(row["content"]) for row in backend.memories(limit=50)]
+    assert any("缓存分层与向量召回" in text for text in contents)
+
+
+def test_sync_worker_bootstraps_repo_from_url(tmp_path):
+    """回归：填了仓库地址点同步却永远 SKIP —— 首次必须自动 git init + 接远端 + push。"""
+    import subprocess
+
+    from sync.event_store import EventStore
+    from sync.git_worker import GitSyncWorker
+    from sync.journal import NdjsonJournal
+
+    remote = tmp_path / "events.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    root = tmp_path / "journal"
+    journal = NdjsonJournal(root, device_id="dev-a")
+    journal.append({
+        "event_id": "evt-1",
+        "agent_id": "codebuddy",
+        "type": "ingest",
+        "payload": {"neuron": {"id": "n1", "content": "共享记忆"}, "extraction": {}},
+    })
+    journal.flush()
+
+    class _Projector:
+        last_applied = False
+
+        def apply(self, event):  # noqa: ANN001
+            return None
+
+    worker = GitSyncWorker(
+        root=root, device_id="dev-a", event_store=EventStore(root),
+        projector=_Projector(), repo_url=str(remote).replace("\\", "/"),
+    )
+    assert worker.has_repo is False
+    report = worker.sync_once()
+
+    assert worker.has_repo is True, "首次同步必须自动初始化仓库"
+    assert report.pushed is True, report.errors
+    refs = subprocess.run(
+        ["git", "-C", str(remote), "rev-parse", "--verify", "main"],
+        capture_output=True, text=True, check=False,
+    )
+    assert refs.returncode == 0, f"远端没有 main 分支：{refs.stderr}"
+
+
+def test_backfill_events_makes_local_memories_syncable(backend, qapp):
+    """同步只搬事件日志：本地已有记忆必须能补写成事件，且重复执行幂等。"""
+    before = len(list(backend._app.journal.iter_events(include_self=True)))
+    first = backend.backfill_events()
+    assert first["ok"] is True and first["appended"] > 0, first
+    after = len(list(backend._app.journal.iter_events(include_self=True)))
+    assert after == before + first["appended"]
+
+    second = backend.backfill_events()
+    assert second["appended"] == 0, "回填必须幂等，否则每次点都会重复推事件"
+
+
 def test_sync_once_without_repo_is_noop(backend, qapp):
     report = backend.sync_once()
     assert report["ok"] is True

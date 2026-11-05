@@ -1,6 +1,6 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-06）：**123 passed**（桌面 22 / 用户控制 6 / 增量与索引 4 / 配置中心 13），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-06）：**134 passed**（桌面 22 / 用户控制 6 / 增量与索引 4 / 配置中心 13），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅
@@ -130,7 +130,7 @@
 ## 记忆可视化与用户控制（v2.2）✅（2026-11-06）
 
 > 主题：让记忆「可见、可纠正、可遗忘、可审计」，且全部改动仍落在事件溯源纪律内。
-> 验收：`pytest tests/test_user_control.py -q` → **6 passed**；`pytest tests/test_incremental_memory.py -q` → **4 passed**；全量 **123 passed**。
+> 验收：`pytest tests/test_user_control.py -q` → **6 passed**；`pytest tests/test_incremental_memory.py -q` → **4 passed**；全量 **134 passed**。
 
 | 验收项 | 状态 | 证据 |
 |---|---|---|
@@ -180,14 +180,17 @@
 ## 多 Agent 共享 + 桌面体验（v2.2 收尾）✅（2026-11-06）
 
 > 定位确认：超级大脑是**所有 Agent 共用的外置记忆中枢**，`agent_id` 只写审计。
-> 全量回归：`pytest tests -q` → **129 passed**。
+> 全量回归：`pytest tests -q` → **134 passed**。
 
 | 验收项 | 状态 | 证据 |
 |---|---|---|
 | 记忆跨 Agent 共享（不按 agent 隔离） | ✅ | `test_memories_are_shared_across_all_agents`：codebuddy 写入 → dsh 不带任何参数即可召回；反向亦通；`namespace` 去重后仍只有一个值 |
 | 多进程同时接入同一内核 | ✅ | 三个 stdio 进程经 `mcp_bridge.json` 转发 `/mcp/call`，并发写入 all applied；`health_check` 6/6 引擎 ok |
 | 入口排队（中枢逐条裁决） | ✅ | `HTTPAdapter` 单工作线程 FIFO + `queue_depth`；并发不再出现 WinError 10054 |
-| 一键复制 MCP 配置 | ✅ | 接口页「复制给 Agent」；实测用该配置 spawn → `initialize` + `health_check` 通过 |
+| 一键复制 MCP 配置 | ✅ | 接口页「复制 MCP JSON」两种模式（streamable-http / stdio），JSON 内含令牌；实测 spawn → `initialize` + `health_check` 通过 |
+| 标准 MCP over HTTP | ✅ | `test_mcp_streamable_http_endpoint_speaks_jsonrpc`：POST /mcp 的 initialize（返回 `Mcp-Session-Id`）/ tools.list（6 工具）/ tools.call（写入成功）；无令牌 401；Bearer 与桥接头都接受 |
+| 令牌持久化（重启不失效） | ✅ | `test_multi_agent_bridge_forwards_to_single_kernel` 断言落盘令牌 == 运行时令牌；令牌存 `%APPDATA%/super-brain/mcp_token.txt` |
+| 批量导入走快速通道 | ✅ | `test_import_fast_mode_skips_llm_extraction`：跳过 LLM 抽取与合并裁决（不调用 `complete_json`），导入在后台线程执行并有进度 |
 | 配置不含安装绝对路径 | ✅ | command=`cmd.exe`、args=`/c %LOCALAPPDATA%\SuperBrain\bin\super-brain-mcp.cmd`；启动器每次启动按当前安装位置重写 |
 | 单一数据目录 + 迁移 | ✅ | `test_storage_root_switch_migrates_data_and_restarts`：换目录后 `storage_root()` 变更、六引擎数据复制到位、重启后仍能读到迁移前的记忆 |
 | HTTP 随软件自启 | ✅ | 启动 16s 内 `mcp_bridge.json` 自动出现、8766 监听；无需手动点「启动 HTTP 服务」 |

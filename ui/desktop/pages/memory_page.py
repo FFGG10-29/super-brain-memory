@@ -15,6 +15,8 @@ _COLUMNS = ("时间", "类型", "分层", "PAD (P/A/D)", "内容", "置信度")
 
 class MemoryPage(QtWidgets.QWidget):
     focus_requested = QtCore.Signal(str)
+    # 后台导入线程 → 主线程的进度信号（跨线程自动走 QueuedConnection）
+    import_progress = QtCore.Signal(int, int)
 
     def __init__(self, backend: DesktopBackend) -> None:
         super().__init__()
@@ -245,33 +247,48 @@ class MemoryPage(QtWidgets.QWidget):
         )
         if not path:
             return
-        progress = QtWidgets.QProgressDialog("正在导入记忆（自动去重）…", "停止", 0, 0, self)
+        progress = QtWidgets.QProgressDialog("正在导入记忆（快速模式：跳过 LLM 抽取）…", "停止", 0, 0, self)
         progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(300)
         progress.show()
         stopped = {"flag": False}
         progress.canceled.connect(lambda: stopped.update(flag=True))
-        app = QtWidgets.QApplication.instance()
 
         def on_progress(done: int, total: int) -> None:
-            progress.setLabelText(f"正在导入记忆（自动去重）… {done}/{total}")
-            if app is not None:
-                app.processEvents()
+            # 工作线程里只发信号，绝不碰控件（碰了就是随机崩溃）
+            self.import_progress.emit(done, total)
 
-        result = self._backend.import_memories(path, should_stop=lambda: stopped["flag"], progress_cb=on_progress)
-        progress.close()
-        self.refresh()
-        message = str(result.get("message", ""))
-        if result.get("ok"):
+        def apply_progress(done: int, total: int) -> None:
+            progress.setLabelText(f"正在导入记忆… {done}/{total}")
+
+        self.import_progress.connect(apply_progress)
+        self._status.setText("导入进行中（后台执行，界面可继续操作）…")
+
+        def finish(result: dict) -> None:
+            progress.close()
+            self.import_progress.disconnect(apply_progress)
+            self.refresh()
+            message = str(result.get("message", ""))
             self._status.setText(message)
-            if result.get("applied"):
+            if result.get("ok") and result.get("applied"):
                 first_new = self._backend.memories(limit=1)
                 if first_new:
                     self.focus_requested.emit(str(first_new[0]["id"]))
-        else:
-            self._status.setText(message)
-        for error in result.get("errors", [])[:3]:
-            self._status.setText(self._status.text() + f"\n{error}")
+            for error in result.get("errors", [])[:3]:
+                self._status.setText(self._status.text() + f"\n{error}")
+
+        def failed(message: str) -> None:
+            progress.close()
+            self.import_progress.disconnect(apply_progress)
+            self._status.setText(f"导入失败：{message}")
+
+        self._backend.tasks.submit(
+            lambda: self._backend.import_memories(
+                path, should_stop=lambda: stopped["flag"], progress_cb=on_progress, fast=True
+            ),
+            finish,
+            failed,
+        )
 
 
 def _format_time(ms: int) -> str:

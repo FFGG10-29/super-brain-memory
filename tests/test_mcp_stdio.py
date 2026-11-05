@@ -97,6 +97,11 @@ def test_multi_agent_bridge_forwards_to_single_kernel(desktop_config, tmp_path, 
         payload = json.loads(local_bridge_path().read_text(encoding="utf-8"))
         assert payload["token"] and payload["url"].startswith("http://127.0.0.1:")
 
+        # 令牌必须持久化：重启软件后复制的 MCP JSON 仍要有效
+        from core.runtime_paths import read_local_token
+
+        assert read_local_token() == payload["token"], "桥接令牌必须与落盘令牌一致（重启不变）"
+
         bridge = mcp_stdio.bridge_config()
         assert bridge is not None, "stdio 进程必须能自动发现桌面内核"
         assert bridge["url"] == payload["url"]
@@ -154,6 +159,53 @@ def test_memories_are_shared_across_all_agents(desktop_config):
         # 两条记忆落在同一个命名空间（中枢唯一库），不是每个 Agent 一份
         rows = app.storage.relational.query("neuron", limit=50)
         assert len({str(row["namespace"]) for row in rows}) == 1
+    finally:
+        app.close()
+
+
+def test_mcp_streamable_http_endpoint_speaks_jsonrpc(desktop_config):
+    """标准 MCP over HTTP：Agent「导入 JSON」后必须能 initialize / tools.list / tools.call。"""
+    from gateway.http_adapter import HTTPAdapter
+    from gateway.mcp_server import MCPToolkit
+    from gateway.registry import AgentRegistry
+
+    app = build_app(desktop_config)
+    try:
+        registry = AgentRegistry(app.storage.kv, timeseries=app.storage.timeseries, config=desktop_config)
+        toolkit = MCPToolkit(
+            registry=registry, hippocampus=app.hippocampus, prefrontal=app.prefrontal,
+            relational=app.storage.relational, engines=app.storage.all(), config=desktop_config,
+        )
+        adapter = HTTPAdapter(registry=registry, toolkit=toolkit, config=desktop_config)
+        headers = {"X-Super-Brain-Bridge": adapter.bridge_token}
+
+        init = adapter.handle("POST", "/mcp", headers=headers, body={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t"}},
+        })
+        assert init[0] == 200
+        assert init[2]["Mcp-Session-Id"], "必须返回 Mcp-Session-Id 头"
+        assert init[1]["result"]["serverInfo"]["name"] == "super-brain-memory"
+
+        # 多数 MCP 客户端只认 Authorization: Bearer —— 桥接令牌也必须能从这里通过
+        bearer = {"Authorization": f"Bearer {adapter.bridge_token}"}
+        assert adapter.handle("POST", "/mcp", headers=bearer,
+                              body={"jsonrpc": "2.0", "id": 20, "method": "tools/list"})[0] == 200
+
+        listed = adapter.handle("POST", "/mcp", headers=headers,
+                                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = [tool["name"] for tool in listed[1]["result"]["tools"]]
+        assert {"save_memory", "recall_memory", "health_check"} <= set(names)
+
+        called = adapter.handle("POST", "/mcp", headers=headers, body={
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "save_memory", "arguments": {"content": "HTTP MCP 通道写入的一条记忆"}},
+        })
+        payload = json.loads(called[1]["result"]["content"][0]["text"])
+        assert payload["neuron_id"], payload
+
+        # 无令牌必须拒绝
+        assert adapter.handle("POST", "/mcp", headers={}, body={"jsonrpc": "2.0", "id": 4, "method": "tools/list"})[0] == 401
     finally:
         app.close()
 

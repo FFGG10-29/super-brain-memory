@@ -19,8 +19,8 @@ from pathlib import Path
 
 __all__ = [
     "APP_NAME", "clear_local_bridge", "data_dir", "env_file", "is_frozen",
-    "local_bridge_path", "models_dir", "project_root", "resource_root",
-    "user_dir", "write_local_bridge",
+    "local_bridge_path", "models_dir", "project_root", "read_local_bridge",
+    "resource_root", "user_dir", "write_local_bridge",
 ]
 
 APP_NAME = "super-brain"
@@ -106,6 +106,35 @@ def write_local_bridge(*, host: str, port: int, token: str, agent_id: str = "") 
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def local_token_path() -> Path:
+    """持久化的本机 MCP 令牌（与运行状态无关：服务停了也还在，重启复用同一把）。"""
+    return user_dir() / "mcp_token.txt"
+
+
+def read_local_token() -> str:
+    try:
+        return local_token_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def write_local_token(token: str) -> None:
+    try:
+        local_token_path().parent.mkdir(parents=True, exist_ok=True)
+        local_token_path().write_text(token, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_local_bridge() -> dict[str, object]:
+    """读桥接描述文件；不存在或损坏返回空 dict。"""
+    try:
+        payload = json.loads(local_bridge_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def clear_local_bridge() -> None:

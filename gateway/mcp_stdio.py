@@ -83,10 +83,14 @@ def _endpoint_alive(url: str) -> bool:
     import socket
 
     parsed = urlparse(url)
-    if not parsed.hostname:
+    host = parsed.hostname or ""
+    if not host:
         return False
+    # 0.0.0.0 / :: 是"监听所有网卡"的写法，不能用来连：本机必须换成回环地址
+    if host in ("0.0.0.0", "::", "::0"):
+        host = "127.0.0.1"
     try:
-        with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=0.4):
+        with socket.create_connection((host, parsed.port or 80), timeout=0.4):
             return True
     except OSError:
         return False
@@ -188,65 +192,68 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
     return {"error": f"未知工具：{name}"}
 
 
+MCP_TOOL_DEFS: list[dict[str, Any]] = [
+    {
+        "name": "save_memory",
+        "description": "写入一条记忆：自动分类（事实/偏好/情绪/画像）、SimHash 去重、情绪标注、六引擎落库",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "记忆正文"},
+                "agent_id": {"type": "string", "description": "调用方标识，如 workbuddy / codebuddy"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "recall_memory",
+        "description": "召回记忆：全文+语义+图谱+时间多通道融合，返回带分数的命中与注入上下文",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "查询语句"},
+                "agent_id": {"type": "string"},
+                "top_k": {"type": "integer", "description": "返回条数，默认 5"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "timeline_query",
+        "description": "按时间窗口查询记忆（事件时间轴）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since_ms": {"type": "integer"},
+                "until_ms": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "profile_read",
+        "description": "读取用户画像槽位（偏好、习惯等 profile 类型记忆）",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "conflict_report",
+        "description": "查看被推翻 / 冲突的记忆清单",
+        "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
+    },
+    {
+        "name": "health_check",
+        "description": "六引擎健康检查",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
 def build_server() -> Server:
     server: Server = Server("super-brain-memory")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name="save_memory",
-                description="写入一条记忆：自动分类（事实/偏好/情绪/画像）、SimHash 去重、情绪标注、六引擎落库",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "记忆正文"},
-                        "agent_id": {"type": "string", "description": "调用方标识，如 workbuddy / codebuddy"},
-                    },
-                    "required": ["content"],
-                },
-            ),
-            Tool(
-                name="recall_memory",
-                description="召回记忆：全文+语义+图谱+时间多通道融合，返回带分数的命中与注入上下文",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "查询语句"},
-                        "agent_id": {"type": "string"},
-                        "top_k": {"type": "integer", "description": "返回条数，默认 5"},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            Tool(
-                name="timeline_query",
-                description="按时间窗口查询记忆（事件时间轴）",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "since_ms": {"type": "integer"},
-                        "until_ms": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                    },
-                },
-            ),
-            Tool(
-                name="profile_read",
-                description="读取用户画像槽位（偏好、习惯等 profile 类型记忆）",
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="conflict_report",
-                description="查看被推翻 / 冲突的记忆清单",
-                inputSchema={"type": "object", "properties": {"limit": {"type": "integer"}}},
-            ),
-            Tool(
-                name="health_check",
-                description="六引擎健康检查",
-                inputSchema={"type": "object", "properties": {}},
-            ),
-        ]
+        return [Tool(**spec) for spec in MCP_TOOL_DEFS]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
