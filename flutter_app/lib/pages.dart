@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
@@ -423,6 +425,344 @@ class _SettingsPageState extends State<SettingsPage> {
           Expanded(child: Slider(value: value.clamp(min, max).toDouble(), min: min, max: max, onChanged: onChanged)),
           SizedBox(width: 56, child: Text(value.toStringAsFixed(value > 10 ? 0 : 4), style: const TextStyle(color: _accent, fontSize: 11))),
         ],
+      );
+}
+
+/// 系统概览：六引擎健康 + PAD/分层采样 + 昼夜任务手动执行。
+class SystemPage extends StatefulWidget {
+  const SystemPage({super.key, required this.client});
+  final BrainClient client;
+
+  @override
+  State<SystemPage> createState() => _SystemPageState();
+}
+
+class _SystemPageState extends State<SystemPage> {
+  List<Map<String, dynamic>> _engines = <Map<String, dynamic>>[];
+  List<Map<String, dynamic>> _tasks = <Map<String, dynamic>>[];
+  Map<String, dynamic> _snapshot = <String, dynamic>{};
+  String _status = '—';
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final engines = await widget.client.engines();
+    final tasks = await widget.client.tasks();
+    final snapshot = await widget.client.snapshot();
+    if (!mounted) return;
+    setState(() {
+      _engines = (engines['engines'] as List<dynamic>? ?? <dynamic>[])
+          .map((row) => (row as Map<String, dynamic>))
+          .toList();
+      _tasks = tasks;
+      _snapshot = snapshot;
+    });
+  }
+
+  Future<void> _run(String name) async {
+    final result = await widget.client.runTask(name);
+    if (!mounted) return;
+    setState(() => _status = '${result['ok'] == true ? '执行成功' : '执行失败'}：$name · ${result['message'] ?? ''}');
+    _reload();
+  }
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+        title: '系统概览',
+        subtitle: '六引擎健康、记忆分层分布与生命循环任务（全部经 WebSocket RPC）',
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Expanded(
+              child: _Card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('引擎 / 它在干什么 / 状态', style: TextStyle(color: Colors.white, fontSize: 13)),
+                    const SizedBox(height: 10),
+                    ..._engines.map((row) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Text(
+                            '${row['name'] ?? '?'} · ${row['description'] ?? ''} · ${row['ok'] == false ? '异常' : '正常'}',
+                            style: const TextStyle(color: _hint, fontSize: 11),
+                          ),
+                        )),
+                    const SizedBox(height: 14),
+                    Text('记忆 ${_snapshot['memory_stream']?['count'] ?? 0} 条 · 待重放 ${_snapshot['sync_status']?['pending_events'] ?? 0}',
+                        style: const TextStyle(color: _accent, fontSize: 11)),
+                    Text('分层 ${_snapshot['spaces']?['tiers'] ?? {}}', style: const TextStyle(color: _hint, fontSize: 10)),
+                    const SizedBox(height: 10),
+                    OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: _Card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('生命循环任务', style: TextStyle(color: Colors.white, fontSize: 13)),
+                    const SizedBox(height: 10),
+                    ..._tasks.map((task) => ListTile(
+                          dense: true,
+                          title: Text('${task['name']}', style: const TextStyle(color: Colors.white, fontSize: 12)),
+                          subtitle: Text('${task['at']} · ${task['description'] ?? ''}',
+                              style: const TextStyle(color: _hint, fontSize: 10)),
+                          trailing: TextButton(
+                            onPressed: () => _run('${task['name']}'),
+                            child: const Text('执行'),
+                          ),
+                        )),
+                    const SizedBox(height: 8),
+                    Text(_status, style: const TextStyle(color: _hint, fontSize: 11)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+}
+
+/// 展示数据：全量快照 JSON + 导出。
+class DataPage extends StatefulWidget {
+  const DataPage({super.key, required this.client});
+  final BrainClient client;
+
+  @override
+  State<DataPage> createState() => _DataPageState();
+}
+
+class _DataPageState extends State<DataPage> {
+  String _json = '{}';
+  String _status = '—';
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final snapshot = await widget.client.snapshot();
+    if (!mounted) return;
+    setState(() => _json = const JsonEncoder.withIndent('  ').convert(snapshot));
+  }
+
+  Future<void> _export() async {
+    final result = await widget.client.exportAll();
+    setState(() => _status = result['error']?.toString() ??
+        '已导出：${result['dashboard']} / ${result['memories']}');
+  }
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+        title: '展示数据',
+        subtitle: '六面板原始快照（JSON）与记忆 NDJSON 导出',
+        child: Column(
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                FilledButton(onPressed: _export, child: const Text('导出快照 + 记忆')),
+                const SizedBox(width: 12),
+                OutlinedButton(onPressed: _reload, child: const Text('重新读取')),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Align(alignment: Alignment.centerLeft, child: Text(_status, style: const TextStyle(color: _hint, fontSize: 11))),
+            const SizedBox(height: 10),
+            Expanded(
+              child: _Card(
+                child: SingleChildScrollView(
+                  child: SelectableText(_json, style: const TextStyle(color: Color(0xFF7FE9FF), fontSize: 11, height: 1.5)),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+}
+
+/// 模型配置：双通道本地/云端、模型状态、参数保存与内核热重启。
+class ModelPage extends StatefulWidget {
+  const ModelPage({super.key, required this.client});
+  final BrainClient client;
+
+  @override
+  State<ModelPage> createState() => _ModelPageState();
+}
+
+class _ModelPageState extends State<ModelPage> {
+  Map<String, dynamic> _status = <String, dynamic>{};
+  Map<String, dynamic> _sections = <String, dynamic>{};
+  late final TextEditingController _embedUrl = TextEditingController();
+  late final TextEditingController _llmUrl = TextEditingController();
+  String _message = '—';
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final status = await widget.client.modelStatus();
+    final config = await widget.client.config();
+    if (!mounted) return;
+    final sections = config['sections'] as Map<String, dynamic>? ?? <String, dynamic>{};
+    final model = sections['model'] as Map<String, dynamic>? ?? <String, dynamic>{};
+    setState(() {
+      _status = status;
+      _sections = sections;
+      _embedUrl.text = model['embed_base_url']?.toString() ?? '';
+      _llmUrl.text = model['llm_base_url']?.toString() ?? '';
+    });
+  }
+
+  Future<void> _save() async {
+    final result = await widget.client.setConfig(<String, dynamic>{
+      'model': <String, dynamic>{'embed_base_url': _embedUrl.text.trim(), 'llm_base_url': _llmUrl.text.trim()},
+    });
+    setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已保存');
+  }
+
+  Future<void> _restart() async {
+    final result = await widget.client.restartKernel();
+    setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已重启');
+    _reload();
+  }
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+        title: '模型配置',
+        subtitle: 'Embedding / LLM 两条通道各自独立供应商（地址、模型名、密钥分开），保存后重启内核生效',
+        child: ListView(
+          children: <Widget>[
+            _Card(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text('当前实际使用', style: TextStyle(color: Colors.white, fontSize: 13)),
+                  const SizedBox(height: 8),
+                  Text('Embedding：${_status['embedding_backend'] ?? '—'} · ${_status['embedder']?['kind'] ?? '—'}',
+                      style: const TextStyle(color: _accent, fontSize: 11)),
+                  Text('LLM：${_status['llm_backend'] ?? '—'} · ${_status['llm']?['kind'] ?? '—'}',
+                      style: const TextStyle(color: _accent, fontSize: 11)),
+                  Text('CUDA ${_status['use_cuda']} · 维度 ${_status['dense_dim']}',
+                      style: const TextStyle(color: _hint, fontSize: 11)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            _Card(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text('两条独立云端通道', style: TextStyle(color: Colors.white, fontSize: 13)),
+                  const SizedBox(height: 12),
+                  TextField(controller: _embedUrl, style: const TextStyle(color: Colors.white, fontSize: 12),
+                      decoration: const InputDecoration(labelText: 'Embedding API 地址', labelStyle: TextStyle(color: _hint, fontSize: 11), border: OutlineInputBorder())),
+                  const SizedBox(height: 10),
+                  TextField(controller: _llmUrl, style: const TextStyle(color: Colors.white, fontSize: 12),
+                      decoration: const InputDecoration(labelText: 'LLM API 地址', labelStyle: TextStyle(color: _hint, fontSize: 11), border: OutlineInputBorder())),
+                  const SizedBox(height: 12),
+                  Row(children: <Widget>[
+                    FilledButton(onPressed: _save, child: const Text('保存')),
+                    const SizedBox(width: 12),
+                    OutlinedButton(onPressed: _restart, child: const Text('应用并重启内核')),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text(_message, style: const TextStyle(color: _hint, fontSize: 11)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            _Card(
+              child: Text('完整参数分组（${_sections.keys.length} 组）：${_sections.keys.join(" / ")}\n'
+                  '在「设置」页或 Qt 控制台可逐项微调；这里通过 WS RPC 的 config.get / config.set 读写同一份用户差异补丁。',
+                  style: const TextStyle(color: _hint, fontSize: 11, height: 1.6)),
+            ),
+          ],
+        ),
+      );
+}
+
+/// 同步与备份：立即同步、创建快照、快照列表。
+class SyncPage extends StatefulWidget {
+  const SyncPage({super.key, required this.client});
+  final BrainClient client;
+
+  @override
+  State<SyncPage> createState() => _SyncPageState();
+}
+
+class _SyncPageState extends State<SyncPage> {
+  List<Map<String, dynamic>> _snapshots = <Map<String, dynamic>>[];
+  String _status = '—';
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final rows = await widget.client.snapshots();
+    if (mounted) setState(() => _snapshots = rows);
+  }
+
+  Future<void> _sync() async {
+    final result = await widget.client.syncOnce();
+    setState(() => _status = result['error']?.toString() ??
+        'pull ${result['pulled']} · replay ${result['replayed']} · push ${result['pushed']}');
+    _reload();
+  }
+
+  Future<void> _snapshot() async {
+    final result = await widget.client.createSnapshot();
+    setState(() => _status = result['error']?.toString() ?? '已创建 ${result['name']}');
+    _reload();
+  }
+
+  @override
+  Widget build(BuildContext context) => PageFrame(
+        title: '同步与备份',
+        subtitle: '事件日志是唯一真源；快照只是某一刻状态，多端同步按 HLC 因果序幂等重放',
+        child: Column(
+          children: <Widget>[
+            Row(children: <Widget>[
+              FilledButton(onPressed: _sync, child: const Text('立即同步')),
+              const SizedBox(width: 12),
+              OutlinedButton(onPressed: _snapshot, child: const Text('创建快照')),
+              const SizedBox(width: 12),
+              OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+            ]),
+            const SizedBox(height: 10),
+            Align(alignment: Alignment.centerLeft, child: Text(_status, style: const TextStyle(color: _hint, fontSize: 11))),
+            const SizedBox(height: 10),
+            Expanded(
+              child: _Card(
+                child: ListView.builder(
+                  itemCount: _snapshots.length,
+                  itemBuilder: (context, index) {
+                    final row = _snapshots[index];
+                    return ListTile(
+                      leading: const Icon(Icons.backup_outlined, color: _accent, size: 18),
+                      title: Text('${row['name']}', style: const TextStyle(color: Colors.white, fontSize: 12)),
+                      subtitle: Text('${row['counts']}', style: const TextStyle(color: _hint, fontSize: 10)),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
       );
 }
 

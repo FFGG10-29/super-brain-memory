@@ -24,7 +24,9 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   StreamSubscription<Map<String, dynamic>>? _subscription;
   final TextEditingController _search = TextEditingController();
 
+  BrainGraph _full = BrainGraph(nodes: <BrainNode>[], edges: <BrainEdge>[], clusters: <GalaxyCluster>[]);
   BrainGraph _graph = BrainGraph(nodes: <BrainNode>[], edges: <BrainEdge>[], clusters: <GalaxyCluster>[]);
+  String _space = '全部';
   NebulaStyle _style = const NebulaStyle();
   List<List<double>> _stardust = <List<double>>[];
   final List<Pulse3D> _pulses = <Pulse3D>[];
@@ -34,6 +36,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   double _yaw = 0.35;
   double _pitch = -0.22;
   double _zoom = 1.0;
+  double _burst = 0.0;
   String _status = '正在连接记忆内核…';
   String _connection = '离线';
 
@@ -65,7 +68,8 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
       final nebula = (config['nebula'] as Map<String, dynamic>? ?? <String, dynamic>{});
       if (!mounted) return;
       setState(() {
-        _graph = graph;
+        _full = graph;
+        _graph = graph.filtered(_space);
         _style = NebulaStyle(
           focal: (nebula['focal_length'] as num? ?? 900).toDouble(),
           starSize: (nebula['star_size'] as num? ?? 3.2).toDouble(),
@@ -73,7 +77,9 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
           autoRotate: nebula['auto_rotate'] != false,
           spinSpeed: (nebula['spin_speed'] as num? ?? 0.00035).toDouble(),
         );
-        _status = '${graph.nodes.length} 个节点 · ${graph.edges.length} 条突触 · ${graph.clusters.length} 个星系';
+        final dust = graph.clusters.fold<int>(0, (sum, c) => sum + c.dust.length);
+        _status = '${graph.nodes.length} 节点 · ${graph.edges.length} 突触 · '
+            '${graph.clusters.length} 星系 · $dust 星尘粒子';
       });
     } catch (error) {
       if (mounted) setState(() => _status = '后端未连接：$error');
@@ -99,19 +105,20 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         tier: event['tier']?.toString() ?? 'buffer',
         isEmotion: event['memory_type']?.toString() == 'emotion',
       );
-      _graph.addNode(node);
-      _pulses.add(Pulse3D(from: _origin, to: node.position, similarity: 0.85));
-      setState(() => _status = '${_graph.nodes.length} 个节点 · 新记忆已点亮');
+      _full.addNode(node);
+      _graph = _full.filtered(_space);
+      _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(node), similarity: 0.85));
+      setState(() => _status = '${_graph.nodes.length} 节点 · 新记忆已点亮');
     } else if (type == 'pulse') {
       final target = _graph.byId[event['target']?.toString() ?? ''];
       if (target != null) {
-        _pulses.add(Pulse3D(from: _origin, to: target.position, similarity: 0.7));
+        _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(target), similarity: 0.7));
       }
     }
   }
 
   void _tick() {
-    if (_pulses.isEmpty && _highlighted.isEmpty) return;
+    if (_pulses.isEmpty && _highlighted.isEmpty && _burst <= 0) return;
     for (final pulse in _pulses) {
       pulse.step();
     }
@@ -119,6 +126,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     for (final node in _graph.nodes) {
       if (node.flash > 0) node.flash = math.max(0, node.flash - 0.04);
     }
+    if (_burst > 0) _burst = math.max(0, _burst - 0.004); // 星爆缓慢消散
   }
 
   Future<void> search(String query) async {
@@ -133,10 +141,13 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         final node = _graph.byId[hit.id];
         if (node != null) {
           node.flash = 1.0;
-          _pulses.add(Pulse3D(from: _origin, to: node.position, similarity: hit.score));
+          _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(node), similarity: hit.score));
         }
       }
-      setState(() => _status = '「$query」命中 ${hits.length} 条 · 光点齐射');
+      setState(() {
+        _burst = 1.0; // 触发 LivingMemory 式检索星爆
+        _status = '「$query」命中 ${hits.length} 条 · 星爆齐射';
+      });
     } catch (error) {
       if (mounted) setState(() => _status = '召回失败：$error');
     }
@@ -147,6 +158,17 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         _pitch = -0.22;
         _zoom = 1.0;
         _highlighted.clear();
+        _burst = 0.0;
+      });
+
+  void applySpace(String space) => setState(() {
+        _space = space;
+        _graph = _full.filtered(space);
+        _highlighted.clear();
+        _yaw = 0.35;
+        _pitch = -0.22;
+        _zoom = 1.0;
+        _burst = 0.0;
       });
 
   @override
@@ -192,6 +214,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
                       style: _style,
                       highlighted: _highlighted,
                       stardust: _stardust,
+                      burst: _burst,
                     ),
                     child: Container(),
                   );

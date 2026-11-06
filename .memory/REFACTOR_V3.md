@@ -16,6 +16,32 @@
 | 数据迁移 | `scripts/migrate_v2_to_v3.py` | 旧库只读、含封存记录、保留双时态/PAD；**待显卡机 3000 条数据到位后运行** |
 | 验收 | `tests/test_v3_pipeline.py`、`scripts/verify_v3.py` | 全量 139 passed；实机 ack 54–97ms、WS 3 事件、inbox done=3、投影 3 条 |
 
+## 0.2 按 astrbot_plugin_livingmemory 源码重写（2026-11-06）
+
+**源码依据**（`data/_research/livingmemory`，`gh repo clone lxfight/astrbot_plugin_livingmemory`）：
+- `package.json`：`three@0.186.1` + `d3-force-3d@3.0.6` + `esbuild`；
+- `pages/dashboard/graph-3d-core.js`：社区球壳 `goldenAngle/cbrt` (L90-99)、每星系旋转矩阵 `frames` (L150-155)、
+  螺旋臂 `angle = arm*2π/arms + 5.4*r` (L173)、力导向迭代 `max(60,150-n/30)` (L187)、
+  每社区边预算 `min(120,max(12,sqrt(size)*5))` 且 degree<4 (L207-215)；
+- `pages/dashboard/graph-3d.js`：`THREE.Points + ShaderMaterial + AdditiveBlending` (L244-271) 一次 draw call；
+  `galaxyDust = min(24000, nodes*12)` 粒子、每粒子 `aCenter/aSpin` 绕簇心旋转 (L290-342)；
+  `setPixelRatio(min(dpr,1.5))` (L43)、Web Worker 跑布局 (L82)、`LineSegments` 共享 position buffer (L277-286)。
+
+**Flutter 等价实现**（`flutter_app/lib/`）：
+- `graph_model.dart`：内容 2-gram 贪心社区检测（容量上限强制分散）→ 球壳簇心 + 螺旋臂 + 每簇 frame 矩阵
+  + galaxyDust 粒子云 + 边预算截断；纯 TypedArray 式预计算，布局只跑一次；
+- `nebula_painter.dart`：`Canvas.drawPoints` 批量绘制（星尘 / 24000 尘埃 / haze / 边 / 星爆 / 节点 / 脉冲 ≈ 7 次 draw call），
+  **无逐节点 blur、无 MaskFilter**；`BlendMode.plus` 等价 AdditiveBlending；透视 + yaw/pitch 拖拽翻滚；
+  检索命中触发「焦点→命中节点」束状金线星爆（复刻截图 3）；
+- `v3/rpc.py` + `v3/daemon.py`：**WebSocket 双向 RPC**（`rpc` / `rpc_result`），
+  覆盖十页全部方法（graph/memories/recall/detail/spaces/snapshot/engines/tasks/run_task/
+  model_status/config.get/config.set/sync_once/snapshots/create_snapshot/export/gateway/restart）；
+- `app_shell.dart`：十页导航 + 顶栏（空间/搜索/导出/全屏/复位）+ 底部状态栏，与 Qt 控制台功能对齐。
+
+**性能实测**：`flutter test` 3000 节点 / 4000 边 → 布局 **163ms**、10 个星系团、24000 尘埃粒子、
+边预算截断到 602 条；`flutter analyze` 0 issues、`flutter build windows --release` 通过；
+`scripts/verify_v3_rpc.py` 13 个 RPC 方法实机全通。
+
 ## 0.1 Flutter 3D 客户端（2026-11-06 已落地并编译通过）
 
 `flutter_app/`：**纯 Dart CustomPainter 实现真 3D 星云**（旋转矩阵 yaw/pitch + 透视投影 + 深度排序 + 加色 bloom），

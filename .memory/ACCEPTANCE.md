@@ -1,7 +1,8 @@
 # 七阶段验收台账
 
 > 最近一次全量回归（2026-11-06）：**138 passed + 1 环境性失败**（`test_sync_worker_bootstraps_repo_from_url`：Qt offscreen 下 subprocess 句柄继承 WinError 6，与业务代码无关），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
-> Flutter 客户端：`flutter analyze lib` **0 error**，`flutter build windows --release` 编译通过（Flutter 3.47.7）；`scripts/seed_v3_demo.py` 灌入 24 条主题记忆 → 27 节点，召回命中 7 条。
+> Flutter 客户端：`flutter analyze lib` **0 issues**、`flutter test` **All tests passed**（3000 节点/4000 边 → 布局 163ms、10 星系团、24000 尘埃、边预算 602 条）、`flutter build windows --release` 编译通过（Flutter 3.47.7）；
+> `scripts/verify_v3_rpc.py` 13 个 WebSocket RPC 方法实机全通；十页功能页（星云/记忆/召回/系统/数据/模型/接口/同步/设置/关于）全部经 WS 与 v3 Daemon 通信。
 > v3 实机：`scripts/verify_v3.py` → HTTP 202 受理 54–97ms、WS 3 事件、inbox done=3、投影可读；`--separate` 进程模式 done=1/投影=1。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 

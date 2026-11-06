@@ -25,6 +25,7 @@ from main import build_app
 from v3.inbox import Inbox
 from v3.journal import V3Journal
 from v3.notify import V3Alarm
+from v3.rpc import RpcHandler
 from v3.supervisor import ProcessSupervisor, SpawnSpec
 from v3.worker import V3Worker
 
@@ -36,12 +37,15 @@ _WEB_DIR = Path(__file__).resolve().parent / "web"
 class WebSocketHub:
     """线程安全的 WS 广播：后台 asyncio loop，Worker 用 broadcast 推增量。"""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8767) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8767, *, rpc: Any | None = None) -> None:
         self.host, self.port = host, port
+        self.rpc = rpc
         self._loop = asyncio.new_event_loop()
         self._clients: set[Any] = set()
         self._thread = threading.Thread(target=self._run, name="v3-ws", daemon=True)
         self._started = threading.Event()
+        self._async_stop: asyncio.Event | None = None
+        self._server: Any = None
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -53,14 +57,33 @@ class WebSocketHub:
         async def handler(websocket: Any) -> None:
             self._clients.add(websocket)
             try:
-                async for _message in websocket:
-                    pass
+                async for raw in websocket:
+                    try:
+                        message = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(message, dict):
+                        continue
+                    kind = str(message.get("type", ""))
+                    if kind == "rpc" and self.rpc is not None:
+                        # 同步业务逻辑放到线程池，避免阻塞 WS 事件循环
+                        result = await asyncio.to_thread(self.rpc.dispatch, message)
+                        await websocket.send(json.dumps(
+                            {"type": "rpc_result", "id": message.get("id"), **result},
+                            ensure_ascii=False, default=str,
+                        ))
+                    elif kind == "pulse":
+                        self.broadcast({"type": "pulse", **{
+                            k: v for k, v in message.items() if k != "type"
+                        }})
             finally:
                 self._clients.discard(websocket)
 
-        async with websockets.serve(handler, self.host, self.port):
+        self._async_stop = asyncio.Event()
+        async with websockets.serve(handler, self.host, self.port) as server:
+            self._server = server
             self._started.set()
-            await asyncio.Future()
+            await self._async_stop.wait()
 
     def start(self, *, wait_s: float = 2.0) -> None:
         self._thread.start()
@@ -81,8 +104,13 @@ class WebSocketHub:
         asyncio.run_coroutine_threadsafe(send_all(), self._loop)
 
     def stop(self) -> None:
-        if self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        """优雅关闭：让 serve 的 async with 正常退出，避免 loop 关闭后残留协程告警。"""
+        if self._async_stop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._async_stop.set)
+        if self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        if not self._loop.is_closed():
+            self._loop.close()
 
 
 class V3Daemon:
@@ -108,6 +136,8 @@ class V3Daemon:
         # Honker 只作可选加速闹钟；默认关闭，避免扩展事务初始化进入在线受理路径
         self.alarm = V3Alarm(port=alarm_port, peer_file=self.root / "worker.port")
         self.hub = WebSocketHub(port=ws_port)
+        self.rpc = RpcHandler(self)
+        self.hub.rpc = self.rpc
         self.app = None
         self.worker: V3Worker | None = None
         self.supervisor: ProcessSupervisor | None = None
