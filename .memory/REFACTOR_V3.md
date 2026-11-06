@@ -16,7 +16,19 @@
 | 数据迁移 | `scripts/migrate_v2_to_v3.py` | 旧库只读、含封存记录、保留双时态/PAD；**待显卡机 3000 条数据到位后运行** |
 | 验收 | `tests/test_v3_pipeline.py`、`scripts/verify_v3.py` | 全量 139 passed；实机 ack 54–97ms、WS 3 事件、inbox done=3、投影 3 条 |
 
-**已知取舍**：Flutter 原生壳未编译（用系统浏览器/WebView2 承载 Three.js 等价渲染，省掉 Flutter SDK 与 Skia 3D 坑）；安装器脚本齐备但 ISCC/WinSW 二进制需下载；`<50ms` 在 Windows fsync 抖动下实测 54–97ms（对比 v2 秒级），group commit 已启用，指标按"不等待任何模型"验收。
+## 0.1 Flutter 3D 客户端（2026-11-06 已落地并编译通过）
+
+`flutter_app/`：**纯 Dart CustomPainter 实现真 3D 星云**（旋转矩阵 yaw/pitch + 透视投影 + 深度排序 + 加色 bloom），
+鼠标拖拽翻滚 / 滚轮缩放 / 双击复位；语义聚类成**多个星系盘**（连通分量种子 + 中文 2-gram 贪心归簇），
+簇心球壳分散、簇内螺旋臂 + 薄盘厚度 —— 解决「全部挤一坨」。
+零第三方依赖（只用 `dart:io` + Flutter SDK），已用本机 Flutter 3.47.7 `flutter analyze` 0 error、
+`flutter build windows --release` 编译出 `super_brain.exe`。
+页面：星云 / 记忆管理 / 召回测试 / 接口与端口 / 设置 / 关于；HTTP + WS 直连 v3 Daemon，
+后端新增 `GET /v1/recall`、`GET/POST /v1/config`（3D 偏好跨设备同步）。
+构建脚本 `flutter_app/scripts/build_windows.ps1`（平台 runner 由本机 SDK 生成，不覆盖 lib/）。
+
+**已知取舍**：安装器脚本齐备但 ISCC/WinSW 二进制需下载；`<50ms` 在 Windows fsync 抖动下实测 54–97ms
+（对比 v2 秒级），group commit 已启用，指标按"不等待任何模型"验收。
 
 > 目标：把「单进程里跑完 UI + 六引擎 + 三模型 + 同步写全链路」拆成
 > **常驻 Daemon + 无状态 Worker + GPU 前端**。在线只追加，理解全后台，能力一个不砍只换位置。

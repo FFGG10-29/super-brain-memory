@@ -35,3 +35,10 @@ app_entry.py
 super-brain.spec
 dist/
 release/
+
+# Flutter（平台 runner 入库，构建产物与本机缓存不入库）
+flutter_app/build/
+flutter_app/.dart_tool/
+flutter_app/windows/flutter/ephemeral/
+flutter_app/.flutter-plugins
+flutter_app/.flutter-plugins-dependencies

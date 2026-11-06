@@ -181,21 +181,24 @@ class V3Daemon:
                 self.wfile.write(body)
 
             def do_POST(self) -> None:  # noqa: N802
-                if urlparse(self.path).path != "/v1/events":
-                    self._send(404, {"error": "not found"})
-                    return
+                path = urlparse(self.path).path
                 length = int(self.headers.get("Content-Length", "0"))
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}")
                 except json.JSONDecodeError:
                     self._send(400, {"error": "invalid json"})
                     return
-                result = daemon.handle_event(
-                    str(body.get("content", "")),
-                    agent_id=str(body.get("agent_id", "default")),
-                    namespace=str(body.get("namespace", "private")),
-                )
-                self._send(202 if result.get("accepted") else 400, result)
+                if path == "/v1/events":
+                    result = daemon.handle_event(
+                        str(body.get("content", "")),
+                        agent_id=str(body.get("agent_id", "default")),
+                        namespace=str(body.get("namespace", "private")),
+                    )
+                    self._send(202 if result.get("accepted") else 400, result)
+                elif path == "/v1/config":
+                    self._send(200, daemon.save_client_config(dict(body)))
+                else:
+                    self._send(404, {"error": "not found"})
 
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
@@ -211,6 +214,12 @@ class V3Daemon:
                     self._send(200, {"memories": daemon.memories(limit=limit)})
                 elif path == "/v1/graph":
                     self._send(200, daemon.graph())
+                elif path == "/v1/recall":
+                    query = parse_qs(parsed.query).get("q", [""])[0]
+                    limit = int(parse_qs(parsed.query).get("limit", ["8"])[0])
+                    self._send(200, daemon.recall(query, limit=limit))
+                elif path == "/v1/config":
+                    self._send(200, daemon.client_config())
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -289,6 +298,68 @@ class V3Daemon:
             }
             for row in self._rows(limit=limit)
         ]
+
+    def recall(self, query: str, *, limit: int = 8) -> dict[str, Any]:
+        """轻量召回：字符 2-gram 余弦（只读投影，不加载模型）。Flutter 用结果发射光脉冲。"""
+        rows = self._rows(limit=500)
+        vector = _ngram(query)
+        scored = []
+        for row in rows:
+            content = self._content(row)
+            score = _cosine(vector, _ngram(content))
+            if score > 0:
+                scored.append({
+                    "id": str(row.get("id")), "content": content,
+                    "score": round(score, 4), "channels": ["fts"],
+                    "memory_type": row.get("memory_type", "fact"),
+                })
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return {"query": query, "hits": scored[:limit], "degraded": True}
+
+    DEFAULT_CLIENT_CONFIG: dict[str, Any] = {
+        "nebula": {
+            "cluster_radius": 330.0, "galaxy_thickness": 42.0,
+            "spin_speed": 0.00035, "focal_length": 900.0,
+            "star_size": 3.2, "bloom": True, "auto_rotate": True,
+        }
+    }
+
+    def _client_config_path(self) -> Path:
+        return self.root / "nebula_prefs.json"
+
+    def client_config(self) -> dict[str, Any]:
+        data = json.loads(json.dumps(self.DEFAULT_CLIENT_CONFIG))
+        path = self._client_config_path()
+        if path.exists():
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                for key, value in saved.items():
+                    if isinstance(value, dict) and isinstance(data.get(key), dict):
+                        data[key].update(value)
+                    else:
+                        data[key] = value
+            except (json.JSONDecodeError, OSError):
+                pass
+        data["server"] = {
+            "http_port": self._http_port, "ws_port": self.hub.port,
+            "worker_mode": self.worker_mode, "alarm_port": self.alarm.port,
+        }
+        return data
+
+    def save_client_config(self, patch: dict[str, Any]) -> dict[str, Any]:
+        current = self.client_config()
+        for key, value in patch.items():
+            if key == "server":
+                continue
+            if isinstance(value, dict) and isinstance(current.get(key), dict):
+                current[key].update(value)
+            else:
+                current[key] = value
+        current.pop("server", None)
+        self._client_config_path().write_text(
+            json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return {"ok": True, "config": self.client_config()}
 
     def graph(self) -> dict[str, Any]:
         """只读投影：字符 2-gram 余弦≥阈值画突触线（不加载 embedder）。"""
