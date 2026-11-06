@@ -135,10 +135,17 @@ class HTTPAdapter:
         return 404, {"error": "not_found", "path": path}
 
     def _call_tool(self, tool: str, args: dict, *, headers: dict) -> dict:
-        """入队并等待结果：并发请求自动排队，中枢按 FIFO 逐条处理。"""
+        """入队并等待结果：并发请求自动排队，中枢按 FIFO 逐条处理。
+
+        工具里的异常必须转成结构化错误返回 —— 一旦抛出，BaseHTTPRequestHandler 会直接断开
+        连接，客户端只能看到 WinError 10054 / RemoteDisconnected，连原因都拿不到。
+        """
         future: Future = Future()
         self._jobs.put((tool, args, headers, future))
-        return future.result(timeout=300)
+        try:
+            return future.result(timeout=300)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "message": str(exc)[:500], "tool": tool}
 
     # ── 标准 MCP over HTTP（Streamable HTTP，JSON 响应）───────────────────
     def _mcp_authorized(self, headers: dict) -> bool:

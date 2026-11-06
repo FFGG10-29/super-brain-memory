@@ -81,7 +81,8 @@ def mcp_json_text(mode: str = "http") -> str:
                 "super-brain-memory": {
                     "type": "streamable-http",
                     "url": url,
-                    "headers": {"Authorization": f"Bearer {bridge_token_text()}"},
+                    # 本机桥接的鉴权头：X-Super-Brain-Bridge（服务端也兼容 Authorization: Bearer）
+                    "headers": {"X-Super-Brain-Bridge": bridge_token_text()},
                 }
             }
         },
