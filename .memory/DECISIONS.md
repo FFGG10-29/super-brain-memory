@@ -205,3 +205,34 @@
 - **How to apply**：新增工具只改 `mcp_stdio.MCP_TOOL_DEFS` 一处，stdio 与 HTTP 自动同步；
   任何需要认证的入口都要同时接受 Bearer 与桥接头，否则会被只带 Authorization 的客户端 401。
 
+## ADR-019 v3 事件驱动内核：受理与认知消费分离，与 v2 并行可回退
+
+- **决策**：新增 `v3/` 旁路内核，在线面（`daemon.py`，HTTP 8768 + WS 8767）只做
+  `POST /v1/events` → journal（NDJSON group commit + fsync 先于回执 + `reconcile()` 崩溃补齐）
+  → inbox（SQLite WAL 租约队列，`BEGIN IMMEDIATE + UPDATE...RETURNING` 原子批量抢占）→ 202 返回；
+  认知全链路由无状态 `worker.py` 后台 claim（lease/CAS/幂等）执行，复用 v2 的 `build_app()`
+  （Hippocampus → 六引擎投影），`emit_event=False` 防再入队。`supervisor.py` 用 Windows Job Object
+  防孤儿 + 指数退避 + 熔断；`notify.py` 三层闹钟（Event/UDP/Honker）只是加速，可靠性靠启动扫描
+  + drain + 1s 兜底轮询。
+- **理由**：v2 的写入流是同步串行的——Agent 写一条要等抽取/去重/六引擎落库全走完；
+  v3 让写入在 fsync 后立即 202，认知处理异步化，且六引擎单写者约束不变。
+  不替换 v2：桌面端与测试仍走 v2 路径，v3 出问题可直接回退。
+- **How to apply**：改认知链路仍只动 `brain/`（v3 worker 复用同一份）；改受理/广播去 `v3/daemon.py`；
+  `v3/rpc.py` 是 Flutter 十页的全部方法分发器，新增前端能力先在此加 method。
+  `v3/web/`（WebGL 星云）由 daemon 直接 serve，无独立服务。
+
+## ADR-020 Flutter 前端经 WS RPC 连 v3 daemon，星云渲染零第三方依赖
+
+- **决策**：`flutter_app/`（纯 Dart，Windows 桌面）通过 `ws://host:8767/ws` 与 v3 daemon 通信，
+  协议 `{"type":"rpc","id","method","args"}` → `{"type":"rpc_result",...}`（`brain_client.dart`），
+  12s 超时自动降级 HTTP（`/v1/graph|health|recall|memories|config|events`），断线 1.5s 重连。
+  3D 星云（`nebula_painter.dart` / `nebula_math.dart` / `graph_model.dart`）移植
+  astrbot_plugin_livingmemory 的布局公式：社区球壳 golden angle、螺旋臂、星尘云 ≤24000 粒，
+  用 CustomPainter 批量 `drawPoints`（约 6 次 draw call），坐标由 id 哈希决定、跨设备可复现。
+- **理由**：PySide6 星云是 2D QGraphicsView，用户要真 3D；Flutter Skia 批量绘制在 3000+ 节点
+  下稳定 60fps（`test/graph_perf_test.dart`），且不引 three.dart 之类重依赖。
+  复用 daemon 的 WS 广播（node_created / pulse）实现写入实时光脉冲。
+- **How to apply**：前端偏好落 `%APPDATA%/super-brain/flutter_prefs.json`；加页面在
+  `pages.dart` 加 PageFrame 并在 `app_shell.dart` 注册导航；新 RPC 方法 v3/rpc.py 与
+  brain_client.dart 两端同步加。
+

@@ -30,7 +30,7 @@
 | 便携发行 + GPU 探针 | ✅ 已出包 | `dist/super-brain/`（onedir，9.6GB 含 3.35GB 权重）；冻结包实测 `verdict=GPU_OK`、`all_on_gpu=true`、`sparse_enabled=true`。流程见 §8 |
 | 多 Agent 共享（外置大脑） | ✅ | 所有 Agent 写同一命名空间、召回不过滤（`gateway/mcp_server.py`）；stdio 进程经 `mcp_bridge.json` 转发给桌面内核，不各自开库 |
 | 入口排队（中枢裁决） | ✅ | `gateway/http_adapter.py`：`queue.Queue` + 唯一工作线程 FIFO，`queue_depth` 显示在接口页 |
-| 一键复制 MCP 配置 | ✅ | 接口页「复制 MCP JSON」：`streamable-http`（`http://127.0.0.1:8766/mcp` + Bearer 令牌，粘进 Agent 的「添加 MCP 连接」）或 `stdio`（本机启动器）。不再输出大段说明文字 |
+| 一键复制 MCP 配置 | ✅ | 接口页「复制 MCP JSON」：`streamable-http`（`http://127.0.0.1:8766/mcp` + `X-Super-Brain-Bridge` 令牌头，粘进 Agent 的「添加 MCP 连接」）或 `stdio`（本机启动器）。不再输出大段说明文字 |
 | MCP over HTTP 端点 | ✅ | `HTTPAdapter._handle_mcp`：`POST /mcp` 支持 initialize / notifications / tools/list / tools/call / ping，返回 `Mcp-Session-Id`；认证接受 `X-Super-Brain-Bridge` 或 `Authorization: Bearer <桥接令牌>` |
 | 桥接令牌持久化 | ✅ | 令牌落 `%APPDATA%/super-brain/mcp_token.txt`，服务启动优先复用 —— 重启软件后已复制的 JSON 不会失效（此前每次启动都换新 token，是「老是 token 错误」的根因） |
 | 批量导入快速通道 | ✅ | `import_memories(fast=True)` → `remember(use_llm=False)`：跳过 LLM 抽取与语义合并裁决（仍保留丘脑准入/SimHash/embedding/六引擎/事件日志），导入走后台线程 + 进度信号 |
@@ -38,6 +38,8 @@
 | 托盘驻留 + 开机自启 | ✅ | `tray.py` / `autostart.py`：叉窗口只隐藏、单实例唤回、托盘「完全退出」；自启命令带 `--tray` |
 | 首页资源仪表 + 模型运行总览 | ✅ | `system_stats.py`（psutil + nvidia-smi，2s 采样）；星云页顶部 CPU/内存/显卡；模型页顶部三通道 × 本地/远程 × 设备 × 状态 |
 | 窗口自适应屏幕 | ✅ | `MainWindow._fit_to_screen()`：按可用区收敛并居中；接口页改滚动区（原最小高度 859 会把窗口顶到 937） |
+| v3 事件驱动内核 | ✅ 与 v2 并行可回退 | `v3/`：daemon(HTTP 8768 + WS 8767) 只受理（journal group commit + fsync → inbox 租约队列 → 202），无状态 worker 后台 claim 复用 v2 认知链路；supervisor Job Object 防孤儿；`v3/web/` WebGL 星云由 daemon 直接 serve（见 ADR-019） |
+| Flutter 3D 星云客户端 | ✅ 已编译 exe | `flutter_app/`：WS RPC（`ws://host:8767/ws`，12s 超时降级 HTTP）连 v3 daemon，覆盖全部十页方法；纯 Dart 3D 星云（球壳/螺旋臂布局，CustomPainter 批量 drawPoints，3000+ 节点 60fps）；`v3/rpc.py` 是全部 RPC 方法分发器（见 ADR-020） |
 
 启动：`python -m ui.desktop`；改完代码重启：`powershell -File scripts/restart_frontend.ps1`。
 离屏整窗截图：`python scripts/desktop_screenshots.py` → `data/screenshots/`。

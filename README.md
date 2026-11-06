@@ -72,7 +72,7 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
     "super-brain-memory": {
       "type": "streamable-http",
       "url": "http://127.0.0.1:8766/mcp",
-      "headers": { "Authorization": "Bearer <你的令牌>" }
+      "headers": { "X-Super-Brain-Bridge": "<你的令牌>" }
     }
   }
 }
@@ -117,6 +117,8 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 - **语义合并**：写入时判断「新增 / 更新 / 合并 / 跳过」，避免记忆库长成一团相似句子
 - **夜间巩固**：聚类摘要、升维、冲突检测（可配置调度）
 - **可视化控制台**：十一页 PySide6 桌面端，星云图 + 记忆检查器 + 事件时间轴 + 资源仪表
+- **Flutter 3D 星云客户端**：纯 Dart 的 Windows 客户端，真 3D 记忆星系（球壳 / 螺旋臂布局，3000+ 节点流畅渲染），WebSocket 实时光脉冲——Agent 写入记忆，星云立刻亮一下
+- **v3 事件驱动内核（可选）**：写入 = journal 组提交 + fsync 后立即返回，认知处理由后台 Worker 异步消费；与 v2 并行、随时可回退，另带浏览器版 WebGL 星云
 - **同步**：事件日志走 Git（每设备独立目录，结构上免冲突），另支持快照
 
 ---
@@ -220,6 +222,7 @@ GPU 验证（最权威的一条）：
 - [x] 记忆可视化（星云 / 时间轴 / 检查器 / Core Memory）
 - [x] 用户控制闭环（纠正 / 封存 / 遗忘 + 审计）
 - [x] 多 Agent 共享 + 标准 MCP over HTTP + 持久令牌
+- [x] v3 事件驱动内核（journal 组提交 + 租约收件箱 + 守护进程/Worker）+ Flutter 3D 星云客户端
 - [ ] 记忆图谱自动补全与关系推理（LLM 抽三元组已就绪，待更强模型）
 - [ ] 跨设备增量同步可视化（落后游标 / 冲突预览）
 - [ ] Linux / macOS 发行包
