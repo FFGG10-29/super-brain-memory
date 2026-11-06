@@ -1,0 +1,110 @@
+"""v3.worker —— 无状态后台消费者：认知全链路搬到这里。
+
+- drain：醒来后一直 claim 到取空，再回去等闹钟（避免"一通知一任务"漏消费）；
+- 复用现有 Hippocampus 的抽取/PAD/丘脑/语义合并/六库投影，仅关闭 journal 再入队（emit_event=False）；
+- CAS 完成、租约心跳、幂等 event_id；结果通过 hub 广播给前端。
+"""
+from __future__ import annotations
+
+import json
+import threading
+import uuid
+from typing import Any
+
+__all__ = ["V3Worker"]
+
+
+class V3Worker:
+    def __init__(self, inbox, alarm, app, *, hub: Any | None = None,
+                 worker_id: str | None = None, lease_s: float = 60.0,
+                 use_llm: bool = True) -> None:
+        self._inbox = inbox
+        self._alarm = alarm
+        self._app = app
+        self._hub = hub
+        self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        self._lease_s = lease_s
+        self._use_llm = use_llm
+        self._stop = threading.Event()
+        self.processed = 0
+        self.failed = 0
+
+    # ── 单轮 ──────────────────────────────────────────────────────────────
+    def run_once(self, *, limit: int = 20) -> int:
+        rows = self._inbox.claim(self.worker_id, limit=limit, lease_s=self._lease_s)
+        for row in rows:
+            self._process(row)
+        return len(rows)
+
+    def _process(self, row: dict[str, Any]) -> None:
+        event_id = str(row["event_id"])
+        try:
+            payload = json.loads(str(row.get("payload") or "{}"))
+            legacy = payload.get("legacy_neuron")
+            if isinstance(legacy, dict) and legacy.get("id"):
+                # v2 迁移事件：原样落投影并保留双时态/PAD，再让 outbox 重建派生库
+                self._app.storage.relational.upsert("neuron", legacy)
+                for target in ("vector", "graph", "timeseries", "hypergraph"):
+                    self._app.storage.relational.outbox_enqueue(
+                        event_id=str(legacy["id"]), target=target,
+                        payload={"neuron": legacy, "extraction": {}},
+                    )
+                self._app.hippocampus.dispatch_outbox()
+                ok = self._inbox.finish(event_id, self.worker_id, ok=True)
+                if ok and self._hub is not None:
+                    self._hub.broadcast({
+                        "type": "node_created", "event_id": event_id, "id": legacy["id"],
+                        "content": payload.get("content", ""),
+                        "memory_type": legacy.get("memory_type", "fact"),
+                        "tier": legacy.get("tier", "buffer"),
+                        "pad": (legacy.get("pad_p", 0), legacy.get("pad_a", 0), legacy.get("pad_d", 0)),
+                        "merge": "add",
+                    })
+                self.processed += 1
+                return
+            result = self._app.hippocampus.remember(
+                str(row["content"]), agent_id=str(row["agent_id"]),
+                emit_event=False, use_llm=self._use_llm,
+            )
+            ok = self._inbox.finish(event_id, self.worker_id, ok=True)
+            if not ok:
+                return  # 租约被抢，丢弃结果，防双花
+            self.processed += 1
+            if self._hub is not None:
+                payload = {
+                    "type": "node_created" if result.applied else "node_rejected",
+                    "event_id": event_id,
+                    "id": result.neuron.uuid7_id,
+                    "content": result.neuron.content,
+                    "memory_type": result.neuron.memory_type,
+                    "tier": result.neuron.tier,
+                    "pad": result.neuron.pad.as_tuple(),
+                    "reason": result.admission.reason,
+                    "superseded": result.superseded,
+                    "merge": (result.merge.action if result.merge else "add"),
+                }
+                self._hub.broadcast(payload)
+        except Exception as exc:  # noqa: BLE001  单条失败不拖垮 Worker
+            self.failed += 1
+            self._inbox.finish(event_id, self.worker_id, ok=False, error=f"{type(exc).__name__}: {exc}")
+            if self._hub is not None:
+                self._hub.broadcast({"type": "node_failed", "event_id": event_id, "error": str(exc)[:200]})
+
+    # ── 常驻循环 ──────────────────────────────────────────────────────────
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                drained = 0
+                while not self._stop.is_set():
+                    count = self.run_once()
+                    drained += count
+                    if count == 0:
+                        break
+                if drained == 0:
+                    self._alarm.wait(timeout=1.0)  # 1s 兜底轮询：通知丢了也扫 pending
+            except Exception:  # noqa: BLE001  守护循环不因单轮异常退出
+                self._stop.wait(0.2)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._alarm.ring("stop")

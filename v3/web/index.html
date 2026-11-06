@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>超级大脑 · 星云</title>
+<style>
+  html, body { margin:0; height:100%; background:#03050b; overflow:hidden; color:#cfe6ff;
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #hud { position:fixed; left:18px; top:14px; padding:10px 14px; border-radius:10px;
+    background:rgba(6,12,22,.68); border:1px solid #1b2a42; font-size:12px; line-height:1.7;
+    pointer-events:none; }
+  #hud b { color:#4fc3f7; font-size:14px; }
+  #status { position:fixed; right:18px; top:14px; font-size:11px; color:#6b7c93; }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+<div id="hud"><b>超级大脑 · 星云</b><br/>GPU 渲染 · 滚轮缩放 · 拖拽平移<br/><span id="counts">节点 0 · 突触 0</span></div>
+<div id="status">WS 连接中…</div>
+<script src="/nebula.js"></script>
+</body>
+</html>

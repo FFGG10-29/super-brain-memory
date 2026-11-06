@@ -1,6 +1,7 @@
 # 七阶段验收台账
 
-> 最近一次全量回归（2026-11-06）：**134 passed**（桌面 22 / 用户控制 6 / 增量与索引 4 / 配置中心 13），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> 最近一次全量回归（2026-11-06）：**139 passed**（含 v3 事件内核 5 条），`verify_baseline.py` 基线成立，`main.py --self-check --json` 退出码 0。
+> v3 实机：`scripts/verify_v3.py` → HTTP 202 受理 54–97ms、WS 3 事件、inbox done=3、投影可读；`--separate` 进程模式 done=1/投影=1。
 > 跑法：`pytest tests -q --basetemp="$env:TEMP\pb_$(Get-Random)"`（沙箱 safe-delete 限制，见 WORKING_MEMORY §3）
 
 ## 阶段 0 地基 ✅

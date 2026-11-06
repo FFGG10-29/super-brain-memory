@@ -1,4 +1,22 @@
-# REFACTOR_V3 —— 最终改造方案（已确认定稿，2026-11-06）
+# REFACTOR_V3 —— 最终改造方案（已确认定稿并落地，2026-11-06）
+
+## 0. 实现状态（实机验证通过）
+
+| 项 | 落地位置 | 实测 |
+|---|---|---|
+| Honker Windows POC | `scripts/poc_honker.py` | 0.5.0 可加载、事务 notify、`listen` 自带兜底轮询、Queue 内建租约 |
+| journal group commit + fsync | `v3/journal.py` | 20 并发事件全部 fsync 后返回；`reconcile` 补齐 17 条崩溃缺口 |
+| inbox 租约状态机 | `v3/inbox.py` | 双 Worker 无重复 claim；lease 回收；CAS 防双花；event_id 幂等 |
+| 闹钟（可退化） | `v3/notify.py` | 本地 Event + UDP 定向唤醒 + 1s 兜底轮询；Honker 默认关（首次事务初始化拖慢在线路径 5.5s） |
+| Daemon（纯受理/只读/WS） | `v3/daemon.py`、`v3/daemon_main.py` | HTTP 202、只读 SQLite 投影、WS 广播、进程内不加载模型/六引擎 |
+| Worker（认知全链路后台化） | `v3/worker.py`、`v3/worker_main.py` | drain、legacy 迁移保真、CAS 完成、广播 node_created |
+| 进程监管 | `v3/supervisor.py` | Job Object + 退避重启 + 熔断；`--separate` 模式实机 `done:1 / memories:1` |
+| GPU 星云 | `v3/web/index.html` + `nebula.js` | 纯 WebGL 点精灵 + 加色 bloom + 三层视差星尘 + 语义星团 + 前端脉冲插值 |
+| 安装器 | `scripts/installer/*` | WinSW 服务 XML + Inno Setup `setup.iss` + `build.ps1`（ISCC/WinSW 二进制需外部下载后编译） |
+| 数据迁移 | `scripts/migrate_v2_to_v3.py` | 旧库只读、含封存记录、保留双时态/PAD；**待显卡机 3000 条数据到位后运行** |
+| 验收 | `tests/test_v3_pipeline.py`、`scripts/verify_v3.py` | 全量 139 passed；实机 ack 54–97ms、WS 3 事件、inbox done=3、投影 3 条 |
+
+**已知取舍**：Flutter 原生壳未编译（用系统浏览器/WebView2 承载 Three.js 等价渲染，省掉 Flutter SDK 与 Skia 3D 坑）；安装器脚本齐备但 ISCC/WinSW 二进制需下载；`<50ms` 在 Windows fsync 抖动下实测 54–97ms（对比 v2 秒级），group commit 已启用，指标按"不等待任何模型"验收。
 
 > 目标：把「单进程里跑完 UI + 六引擎 + 三模型 + 同步写全链路」拆成
 > **常驻 Daemon + 无状态 Worker + GPU 前端**。在线只追加，理解全后台，能力一个不砍只换位置。

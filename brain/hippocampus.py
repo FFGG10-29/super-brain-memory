@@ -106,6 +106,7 @@ class Hippocampus:
         device_id: str | None = None,
         now_ms: int | None = None,
         use_llm: bool = True,
+        emit_event: bool = True,
     ) -> WriteResult:
         extraction = self._extractor.extract(content, agent_id=agent_id, use_llm=use_llm)
         affect = self._amygdala.ingest(agent_id, extraction.pad, now_ms=now_ms)
@@ -167,7 +168,9 @@ class Hippocampus:
             warnings=warnings,
             merge=merge,
         )
-        self._emit_event(neuron, extraction, result)
+        # v3 Worker 消费事件时关闭再入队，避免 journal → inbox 无限回环
+        if emit_event:
+            self._emit_event(neuron, extraction, result)
         return result
 
     def _emit_event(self, neuron: Neuron, extraction: Extraction, result: WriteResult) -> None:

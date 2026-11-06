@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- WinSW service descriptor. SCM owns crash recovery; daemon owns worker processes. -->
+<service>
+  <id>super-brain-v3</id>
+  <name>Super Brain v3 Memory Daemon</name>
+  <description>Event-driven memory daemon: journal + inbox + WebSocket + GPU nebula frontend.</description>
+  <executable>%BASE%\runtime\pythonw.exe</executable>
+  <arguments>-m v3.daemon_main --root "%PROGRAMDATA%\SuperBrain\data" --http-port 8768 --ws-port 8767 --worker-mode process</arguments>
+  <workingdirectory>%BASE%\app</workingdirectory>
+  <env name="PYTHONPATH" value="%BASE%\app"/>
+  <env name="GW_MCP_TOKEN_SECRET" value="%SUPERBRAIN_TOKEN_SECRET%"/>
+  <logpath>%PROGRAMDATA%\SuperBrain\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="15 sec"/>
+  <onfailure action="none"/>
+  <delayedAutoStart>true</delayedAutoStart>
+</service>
