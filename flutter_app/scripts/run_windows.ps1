@@ -23,5 +23,5 @@ if (-not (Test-Path (Join-Path $app 'windows\CMakeLists.txt'))) {
 }
 
 & flutter pub get 2>&1 | Out-Host
-Write-Output 'Starting v3 daemon is required first: .venv\Scripts\python.exe scripts\run_v3.py'
+Write-Output 'Flutter 会自动探活并拉起无头后端；手动启动可用: ..\.venv\Scripts\python.exe -m headless_server'
 & flutter run -d windows 2>&1 | Out-Host

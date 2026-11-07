@@ -2,12 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'backend_launcher.dart';
 import 'brain_client.dart';
 import 'nebula_page.dart';
 import 'pages.dart';
+import 'pages_extra.dart';
 import 'prefs.dart';
 
-/// LivingMemory 风格外壳：左侧十页导航 + 顶栏（空间/搜索/导出/全屏）+ 底部状态栏。
+/// LivingMemory 风格外壳：左侧十四页导航 + 顶栏（空间/搜索/导出/全屏）+ 底部状态栏。
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -37,6 +39,10 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '接口与端口', 'icon': Icons.settings_ethernet},
     <String, Object>{'name': '同步与备份', 'icon': Icons.cloud_sync},
     <String, Object>{'name': '设置', 'icon': Icons.tune},
+    <String, Object>{'name': '记忆检查器', 'icon': Icons.fact_check_outlined},
+    <String, Object>{'name': '事件时间轴', 'icon': Icons.timeline},
+    <String, Object>{'name': '批量导入', 'icon': Icons.upload_file},
+    <String, Object>{'name': '全量配置', 'icon': Icons.tune_outlined},
     <String, Object>{'name': '关于', 'icon': Icons.info_outline},
   ];
 
@@ -59,7 +65,11 @@ class _AppShellState extends State<AppShell> {
     final data = await _client.spaces();
     if (!mounted) return;
     final tiers = (data['tiers'] as Map<String, dynamic>? ?? <String, dynamic>{}).keys.toList();
-    setState(() => _spaces = <String>['全部', '情感记忆', ...tiers]);
+    final spaces = <String>['全部', '情感记忆', ...tiers].toSet().toList();
+    setState(() {
+      _spaces = spaces;
+      if (!spaces.contains(_space)) _space = '全部';
+    });
   }
 
   Future<void> _refreshStatus() async {
@@ -209,6 +219,10 @@ class _AppShellState extends State<AppShell> {
                       InterfacePage(client: _client),
                       SyncPage(client: _client),
                       SettingsPage(client: _client, onReconnect: _reconnect),
+                      MemoryInspectorPage(client: _client),
+                      TimelinePage(client: _client),
+                      ImportPage(client: _client),
+                      FullConfigPage(client: _client),
                       const AboutPage(),
                     ],
                   ),
@@ -227,7 +241,13 @@ class _AppShellState extends State<AppShell> {
                         style: const TextStyle(color: Color(0xFF6B839F), fontSize: 10),
                       ),
                       const Spacer(),
-                      const Text('WebSocket RPC · v3 Daemon', style: TextStyle(color: Color(0xFF3E5470), fontSize: 10)),
+                      ValueListenableBuilder<String>(
+                        valueListenable: backendStatus,
+                        builder: (context, value, _) => Text(
+                          'WebSocket RPC · $value',
+                          style: const TextStyle(color: Color(0xFF3E5470), fontSize: 10),
+                        ),
+                      ),
                     ],
                   ),
                 ),

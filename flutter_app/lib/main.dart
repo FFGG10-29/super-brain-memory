@@ -1,11 +1,24 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'app_shell.dart';
+import 'backend_launcher.dart';
 import 'prefs.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   Prefs.load();
+  // 进程分离：先探活，后端没起来就拉起独立 Python 进程（不阻塞 UI 首帧）。
+  unawaited(
+    BackendLauncher.ensureRunning(
+      host: Prefs.get<String>('host', '127.0.0.1'),
+      httpPort: Prefs.get<int>('http_port', 8768),
+    ).catchError((Object error) {
+      backendStatus.value = '后端拉起异常：$error';
+      return backendStatus.value;
+    }),
+  );
   runApp(const SuperBrainApp());
 }
 

@@ -236,3 +236,32 @@
   `pages.dart` 加 PageFrame 并在 `app_shell.dart` 注册导航；新 RPC 方法 v3/rpc.py 与
   brain_client.dart 两端同步加。
 
+## ADR-021 单进程无头后端 + Flutter 进程分离；Qt 前端验收后再删
+
+- **决策**：① 新增 `headless_server.py`：`python -m headless_server` 在一个进程里只装配
+  **一份** `build_app()`，同时提供 `8766 /mcp`（MCPToolkit/HTTPAdapter，含持久桥接令牌与
+  stdio 启动器）、`8768 /v1/*`（V3Daemon HTTP）、`8767 /ws`（RPC 分发 + 广播）；
+  `V3Daemon(app=...)` 支持注入外部 app，Worker 与 MCP 网关共用同一六引擎。
+  ② 配置/启动器/业务服务下沉到与 Qt 无关的位置：`core/user_config.py`（Qt 侧保留转发）、
+  `gateway/bridge_launcher.py`、`brain/memory_service.py`（检查器/纠正/遗忘/时间轴/导入/
+  真实六通道召回）；`v3/rpc_ext.py` 给 Flutter 补齐 `memory.*` / `timeline` /
+  `import_memories` / `config.*` / `core_memory.*` / `gateway.status`。
+  ③ Flutter 从 10 页扩到 14 页（新增检查器、时间轴、批量导入、全量配置），
+  `backend_launcher.dart` 探活 `/v1/health` 后用 `ProcessStartMode.detached` 拉起后端。
+  ④ **暂不删除 `ui/desktop/`**：作为功能兜底与对照，等真机验收通过后再删并改打包入口。
+- **理由**：v2 网关与 v3 daemon 各自 `build_app()` 会踩 Kùzu 单写锁，且旧 `run_v3.py`
+  用独立 `projection.db`，与 v2 主库不是一份数据；共用 `BrainConfig` 后
+  `V3Daemon._projection_db == config.storage.sqlite_path`，数据天然统一。
+  Qt 前端此前既做 UI 又持有内核/网关/托盘/自启，直接删会让所有 Agent 的 MCP 接入失效。
+- **How to apply**：新增前端能力 = `v3/rpc_ext.py` 加方法 + `brain_client.dart` 加封装 +
+  `pages_extra.dart`/`app_shell.dart` 加页面；改认知链路仍只动 `brain/`；
+  热重启必须走 `HeadlessServer.restart_kernel()`（先 `old.close()` 再 `build_app()`，
+  同时换 toolkit/registry/worker 的引用），不能只换 `daemon.app`，否则 MCP 指向已关闭的旧引擎。
+- **验收门槛（删除 Qt 前必须全过）**：`pytest tests -q` 全绿（当前 141 passed）、
+  `scripts/verify_headless.py` 全 PASS（含换核后 MCP 可用）、有 Flutter SDK 的机器上
+  `flutter analyze` 无错 + `flutter build windows` 出 exe + 十四页逐页人工验收。
+- **当前已知剩余差异（验收时重点看）**：Qt 的托盘驻留 / 单实例 / 开机自启（无头后端靠端口
+  占用实现单实例，自启需 WinSW 或注册表）、PAT 与云端 API key 的钥匙串保存、
+  数据目录一键迁移、PAD 曲线与认知分区图表、召回命中归因/注入上下文可视化、
+  星云 2D 检查器联动。这些不影响「记忆读写 + MCP + 配置 + 用户控制」主链路等价。
+

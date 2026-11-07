@@ -26,10 +26,17 @@ class Prefs {
     _cache.putIfAbsent('host', () => '127.0.0.1');
     _cache.putIfAbsent('http_port', () => 8768);
     _cache.putIfAbsent('ws_port', () => 8767);
+    _cache.putIfAbsent('auto_start_backend', () => true);
+    _cache.putIfAbsent('backend_command', () => '');
+    _cache.putIfAbsent('backend_dir', () => '');
+    _cache.putIfAbsent('backend_args', () => '-m headless_server');
     return _cache;
   }
 
-  static T get<T>(String key, T fallback) => (_cache[key] as T?) ?? fallback;
+  static T get<T>(String key, T fallback) {
+    final value = _cache[key];
+    return value is T ? value : fallback;
+  }
 
   static void save(Map<String, dynamic> values) {
     _cache = <String, dynamic>{..._cache, ...values};

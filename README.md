@@ -12,7 +12,7 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 [![PySide6](https://img.shields.io/badge/PySide6-6.12-41CD52?logo=qt&logoColor=white)](https://doc.qt.io/qtforpython/)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20%2B%20streamable--http-8A2BE2)](https://modelcontextprotocol.io/)
 [![CUDA](https://img.shields.io/badge/CUDA-GPU%20accelerated-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
-[![Tests](https://img.shields.io/badge/tests-134%20passed-brightgreen)](#-测试)
+[![Tests](https://img.shields.io/badge/tests-141%20passed-brightgreen)](#-测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-license)
 
 [快速开始](#-60-秒接入你的-agent) · [功能](#-它能做什么) · [架构](#-架构) · [截图](#-界面) · [参与贡献](#-参与贡献)
@@ -119,6 +119,7 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 - **可视化控制台**：十一页 PySide6 桌面端，星云图 + 记忆检查器 + 事件时间轴 + 资源仪表
 - **Flutter 3D 星云客户端**：纯 Dart 的 Windows 客户端，真 3D 记忆星系（球壳 / 螺旋臂布局，3000+ 节点流畅渲染），WebSocket 实时光脉冲——Agent 写入记忆，星云立刻亮一下
 - **v3 事件驱动内核（可选）**：写入 = journal 组提交 + fsync 后立即返回，认知处理由后台 Worker 异步消费；与 v2 并行、随时可回退，另带浏览器版 WebGL 星云
+- **无头后端 + 进程分离**：`python -m headless_server` 单进程同时提供 `8766 /mcp`（Agent 接入）、`8768 /v1/*`、`8767 /ws`（Flutter RPC），一份六引擎、一个 Kùzu 写者；Flutter 启动自动探活并拉起它
 - **同步**：事件日志走 Git（每设备独立目录，结构上免冲突），另支持快照
 
 ---
@@ -179,6 +180,20 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 3. **纠正/遗忘不物理删除**：否则落后设备重放 journal 会把记忆「复活」；
 4. **索引与缓存是派生数据**：可随时删除重建，结果必须与全扫一致。
 
+**无头后端（推荐的新形态）**：`python -m headless_server` 把上面整张图装进**一个进程**，
+同时提供三个入口，Flutter 客户端与所有 Agent 都只是它的客户端：
+
+| 端口 | 入口 | 用途 |
+|---|---|---|
+| `8766` | `POST /mcp` | 标准 MCP（streamable HTTP），`X-Super-Brain-Bridge` 鉴权；`super-brain-mcp.cmd` 启动器会自动生成 |
+| `8768` | `/v1/health` `/v1/events` `/v1/memories` … | v3 HTTP 受理面 + 只读投影 + 浏览器版 WebGL 星云 |
+| `8767` | `/ws` | Flutter 的 21+ 个 RPC 方法与 `node_created` / `pulse` 广播 |
+
+MCP 网关与 v3 Worker **共用同一份 `build_app()` 实例**（Kùzu 只允许一个写者），
+v3 只读投影取 `config.storage.sqlite_path`，与 v2 主库天然是同一份数据。
+Flutter 启动时先探活 `/v1/health`，没起来才拉起后端独立进程；Qt 前端目前保留作对照，
+待 Flutter 真机验收后再删除（见 [`flutter_app/README.md`](flutter_app/README.md)）。
+
 ---
 
 ## 📦 安装
@@ -203,8 +218,16 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 # 可选：GPU 加速（onnxruntime-gpu / llama-cpp-python CUDA 轮子）
 .\.venv\Scripts\python.exe -m pip install -r requirements-optional.txt
-.\.venv\Scripts\python.exe -m ui.desktop          # 启动桌面端
-.\.venv\Scripts\python.exe -m pytest tests -q     # 跑测试（134 passed）
+.\.venv\Scripts\python.exe -m ui.desktop          # Qt 桌面端（验收期保留）
+.\.venv\Scripts\python.exe -m headless_server      # 无头后端：MCP 8766 + HTTP 8768 + WS 8767
+.\.venv\Scripts\python.exe scripts\verify_headless.py   # 端到端验收（临时目录隔离）
+.\.venv\Scripts\python.exe -m pytest tests -q     # 跑测试（141 passed）
+```
+
+Flutter 客户端（会自动拉起无头后端，需要 Flutter SDK）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File flutter_app\scripts\run_windows.ps1
 ```
 
 GPU 验证（最权威的一条）：
@@ -223,6 +246,8 @@ GPU 验证（最权威的一条）：
 - [x] 用户控制闭环（纠正 / 封存 / 遗忘 + 审计）
 - [x] 多 Agent 共享 + 标准 MCP over HTTP + 持久令牌
 - [x] v3 事件驱动内核（journal 组提交 + 租约收件箱 + 守护进程/Worker）+ Flutter 3D 星云客户端
+- [x] 无头后端单进程统一内核 + Flutter 十四页功能补齐 + 后端自动拉起
+- [ ] Flutter 真机验收（analyze / build windows）通过后删除 Qt 前端 `ui/desktop/`
 - [ ] 记忆图谱自动补全与关系推理（LLM 抽三元组已就绪，待更强模型）
 - [ ] 跨设备增量同步可视化（落后游标 / 冲突预览）
 - [ ] Linux / macOS 发行包
@@ -253,7 +278,7 @@ GPU 验证（最权威的一条）：
 ## 🧪 测试
 
 ```
-134 passed  # 六引擎 / 事件重放 / 召回质量 / 用户控制 / MCP 双通道 / 配置中心
+141 passed  # 六引擎 / 事件重放 / 召回质量 / 用户控制 / MCP 双通道 / 配置中心
 ```
 
 CI 尚未接入（本机 Windows + CUDA），欢迎帮忙加 GitHub Actions 的 CPU-only 流水线。

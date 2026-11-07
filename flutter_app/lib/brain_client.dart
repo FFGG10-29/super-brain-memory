@@ -173,6 +173,63 @@ class BrainClient {
     return setClientConfig(nebula);
   }
 
+  // ── 功能补齐：检查器 / 用户控制 / 时间轴 / 导入 / 全量配置 ──────────
+  Future<List<Map<String, dynamic>>> memoryList({int limit = 200, String keyword = '',
+      String tier = '', String memoryType = '', String namespace = ''}) async {
+    final data = await call('memory.list', <String, dynamic>{
+      'limit': limit, 'keyword': keyword, 'tier': tier,
+      'memory_type': memoryType, 'namespace': namespace,
+    });
+    final rows = data is List<dynamic> ? data : <dynamic>[];
+    return rows.map((row) => _asMap(row)).toList();
+  }
+
+  Future<Map<String, dynamic>> inspectMemory(String id) async =>
+      _asMap(await call('memory.inspect', <String, dynamic>{'memory_id': id}));
+
+  Future<Map<String, dynamic>> correctMemory(String id, Map<String, dynamic> changes,
+          {String reason = ''}) async =>
+      _asMap(await call('memory.correct', <String, dynamic>{
+        'memory_id': id, 'changes': changes, 'reason': reason,
+      }));
+
+  Future<Map<String, dynamic>> forgetMemory(String id, {String reason = '', String action = 'forget'}) async =>
+      _asMap(await call('memory.forget', <String, dynamic>{
+        'memory_id': id, 'reason': reason, 'action': action,
+      }));
+
+  Future<List<Map<String, dynamic>>> memoryAudit(String id, {int limit = 50}) async {
+    final data = await call('memory.audit', <String, dynamic>{'memory_id': id, 'limit': limit});
+    final rows = data is List<dynamic> ? data : <dynamic>[];
+    return rows.map((row) => _asMap(row)).toList();
+  }
+
+  Future<Map<String, dynamic>> setSensitive(String id, bool flag) async =>
+      _asMap(await call('memory.sensitive', <String, dynamic>{'memory_id': id, 'flag': flag}));
+
+  Future<Map<String, dynamic>> coreMemory() async => _asMap(await call('core_memory.get'));
+
+  Future<Map<String, dynamic>> saveCoreMemory(Map<String, dynamic> blocks) async =>
+      _asMap(await call('core_memory.set', <String, dynamic>{'blocks': blocks}));
+
+  Future<List<Map<String, dynamic>>> timeline({List<String> types = const <String>[], int limit = 200}) async {
+    final data = await call('timeline', <String, dynamic>{'types': types, 'limit': limit});
+    final rows = data is List<dynamic> ? data : <dynamic>[];
+    return rows.map((row) => _asMap(row)).toList();
+  }
+
+  Future<Map<String, dynamic>> configPresets() async => _asMap(await call('config.presets'));
+  Future<Map<String, dynamic>> applyPreset(String name) async =>
+      _asMap(await call('config.apply_preset', <String, dynamic>{'name': name}));
+  Future<Map<String, dynamic>> resetConfig() async => _asMap(await call('config.reset'));
+  Future<Map<String, dynamic>> gatewayStatus() async => _asMap(await call('gateway.status'));
+
+  Future<Map<String, dynamic>> importMemories(String text, String suffix,
+          {bool fast = true}) async =>
+      _asMap(await call('import_memories', <String, dynamic>{
+        'text': text, 'suffix': suffix, 'fast': fast,
+      }));
+
   // ── HTTP 兜底（WS 未连通时）──────────────────────────────────────────
   Future<dynamic> _httpFallback(String method, Map<String, dynamic> args) async {
     try {

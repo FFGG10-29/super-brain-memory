@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-06 ｜ 当前阶段：**v2.2 桌面体验 + v3 事件驱动内核 + Flutter 3D 星云客户端（已编译出 exe）全部落地；便携包已出（9.6GB，冻结态 GPU_OK）**
+> 最后更新：2026-11-08 ｜ 当前阶段：**无头后端单进程统一内核（MCP 8766 + HTTP 8768 + WS 8767）+ Flutter 十四页并自动拉起后端已落地；Qt 前端保留作对照，待真机验收后删除；便携包已出（9.6GB，冻结态 GPU_OK）**
 
 ## 1. 进度总览
 
@@ -39,7 +39,11 @@
 | 首页资源仪表 + 模型运行总览 | ✅ | `system_stats.py`（psutil + nvidia-smi，2s 采样）；星云页顶部 CPU/内存/显卡；模型页顶部三通道 × 本地/远程 × 设备 × 状态 |
 | 窗口自适应屏幕 | ✅ | `MainWindow._fit_to_screen()`：按可用区收敛并居中；接口页改滚动区（原最小高度 859 会把窗口顶到 937） |
 | v3 事件驱动内核 | ✅ 与 v2 并行可回退 | `v3/`：daemon(HTTP 8768 + WS 8767) 只受理（journal group commit + fsync → inbox 租约队列 → 202），无状态 worker 后台 claim 复用 v2 认知链路；supervisor Job Object 防孤儿；`v3/web/` WebGL 星云由 daemon 直接 serve（见 ADR-019） |
-| Flutter 3D 星云客户端 | ✅ 已编译 exe | `flutter_app/`：WS RPC（`ws://host:8767/ws`，12s 超时降级 HTTP）连 v3 daemon，覆盖全部十页方法；纯 Dart 3D 星云（球壳/螺旋臂布局，CustomPainter 批量 drawPoints，3000+ 节点 60fps）；`v3/rpc.py` 是全部 RPC 方法分发器（见 ADR-020） |
+| Flutter 3D 星云客户端 | ✅ 十四页（待真机编译验收） | `flutter_app/`：WS RPC（`ws://host:8767/ws`，12s 超时降级 HTTP）连无头后端；纯 Dart 3D 星云（球壳/螺旋臂布局，CustomPainter 批量 drawPoints，3000+ 节点）；`v3/rpc.py` + `v3/rpc_ext.py` 是 RPC 分发器（见 ADR-020/021）。仓库内**无编译产物**，本机也未安装 Flutter SDK |
+| 无头后端（单进程统一内核） | ✅ 端到端验收通过 | `headless_server.py`：`python -m headless_server` 一份 `build_app()` 同时开 8766 `/mcp`（含持久令牌 + stdio 启动器）、8768 `/v1/*`、8767 `/ws`；`V3Daemon(app=...)` 注入共享 app；配置/启动器/业务服务下沉到 `core/user_config.py`、`gateway/bridge_launcher.py`、`brain/memory_service.py`（见 ADR-021） |
+| Flutter 功能补齐 | ✅ | 新增记忆检查器（纠正/遗忘/敏感/审计）、事件时间轴、批量导入、全量配置（动态表单 + 预设 + Core Memory + MCP 配置）；`v3/rpc_ext.py` 补齐 `memory.*`/`timeline`/`import_memories`/`config.*`/`core_memory.*`/`gateway.status`；召回改走真实六通道而非 2-gram |
+| 后端自动拉起（进程分离） | ✅ | `backend_launcher.dart` 探活 `/v1/health` → `Process.start(..., detached)` 拉起 `python -m headless_server` → 轮询 30s；启动命令/目录存 `flutter_prefs.json`，「全量配置」页可改 |
+| 端到端验收脚本 | ✅ 全 PASS | `scripts/verify_headless.py`：临时目录隔离，验证 MCP 六工具、异步写入、全部 RPC（含此前 process 模式必失败的 4 个）、真实召回、导入、纠正、热重启换核后 MCP 仍可用 |
 
 启动：`python -m ui.desktop`；改完代码重启：`powershell -File scripts/restart_frontend.ps1`。
 离屏整窗截图：`python scripts/desktop_screenshots.py` → `data/screenshots/`。
@@ -53,7 +57,8 @@
 - 未装（按降级实现）：`fastapi`、`nicegui`、`apscheduler`、`GitPython`（git_worker 走 CLI 兜底）。
 - 本机算力：**GTX 1060 / SM 6.1 / 6143 MiB / 驱动 581.57（CUDA Driver 13.0）**。三模型权重已落位 `data/models/`：`BAAI/bge-m3/model.onnx(+_data)`、`bge-m3/sparse_head.onnx`、`bge-reranker-v2-m3/model.onnx`、`qwen3-0.6b-q8_0.gguf`（合计约 3GB）。安装步骤与 CUDA DLL 归集记录在 `requirements-optional.txt`，重装轮子后按注释把 `nvidia\\cuda_runtime`/`nvidia\\cublas` 的 DLL 拷回 `llama_cpp\\lib`（另有一份暂存 `data\\wheels\\cuda_dlls\\`）。
 - `--probe-models --json` 的 `verdict` 取值：`GPU_OK` / `GPU_PARTIAL` / `MODEL_MISSING` / `CPU_ONLY` / `GPU_FELL_BACK_TO_CPU`（判定条件见 `main.py::probe_models`）。**判断 CUDA 是否生效只认本探针**，`--self-check` 只构造对象，证明不了加载。
-- 用例基线：**134 passed**（桌面 26 / 用户控制 6 / 增量与索引 4 / 配置中心 16 / MCP 6）。
+- 用例基线：**141 passed**（2026-11-08 全量实测）；`websockets==17.4` 已装（v3 WS 服务端延迟 import，缺它 `test_v3_rpc` 会失败）。
+- 本机**没有 Flutter/Dart SDK**（PATH 与 C:/D: 常见路径均无），`flutter analyze` / `flutter build windows` 尚未跑过；`analysis_options.yaml` 已移除未声明的 `flutter_lints` include，避免 analyze 直接报错。`pubspec.lock` 记录 Dart `>=3.11.0-0` 而 `pubspec.yaml` 写 `>=3.2.0`，若 `flutter pub get` 报约束不匹配，删 lock 重新生成。
 - GitHub：gh CLI 已登录账号 **FFGG10-29**；私库 `github.com/FFGG10-29/super-brain-memory`（remote origin 已配）。事件同步库建议另建（代码库与事件总线分开）。
 - Qt 测试/离屏渲染必须先设 `QT_QPA_PLATFORM=offscreen`（`tests/test_desktop.py` 模块顶部已设）。
 - Qt offscreen 环境里**不要 spawn 子进程**（句柄继承 WinError 50）；字体库为空，截图脚本须注入 `msyh.ttc`。
@@ -106,6 +111,12 @@ Set-Location -LiteralPath 'B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory
 
 ## 6. 下一步
 
+0. **Flutter 单前端收尾（验收后再删 Qt）**：装 Flutter SDK → `flutter pub get` → `flutter analyze`
+   → `flutter build windows --release` → 按 `flutter_app/README.md` 十四页逐页验收
+   （检查器纠正/遗忘、时间轴、批量导入、全量配置保存 + 重启内核、后端自动拉起）。
+   全过后删 `ui/desktop/`，改写 `tests/conftest.py` 与 3 个混合测试文件、
+   `scripts/build_portable.py` 入口改 `-m headless_server`、清 `requirements.txt`
+   的 PySide6/keyring/psutil，并同步 README/.memory。硬阻塞清单见 ADR-021。
 1. **先在本机补探针结论**（关掉桌面窗口，Kùzu 单进程锁）：`main.py --probe-models --json`，
    把 `verdict` / 三段 `on_gpu` 回填 `ACCEPTANCE.md`；若 `GPU_PARTIAL` 按 llm → embedder → reranker 定位。
    判定要 `verdict == GPU_OK` + `all_on_gpu == true` + `embedder.sparse_enabled == true`；
@@ -138,6 +149,9 @@ Set-Location -LiteralPath 'B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory
 - 更新 `dist/` 用 `robocopy build\pyi_outN\super-brain dist\super-brain /E`：`Copy-Item -Recurse` 曾把 `_internal` 内容拍平到根目录（多了一层通配符展开）。
 - 主窗口尺寸受**所有页面的最小高度**约束（QStackedWidget 取最大值）：原来接口页最小 859，把窗口顶到 937，笔记本上标题栏飞出屏幕。加滚动区前先量 `page.minimumSizeHint()`。
 - `psutil` 已进 `requirements.txt`（首页仪表）；显卡走 `nvidia-smi`，非 N 卡显示「无 N 卡 / 不可用」。
+- **无头后端与 Qt 桌面端不能同时跑**：两者都 `build_app()` 打开同一 Kùzu 库，单写者会抢锁（先关桌面窗口再起 headless）。
+- **热重启必须先关旧内核再 `build_app()`**：`HeadlessServer.restart_kernel()` 已统一换 toolkit/registry/worker；只换 `daemon.app` 会让 MCP 指向已关闭的旧引擎。
+- **三个端口各司其职**：8766 `/mcp`（Agent）、8768 `/v1/*`（Flutter HTTP 兜底 + 探活）、8767 `/ws`（RPC）；改端口要同时改 `flutter_prefs.json` 与后端启动参数。
 
 ## 8. 发行包（实测用）
 
