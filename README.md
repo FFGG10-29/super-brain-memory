@@ -198,7 +198,22 @@ Flutter 启动时先探活 `/v1/health`，没起来才拉起后端独立进程�
 
 ## 📦 安装
 
-### A. 直接跑发行包（Windows，推荐）
+### A. 一体安装包（推荐：Flutter 前端 + 随包部署的后端）
+
+一个安装包、**两个进程**：双击 `super_brain.exe`（Flutter 原生窗口），它会探活并自动拉起
+`backend\headless-server.exe`——冻结的 Python 后端，无 GUI、无 Qt，目标机器不需要装 Python /
+PySide6 / 任何依赖。Python 解释器不能塞进 Flutter 的 exe 内部，所以采用「随安装包一起部署」。
+
+```powershell
+# 构建（没有 Flutter SDK 就加 -InstallSdk，会自动 clone stable 到 D:\flutter）
+powershell -ExecutionPolicy Bypass -File scripts\build_full_release.ps1 -InstallSdk -Launch
+```
+
+Qt 桌面端约 7,000 行 / 630 KB 源码，但独占 `PySide6-Essentials` 200–300 MB；`--headless`
+构建模板已把它排除，发行包里不会带上。Qt 仅保留为隐藏调试入口 `python -m ui.desktop`
+（与后端互斥，Kùzu 单写者），默认完全不加载。详见 [`flutter_app/README.md`](flutter_app/README.md)。
+
+### B. 旧版 Qt 桌面便携包（调试 / 对照）
 
 1. 到 [Releases](../../releases) 下载分卷压缩包（每卷 < 2GB），全部下载后放到同一目录；
 2. 双击 `reassemble.cmd` 合并解压（或手动 `copy /b part1+part2+... super-brain.zip`）；
@@ -209,7 +224,7 @@ Flutter 启动时先探活 `/v1/health`，没起来才拉起后端独立进程�
 > 按 `data/models/` 的结构放进 `_internal\models\`，再跑 `super-brain-cli.exe --probe-models --json`
 > 看到 `"verdict": "GPU_OK"` 即成功。
 
-### B. 从源码跑（开发者）
+### C. 从源码跑（开发者）
 
 ```powershell
 git clone https://github.com/FFGG10-29/super-brain-memory

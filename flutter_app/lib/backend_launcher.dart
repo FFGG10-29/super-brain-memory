@@ -25,15 +25,26 @@ class BackendLauncher {
     }
   }
 
-  /// 从当前目录 / 可执行文件目录向上找项目根（含 headless_server.py），推断 venv python。
+  /// 优先级：安装包里的 backend/headless-server.exe > 开发态 venv python > PATH python。
   static Map<String, String> resolveDefaults() {
+    final exeName = Platform.isWindows ? 'headless-server.exe' : 'headless-server';
     final starts = <String>[
-      Directory.current.path,
       File(Platform.resolvedExecutable).parent.path,
+      Directory.current.path,
     ];
     for (final start in starts) {
       var dir = Directory(start);
       for (var depth = 0; depth < 6; depth++) {
+        // ① 安装布局：<root>\super_brain.exe 与 <root>\backend\headless-server.exe 同级
+        final exe = File('${dir.path}${Platform.pathSeparator}backend${Platform.pathSeparator}$exeName');
+        if (exe.existsSync()) {
+          return <String, String>{
+            'command': exe.path,
+            'directory': exe.parent.path,
+            'args': '',
+          };
+        }
+        // ② 开发态：项目根有 headless_server.py，用 venv 的 python -m headless_server
         final marker = File('${dir.path}${Platform.pathSeparator}headless_server.py');
         if (marker.existsSync()) {
           final venv = Platform.isWindows
@@ -63,13 +74,15 @@ class BackendLauncher {
       return backendStatus.value;
     }
     if (!Prefs.get<bool>('auto_start_backend', true)) {
-      backendStatus.value = '自动拉起已关闭；请手动运行 python -m headless_server';
+      backendStatus.value = '自动拉起已关闭；请手动运行 backend\headless-server.exe 或 python -m headless_server';
       return backendStatus.value;
     }
     final defaults = resolveDefaults();
     final command = _or(Prefs.get<String>('backend_command', ''), defaults['command']!);
     final directory = _or(Prefs.get<String>('backend_dir', ''), defaults['directory']!);
-    final args = _or(Prefs.get<String>('backend_args', ''), defaults['args']!);
+    var args = _or(Prefs.get<String>('backend_args', ''), defaults['args']!);
+    // 兼容旧偏好：以前默认把 '-m headless_server' 写进 prefs，传给 exe 会失败
+    if (command.toLowerCase().endsWith('.exe') && args.contains('-m ')) args = '';
     backendStatus.value = '正在拉起后端…';
     try {
       await Process.start(

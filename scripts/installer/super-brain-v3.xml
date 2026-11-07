@@ -4,10 +4,10 @@
   <id>super-brain-v3</id>
   <name>Super Brain v3 Memory Daemon</name>
   <description>Event-driven memory daemon: journal + inbox + WebSocket + GPU nebula frontend.</description>
-  <executable>%BASE%\runtime\pythonw.exe</executable>
-  <arguments>-m v3.daemon_main --root "%PROGRAMDATA%\SuperBrain\data" --http-port 8768 --ws-port 8767 --worker-mode process</arguments>
-  <workingdirectory>%BASE%\app</workingdirectory>
-  <env name="PYTHONPATH" value="%BASE%\app"/>
+  <!-- 可选：默认由 Flutter 前端自行拉起后端，本文件只在需要开机自启服务时使用 -->
+  <executable>%BASE%\backend\headless-server.exe</executable>
+  <arguments>--http-port 8768 --ws-port 8767 --mcp-port 8766</arguments>
+  <workingdirectory>%BASE%\backend</workingdirectory>
   <env name="GW_MCP_TOKEN_SECRET" value="%SUPERBRAIN_TOKEN_SECRET%"/>
   <logpath>%PROGRAMDATA%\SuperBrain\logs</logpath>
   <log mode="roll-by-size">

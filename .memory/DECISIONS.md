@@ -265,3 +265,28 @@
   数据目录一键迁移、PAD 曲线与认知分区图表、召回命中归因/注入上下文可视化、
   星云 2D 检查器联动。这些不影响「记忆读写 + MCP + 配置 + 用户控制」主链路等价。
 
+## ADR-022 后端以冻结 exe 随 Flutter 安装包部署；Qt 降级为隐藏调试入口
+
+- **决策**：① 冻结后端用独立模板：`scripts/build_portable.py --headless` 生成
+  `backend_entry.py` + `super-brain-backend.spec`，产物 `dist/super-brain-backend/`
+  含 `headless-server.exe`（console=False）与 `headless-server-cli.exe`（console=True）；
+  spec 的 `excludes` 明确排除 `PySide6 / keyring / psutil / ui.desktop`，不收 UI 图标资源。
+  ② 安装包布局改为 `{app}\super_brain.exe` + `{app}\backend\headless-server.exe`；
+  `setup.iss` 安装后只启动 Flutter exe，由 `BackendLauncher` 自行拉起后端；
+  不再注册 WinSW 服务（`super-brain-v3.xml` 降级为可选开机自启方案）。
+  ③ `BackendLauncher.resolveDefaults()` 优先找安装目录 exe，其次开发态 venv python；
+  `prefs.dart` 的 `backend_args` 默认改空，兼容旧偏好（命令是 exe 时忽略 `-m` 参数）。
+  ④ **Qt 源码保留但不进发行包**：`python -m ui.desktop` 是唯一入口，只有
+  `build.ps1 -IncludeDebugConsole` 才额外打包源码 + Python 运行时。
+- **理由**：Flutter 编译产物是原生 Dart 二进制，内部没有 Python 解释器，无法「内嵌」后端；
+  但「一个安装包、两个进程」对终端用户等价（双击一个图标即可）。Qt 真正的体积开销
+  是 PySide6 运行时（200–300 MB），源码本身只有约 630 KB，留作调试入口几乎零成本。
+  旧形态「PySide6 既是 UI 又是主进程」与新形态不能共存（同一 Kùzu 库单写锁）。
+- **How to apply**：新增后端模块要同步加入 `_SPEC_BACKEND.hiddenimports`；
+  改后端启动参数时 `headless_server.main(argv)`、`_ENTRY_BACKEND`、WinSW xml 三处对齐；
+  新增前端 RPC 不需要动安装包。用户机器无需 Python/PySide6，`SUPER_BRAIN_*` 环境变量
+  仍可覆盖数据目录。构建入口统一为 `scripts/build_full_release.ps1`。
+- **进程模型澄清**：旧 v2.2 = PySide6 桌面进程即主进程（持有六引擎 + 8766 网关 + 托盘）；
+  现在 = `headless_server` 是主进程（唯一持有六引擎，三端口），Flutter 是独立 UI 进程，
+  Qt 不在启动链上。任何时刻只允许这两类持有内核的进程之一运行。
+

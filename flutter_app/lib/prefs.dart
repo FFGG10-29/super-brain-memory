@@ -29,7 +29,7 @@ class Prefs {
     _cache.putIfAbsent('auto_start_backend', () => true);
     _cache.putIfAbsent('backend_command', () => '');
     _cache.putIfAbsent('backend_dir', () => '');
-    _cache.putIfAbsent('backend_args', () => '-m headless_server');
+    _cache.putIfAbsent('backend_args', () => '');
     return _cache;
   }
 

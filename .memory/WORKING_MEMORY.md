@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-08 ｜ 当前阶段：**无头后端单进程统一内核（MCP 8766 + HTTP 8768 + WS 8767）+ Flutter 十四页并自动拉起后端已落地；Qt 前端保留作对照，待真机验收后删除；便携包已出（9.6GB，冻结态 GPU_OK）**
+> 最后更新：2026-11-08 ｜ 当前阶段：**无头后端单进程统一内核 + Flutter 十四页已落地；后端改为冻结 exe 随 Flutter 安装包部署，Qt 降级为隐藏调试入口、不进发行包；待装 Flutter SDK 编译验收后再决定删 Qt；旧便携包已出（9.6GB，冻结态 GPU_OK）**
 
 ## 1. 进度总览
 
@@ -44,6 +44,9 @@
 | Flutter 功能补齐 | ✅ | 新增记忆检查器（纠正/遗忘/敏感/审计）、事件时间轴、批量导入、全量配置（动态表单 + 预设 + Core Memory + MCP 配置）；`v3/rpc_ext.py` 补齐 `memory.*`/`timeline`/`import_memories`/`config.*`/`core_memory.*`/`gateway.status`；召回改走真实六通道而非 2-gram |
 | 后端自动拉起（进程分离） | ✅ | `backend_launcher.dart` 探活 `/v1/health` → `Process.start(..., detached)` 拉起 `python -m headless_server` → 轮询 30s；启动命令/目录存 `flutter_prefs.json`，「全量配置」页可改 |
 | 端到端验收脚本 | ✅ 全 PASS | `scripts/verify_headless.py`：临时目录隔离，验证 MCP 六工具、异步写入、全部 RPC（含此前 process 模式必失败的 4 个）、真实召回、导入、纠正、热重启换核后 MCP 仍可用 |
+| 后端随 Flutter 安装包部署 | ✅ 链路就绪（产物待构建） | `scripts/build_portable.py --headless` 生成 `backend_entry.py` + `super-brain-backend.spec`（excludes PySide6/keyring/psutil/ui.desktop），产物 `headless-server.exe`；`installer/build.ps1` 组装 `super_brain.exe` + `backend\`，`setup.iss` 安装后只启 Flutter；`backend_launcher.dart` 优先用安装目录 exe；一键脚本 `scripts/build_full_release.ps1`（`-InstallSdk` 可 clone Flutter stable）。见 ADR-022 |
+| Qt 隐藏调试入口 | ✅ 默认不加载 | `python -m ui.desktop` 是唯一入口；源码约 7,000 行 / 630 KB，真正开销在 PySide6 200–300MB，已排除出发行包；`-IncludeDebugConsole` 才额外打包。与后端互斥（Kùzu 单写者） |
+| 本机 SDK 事实 | ⚠ 无 Flutter SDK | C:/D: 全盘检索无 `flutter.bat` / `dart.exe`、无 `super_brain.exe`；环境变量 `FLUTTER_ROOT/DART_SDK/PUB_CACHE` 全空、PATH 无 flutter/dart。当前占用 8766 的是旧 `super-brain.exe`（Qt 桌面端，PID 12688），预览实例改用隔离数据 + 18766/7/8 |
 
 启动：`python -m ui.desktop`；改完代码重启：`powershell -File scripts/restart_frontend.ps1`。
 离屏整窗截图：`python scripts/desktop_screenshots.py` → `data/screenshots/`。

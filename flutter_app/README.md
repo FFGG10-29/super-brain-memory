@@ -59,9 +59,64 @@ powershell -ExecutionPolicy Bypass -File flutter_app\scripts\run_windows.ps1
 | **全量配置** | 后端 BrainConfig 全参数动态表单、预设、恢复出厂、Core Memory、MCP 配置复制、后端进程设置 |
 | 关于 | 架构说明 |
 
+## 发行包：后端随包部署
+
+**不能把 Python 塞进 `super_brain.exe` 内部**——Flutter 编译出来的是原生 Dart 二进制，
+里面没有 Python 解释器。可行的做法是「一个安装包、两个进程」：安装时把冻结好的后端
+一起部署到 `backend\`，Flutter 启动时自动拉起它。目标机器**不需要装 Python、PySide6
+或任何依赖**。
+
+```
+{app}\
+  super_brain.exe              ← 快捷方式只指向它（双击即启动）
+  flutter_windows.dll, data\
+  backend\
+    headless-server.exe        ← 冻结后端（无 GUI、无 Qt）
+    headless-server-cli.exe    ← 排障用（--self-check / --probe-models）
+    _internal\
+```
+
+`BackendLauncher.resolveDefaults()` 的优先级：
+① 用户显式配置 → ② 安装目录 `backend/headless-server.exe` → ③ 开发态
+`.venv\Scripts\python.exe -m headless_server` → ④ PATH 上的 python。
+后端 exe 分支的启动参数必须为空（旧偏好里的 `-m headless_server` 会被自动忽略）。
+
+一键构建（需要 Python venv + Inno Setup；没有 Flutter SDK 就加 `-InstallSdk`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_full_release.ps1 -FlutterSdk 'D:\flutter' -InstallSdk -Launch
+```
+
+分步：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_portable.py --headless
+.\.venv\Scripts\python.exe -m PyInstaller super-brain-backend.spec --noconfirm
+.\.venv\Scripts\python.exe scripts\build_portable.py --trim dist\super-brain-backend
+powershell -ExecutionPolicy Bypass -File flutter_app\scripts\build_windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts\installer\build.ps1
+ISCC.exe scripts\installer\setup.iss
+```
+
+> 本机当前**没有 Flutter SDK**（C:/D: 全盘检索无 `flutter.bat` / `dart.exe`），
+> 所以 `super_brain.exe` 还编译不出来。装好 SDK 后跑上面的一键脚本即可。
+> 在那之前可以看同源数据的 WebGL 星云页：启动后端后打开 `http://127.0.0.1:8768/`。
+
+## 进程模型（澄清「谁是主进程」）
+
+| 形态 | 主进程 | UI 进程 | 说明 |
+|---|---|---|---|
+| 旧 v2.2 | **PySide6 桌面进程**（`super-brain.exe`） | 同一个进程 | UI 同时持有 `build_app()` 六引擎、8766 网关、托盘、自启；没有独立后端 |
+| 现在 v3.1 | **无头后端 `headless_server`** | **Flutter `super_brain.exe`**（另一进程） | 后端唯一持有六引擎；Flutter 只是 WS 客户端，并负责探活/拉起后端 |
+| 可选调试入口 | Qt 桌面进程 | 自身 | `python -m ui.desktop` 显式调用才启动；与后端互斥（Kùzu 单写者） |
+
+Qt 代码约 **7,000 行 / 630 KB 源码**，但真正占体积的是 `PySide6-Essentials`（200–300 MB）。
+默认发行包用 `--headless` 模板把它 `excludes` 掉，Qt 源码不进包，运行时也完全不加载；
+只有传 `-IncludeDebugConsole` 才会额外部署一份源码 + Python 运行时供排障。
+
 ## 与 Qt 前端的关系
 
-Qt 前端 `ui/desktop/` 目前**仍保留**作为功能兜底与对照。按 ADR-021 的约定，
+Qt 前端 `ui/desktop/` 目前**仍保留**作为隐藏调试入口与功能对照。按 ADR-021 的约定，
 需先在有 Flutter SDK 的机器上完成 `flutter analyze` + `flutter build windows` + 逐页验收，
 确认功能等价后再删除 `ui/desktop/` 并改造打包入口。后端已不依赖任何 Qt 模块
 （`core/user_config.py`、`gateway/bridge_launcher.py`、`brain/memory_service.py` 已下沉）。

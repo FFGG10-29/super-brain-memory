@@ -539,9 +539,7 @@ class _FullConfigPageState extends State<FullConfigPage> {
       'auto_start_backend': _autoStart,
       'backend_command': _proc['backend_command']!.text.trim(),
       'backend_dir': _proc['backend_dir']!.text.trim(),
-      'backend_args': _proc['backend_args']!.text.trim().isEmpty
-          ? '-m headless_server'
-          : _proc['backend_args']!.text.trim(),
+      'backend_args': _proc['backend_args']!.text.trim(),
     });
     setState(() => _message = '后端进程启动设置已保存（下次启动生效）');
   }
@@ -715,9 +713,9 @@ class _FullConfigPageState extends State<FullConfigPage> {
               onChanged: (value) => setState(() => _autoStart = value),
             ),
             for (final entry in <Map<String, String>>[
-              <String, String>{'key': 'backend_command', 'label': 'Python 命令（留空自动推断 venv）'},
-              <String, String>{'key': 'backend_dir', 'label': '工作目录（留空自动定位项目根）'},
-              <String, String>{'key': 'backend_args', 'label': '启动参数（默认 -m headless_server）'},
+              <String, String>{'key': 'backend_command', 'label': '后端命令（留空优先用安装包内 backend\\headless-server.exe）'},
+              <String, String>{'key': 'backend_dir', 'label': '工作目录（留空自动定位项目根 / 安装目录）'},
+              <String, String>{'key': 'backend_args', 'label': '启动参数（留空自动推断；exe 模式必须留空）'},
             ])
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 3),
