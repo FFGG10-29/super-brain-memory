@@ -125,6 +125,7 @@ class V3Daemon:
         use_llm: bool = True,
         worker_mode: str = "thread",
         auto_start: bool = False,
+        app: Any | None = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -138,7 +139,9 @@ class V3Daemon:
         self.hub = WebSocketHub(port=ws_port)
         self.rpc = RpcHandler(self)
         self.hub.rpc = self.rpc
-        self.app = None
+        # 无头后端可注入外部 build_app()：MCP 网关与 v3 Worker 共用同一份六引擎，
+        # 保证 Kùzu 单写者 + 同一 SQLite 主库（数据目录天然统一）。
+        self.app = app
         self.worker: V3Worker | None = None
         self.supervisor: ProcessSupervisor | None = None
         self._use_llm = use_llm
@@ -170,7 +173,7 @@ class V3Daemon:
         if restored:
             self.hub.broadcast({"type": "reconciled", "count": restored})
         if self.worker_mode == "thread":
-            self.app = build_app(self._config)
+            self.app = self.app or build_app(self._config)
             self.worker = V3Worker(self.inbox, self.alarm, self.app, hub=self.hub,
                                    use_llm=self._use_llm)
             self._worker_thread = threading.Thread(target=self.worker.run, name="v3-worker", daemon=True)

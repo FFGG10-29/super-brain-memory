@@ -17,10 +17,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from v3.rpc_ext import RpcExtension
+
 __all__ = ["RpcHandler"]
 
 
-class RpcHandler:
+class RpcHandler(RpcExtension):
     def __init__(self, daemon: Any) -> None:
         self._daemon = daemon
 
@@ -48,6 +50,9 @@ class RpcHandler:
         return self._daemon.memories(limit=int(limit))
 
     def _recall(self, q: str = "", limit: int = 8, **_: Any) -> dict[str, Any]:
+        # 无头后端（thread 模式）走真实六通道召回；process 模式退回只读投影的轻量召回
+        if self._daemon.app is not None:
+            return self._svc.recall(str(q), limit=int(limit))
         return self._daemon.recall(str(q), limit=int(limit))
 
     def _health(self, **_: Any) -> dict[str, Any]:
@@ -169,7 +174,7 @@ class RpcHandler:
         return {"sections": sections, "client": self._daemon.client_config()}
 
     def _config_set(self, patches: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
-        from ui.desktop.user_config import apply_overrides, save_overrides  # noqa: PLC0415
+        from core.user_config import apply_overrides, save_overrides  # noqa: PLC0415
 
         patch = patches or {}
         merged = save_overrides(patch)
@@ -185,6 +190,10 @@ class RpcHandler:
         daemon = self._daemon
         if daemon.worker_mode != "thread" or daemon.app is None:
             return {"ok": False, "message": "进程分离模式请重启 Windows 服务"}
+        # 无头后端：MCP 网关与 v3 Worker 共用同一 app，必须整体换核，不能只换 daemon.app
+        hook = getattr(daemon, "restart_kernel", None)
+        if hook is not None:
+            return hook()
         from main import build_app  # noqa: PLC0415
 
         old = daemon.app
