@@ -48,7 +48,7 @@
 certutil -hashfile SuperBrainSetup.exe SHA256
 ```
 
-应与 `SuperBrainSetup.exe.sha256` 一致（见 assets）。
+应与 Release 里的 `SuperBrainSetup.sha256` 一致（逐文件比对，GitHub 也会在资产详情页显示 digest）。
 
 ## 已知事项
 
