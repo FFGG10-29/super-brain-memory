@@ -18,6 +18,11 @@ OutputBaseFilename=SuperBrainSetup
 ; 包体略大几十 MB，换来压缩时间减半且 MCP 服务可保持在线。
 Compression=lzma2/normal
 SolidCompression=no
+; 全量包（含 3.3GB 模型权重）压缩后 >4.2GB，Inno 单文件 Setup.exe 不支持，
+; 必须开磁盘分卷：输出 SuperBrainSetup.exe + SuperBrainSetup-1.bin / -2.bin …
+; 每卷 1.9GB，正好低于 GitHub Release 单资源 2GB 的限制。
+DiskSpanning=yes
+DiskSliceSize=1900000000
 WizardStyle=modern
 ; 沿用旧 Qt/Python 前端的品牌图标（多尺寸 16~256）
 SetupIconFile=..\..\ui\desktop\assets\app.ico
