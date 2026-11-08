@@ -187,7 +187,10 @@ class HTTPAdapter:
             self._mcp_sessions[session] = time.time()
             result = {
                 "protocolVersion": body.get("params", {}).get("protocolVersion") or "2024-11-05",
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
+                },
                 "serverInfo": {"name": "super-brain-memory", "version": "2.2"},
             }
             return 200, {"jsonrpc": "2.0", "id": request_id, "result": result}, {"Mcp-Session-Id": session}
@@ -197,6 +200,24 @@ class HTTPAdapter:
 
         if action == "ping":
             return 200, {"jsonrpc": "2.0", "id": request_id, "result": {}}
+
+        # MCP resources：只读 View 投影，Agent 可直接挂进上下文（等价于 DSH 的 View）
+        if action == "resources/list":
+            from gateway.tool_catalog import resource_list
+            return 200, {"jsonrpc": "2.0", "id": request_id,
+                         "result": {"resources": resource_list()}}
+
+        if action == "resources/templates/list":
+            return 200, {"jsonrpc": "2.0", "id": request_id,
+                         "result": {"resourceTemplates": []}}
+
+        if action == "resources/read":
+            from gateway.tool_catalog import resource_read
+            uri = str(params.get("uri") or "")
+            payload = resource_read(uri)
+            if "error" in payload:
+                return self._mcp_error(request_id, -32602, payload["error"])
+            return 200, {"jsonrpc": "2.0", "id": request_id, "result": payload}
 
         if action == "tools/list":
             return 200, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": MCP_TOOL_DEFS}}

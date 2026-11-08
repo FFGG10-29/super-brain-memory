@@ -8,8 +8,17 @@ import 'prefs.dart';
 final ValueNotifier<String> backendStatus = ValueNotifier<String>('后端探活中…');
 
 /// 进程分离：Flutter 只做 UI，后端是独立的 Python 进程。
-/// 启动时先探活 /v1/health；没起来才按配置拉起并轮询等待，之后不再管它（detached 常驻）。
+///
+/// 生命周期约定：
+/// - 启动时创建 Job Object（见 win32_job.dart），后端子进程自动入组；
+///   前端被强杀时由系统一并终止后端，绝不残留。
+/// - 只记录「本实例亲自拉起」的 PID。若探活发现后端已在跑（别的实例/手动启动），
+///   托盘「完全退出」不会去杀它，避免误伤。
 class BackendLauncher {
+  static int? ownedPid;
+  static String ownedHost = '127.0.0.1';
+  static int ownedHttpPort = 8768;
+
   static Future<bool> isAlive(String host, int port) async {
     HttpClient? client;
     try {
@@ -69,12 +78,14 @@ class BackendLauncher {
   }
 
   static Future<String> ensureRunning({required String host, required int httpPort}) async {
+    ownedHost = host;
+    ownedHttpPort = httpPort;
     if (await isAlive(host, httpPort)) {
       backendStatus.value = '后端已运行（独立进程）';
       return backendStatus.value;
     }
     if (!Prefs.get<bool>('auto_start_backend', true)) {
-      backendStatus.value = '自动拉起已关闭；请手动运行 backend\headless-server.exe 或 python -m headless_server';
+      backendStatus.value = '自动拉起已关闭；请手动运行 backend\\headless-server.exe 或 python -m headless_server';
       return backendStatus.value;
     }
     final defaults = resolveDefaults();
@@ -85,12 +96,13 @@ class BackendLauncher {
     if (command.toLowerCase().endsWith('.exe') && args.contains('-m ')) args = '';
     backendStatus.value = '正在拉起后端…';
     try {
-      await Process.start(
+      final process = await Process.start(
         command, _splitArgs(args),
         workingDirectory: directory,
         mode: ProcessStartMode.detached,
         includeParentEnvironment: true,
       );
+      ownedPid = process.pid;
     } catch (error) {
       backendStatus.value = '后端拉起失败：$error';
       return backendStatus.value;
@@ -104,6 +116,28 @@ class BackendLauncher {
     }
     backendStatus.value = '后端启动超时 30s；请在设置页检查启动命令与目录';
     return backendStatus.value;
+  }
+
+  /// 托盘「完全退出」：优雅停机 RPC 已先行发出，这里等最多 3 秒确认端口关闭；
+  /// 仍未退出则按 PID 兜底终止（只针对本实例亲自拉起的进程）。
+  static Future<void> stopOwned() async {
+    final pid = ownedPid;
+    if (pid == null) return;
+    for (var attempt = 0; attempt < 6; attempt++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (!await isAlive(ownedHost, ownedHttpPort)) {
+        ownedPid = null;
+        backendStatus.value = '后端已优雅退出';
+        return;
+      }
+    }
+    try {
+      Process.killPid(pid);
+      backendStatus.value = '后端已按 PID 兜底终止';
+    } catch (_) {
+      backendStatus.value = '后端终止失败，请检查任务管理器';
+    }
+    ownedPid = null;
   }
 
   static String _or(String value, String fallback) => value.trim().isEmpty ? fallback : value.trim();

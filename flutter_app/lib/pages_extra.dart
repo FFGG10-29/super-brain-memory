@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import 'backend_launcher.dart';
 import 'brain_client.dart';
+import 'config_docs.dart';
 import 'pages.dart' show PageFrame;
 import 'prefs.dart';
 
@@ -41,8 +42,10 @@ Widget _muted(String text) => Text(text, style: const TextStyle(color: _hint, fo
 // 1. 记忆检查器 + 用户控制闭环（纠正 / 遗忘 / 封存 / 敏感 / 审计）
 // ─────────────────────────────────────────────────────────────────────────────
 class MemoryInspectorPage extends StatefulWidget {
-  const MemoryInspectorPage({super.key, required this.client});
+  /// [initialId] 由 2D 检查器 / 召回归因面板跳转时传入，实现跨页选中联动。
+  const MemoryInspectorPage({super.key, required this.client, this.initialId = ''});
   final BrainClient client;
+  final String initialId;
 
   @override
   State<MemoryInspectorPage> createState() => _MemoryInspectorPageState();
@@ -61,6 +64,7 @@ class _MemoryInspectorPageState extends State<MemoryInspectorPage> {
   void initState() {
     super.initState();
     _load();
+    if (widget.initialId.isNotEmpty) unawaited(_select(widget.initialId));
   }
 
   @override
@@ -467,6 +471,120 @@ class _FullConfigPageState extends State<FullConfigPage> {
   String _preset = 'balanced';
   String _message = '修改任意参数后点「保存配置」；storage/model/merge 需重启内核生效';
   bool _autoStart = true;
+  bool _showAdvanced = false;
+  int _configTab = 0;
+
+  /// 星云外观唯一真源：flutter_prefs.json 的 nebula 段。
+  /// 设置页已不再放第二套滑块，星云页的悬浮开关也写这里。
+  Map<String, dynamic> _neb() {
+    final value = Prefs.load()['nebula'];
+    return value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
+  }
+
+  void _setNeb(String key, Object value) {
+    final next = _neb()..[key] = value;
+    Prefs.save(<String, dynamic>{'nebula': next});
+    setState(() => _message = '星云外观已保存（切到星云页即生效）');
+  }
+
+  double _nebNum(String key, double fallback) => (_neb()[key] as num?)?.toDouble() ?? fallback;
+  bool _nebBool(String key, bool fallback) => _neb()[key] as bool? ?? fallback;
+
+  /// MCP 配置复制：顶部快捷入口与底部说明共用同一份逻辑。
+  Future<void> _copyMcp() async {
+    final url = _mcp['mcp_url']?.toString() ?? 'http://127.0.0.1:8766/mcp';
+    final token = _localToken();
+    final payload = jsonEncode(<String, dynamic>{
+      'mcpServers': <String, dynamic>{
+        'super-brain-memory': <String, dynamic>{
+          'type': 'streamable-http', 'url': url,
+          'headers': <String, dynamic>{
+            'X-Super-Brain-Bridge': token.isEmpty ? '<桥接令牌>' : token,
+          },
+        },
+      },
+    });
+    await Clipboard.setData(ClipboardData(text: payload));
+    if (mounted) {
+      setState(() => _message = token.isEmpty
+          ? '已复制 JSON；后端未在线，请把 <桥接令牌> 换成 mcp_token.txt 里的值'
+          : '已复制完整可用 MCP JSON（含本机令牌 + X-Super-Brain-Bridge 头），任意 Agent 可直接粘贴');
+    }
+  }
+
+
+  Widget _cfgTabButton(int index, String label, IconData icon) => ChoiceChip(
+        label: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+          Icon(icon, size: 13,
+              color: _configTab == index ? const Color(0xFF06121F) : _accent),
+          const SizedBox(width: 5),
+          Text(label,
+              style: TextStyle(
+                fontSize: 11,
+                color: _configTab == index
+                    ? const Color(0xFF06121F)
+                    : const Color(0xFFBFD8F5),
+              )),
+        ]),
+        selected: _configTab == index,
+        selectedColor: const Color(0xFF4FC3F7),
+        backgroundColor: const Color(0xFF0E1B2D),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        onSelected: (_) => setState(() => _configTab = index),
+      );
+
+  Widget _nebSlider(String label, String key, double fallback, double min, double max) => SizedBox(
+        width: 300,
+        child: Row(children: <Widget>[
+          SizedBox(width: 78, child: Text(label, style: const TextStyle(color: _hint, fontSize: 11))),
+          Expanded(
+            child: Slider(
+              value: _nebNum(key, fallback).clamp(min, max).toDouble(),
+              min: min,
+              max: max,
+              onChanged: (value) => _setNeb(key, value),
+            ),
+          ),
+          SizedBox(
+            width: 52,
+            child: Text(
+              _nebNum(key, fallback) >= 1
+                  ? _nebNum(key, fallback).toStringAsFixed(0)
+                  : _nebNum(key, fallback).toStringAsFixed(5),
+              style: const TextStyle(color: _accent, fontSize: 10),
+            ),
+          ),
+        ]),
+      );
+
+  Widget _nebToggle(String label, String key, bool fallback) => SizedBox(
+        width: 150,
+        child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+          Switch(
+            value: _nebBool(key, fallback),
+            onChanged: (value) => _setNeb(key, value),
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          Text(label, style: const TextStyle(color: _hint, fontSize: 11)),
+        ]),
+      );
+
+  /// 令牌只从本机文件读取，绝不经过 RPC / 网络响应。
+  String _localToken() {
+    try {
+      final base = Platform.environment['APPDATA'];
+      if (base == null) return '';
+      return File('$base${Platform.pathSeparator}super-brain${Platform.pathSeparator}mcp_token.txt')
+          .readAsStringSync()
+          .trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  String _maskedToken(String token) => token.isEmpty
+      ? '未找到（请检查 mcp_token.txt）'
+      : '${token.substring(0, token.length > 6 ? 6 : token.length)}…（本机读取，不经 RPC）';
 
   @override
   void initState() {
@@ -546,17 +664,24 @@ class _FullConfigPageState extends State<FullConfigPage> {
 
   @override
   Widget build(BuildContext context) {
-    final cards = <Widget>[];
+    final cards = <String, Widget>{};
     _sections.forEach((sectionName, rawSection) {
       if (rawSection is! Map<String, dynamic>) return;
       final fields = <Widget>[];
       rawSection.forEach((fieldName, value) {
         final key = '$sectionName.$fieldName';
+        final tip = configTooltip(sectionName, fieldName);
         if (value is bool) {
           fields.add(SwitchListTile(
             dense: true,
             value: (_draft[sectionName]?[fieldName] as bool?) ?? value,
-            title: Text(fieldName, style: const TextStyle(color: Colors.white, fontSize: 11)),
+            title: configFieldLabel(sectionName, fieldName, color: Colors.white),
+            subtitle: fieldHint(fieldName).isEmpty
+                ? null
+                : Tooltip(
+                    message: tip,
+                    child: Text(fieldHint(fieldName), maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Color(0xFF6D88A8), fontSize: 10))),
             onChanged: (next) {
               _put(sectionName, fieldName.toString(), next);
               setState(() {});
@@ -567,21 +692,25 @@ class _FullConfigPageState extends State<FullConfigPage> {
           fields.add(Padding(
             padding: const EdgeInsets.symmetric(vertical: 3),
             child: Row(children: <Widget>[
-              SizedBox(width: 190, child: Text(fieldName, style: const TextStyle(color: _hint, fontSize: 11))),
+              SizedBox(width: 190, child: configFieldLabel(sectionName, fieldName)),
               Expanded(
-                child: TextField(
-                  controller: controller,
-                  style: const TextStyle(color: Colors.white, fontSize: 11),
-                  decoration: const InputDecoration(isDense: true, border: OutlineInputBorder()),
-                  onChanged: (text) {
-                    if (value is int) {
-                      _put(sectionName, fieldName.toString(), int.tryParse(text) ?? value);
-                    } else if (value is double) {
-                      _put(sectionName, fieldName.toString(), double.tryParse(text) ?? value);
-                    } else {
-                      _put(sectionName, fieldName.toString(), text);
-                    }
-                  },
+                child: Tooltip(
+                  message: tip,
+                  waitDuration: const Duration(milliseconds: 250),
+                  child: TextField(
+                    controller: controller,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                    decoration: const InputDecoration(isDense: true, border: OutlineInputBorder()),
+                    onChanged: (text) {
+                      if (value is int) {
+                        _put(sectionName, fieldName.toString(), int.tryParse(text) ?? value);
+                      } else if (value is double) {
+                        _put(sectionName, fieldName.toString(), double.tryParse(text) ?? value);
+                      } else {
+                        _put(sectionName, fieldName.toString(), text);
+                      }
+                    },
+                  ),
                 ),
               ),
             ]),
@@ -589,25 +718,91 @@ class _FullConfigPageState extends State<FullConfigPage> {
         } else {
           fields.add(Padding(
             padding: const EdgeInsets.symmetric(vertical: 3),
-            child: _muted('$fieldName = ${jsonEncode(value)}（复杂结构，只读）'),
+            child: Tooltip(
+              message: tip,
+              child: _muted('${fieldLabel(fieldName)} = ${jsonEncode(value)}（复杂结构，只读）'),
+            ),
           ));
         }
       });
-      cards.add(Padding(
+      cards[sectionName] = Padding(
         padding: const EdgeInsets.only(bottom: 12),
         child: _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
-          _title(sectionName),
+          configSectionTitle(sectionName),
           ...fields,
         ])),
-      ));
+      );
     });
+    // 常用分组固定置顶展开；其余收进「高级参数」默认折叠。
+    const commonOrder = <String>['gateway', 'activation', 'ui', 'model', 'recall'];
+    final commonCards = <Widget>[
+      for (final key in commonOrder)
+        if (cards.containsKey(key)) cards[key]!,
+    ];
+    final advancedCards = <Widget>[
+      for (final entry in cards.entries)
+        if (!commonOrder.contains(entry.key)) entry.value,
+    ];
 
     return PageFrame(
       title: '全量配置',
-      subtitle: '后端 BrainConfig 全参数（差异补丁存 %APPDATA%/super-brain/config.json）· 共 ${_sections.length} 组',
+      subtitle: '后端 BrainConfig 全参数（差异补丁存 %APPDATA%/super-brain/config.json）· 共 ${_sections.length} 组 · 鼠标悬停任意参数名可查看它管什么',
       child: SingleChildScrollView(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
-          _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+          _Card(child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(children: <Widget>[
+              _cfgTabButton(0, '接入与启动', Icons.link),
+              const SizedBox(width: 8),
+              _cfgTabButton(1, '外观与常用', Icons.tune),
+              const SizedBox(width: 8),
+              _cfgTabButton(2, '高级参数', Icons.expand_more),
+              const Spacer(),
+              const Text('三类子标签 · 常用置顶 · 高级默认折叠',
+                  style: TextStyle(color: _hint, fontSize: 10)),
+            ]),
+          )),
+          const SizedBox(height: 12),
+          // ── 第一屏：MCP 接入（不用再翻到页面底部找）──────────────────
+          if (_configTab == 0) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+            _title('MCP 接入 · 一键复制给任意 Agent'),
+            _muted('Streamable HTTP：${_mcp['mcp_url'] ?? 'http://127.0.0.1:8766/mcp'}'),
+            const Text('鉴权头必须恰好是 X-Super-Brain-Bridge: <令牌>，不能加 Bearer 前缀',
+                style: TextStyle(color: Color(0xFF7FE9FF), fontSize: 11)),
+            SelectableText('本机令牌：${_maskedToken(_localToken())}',
+                style: const TextStyle(color: _hint, fontSize: 11)),
+            const SizedBox(height: 8),
+            Wrap(spacing: 10, crossAxisAlignment: WrapCrossAlignment.center, children: <Widget>[
+              FilledButton.icon(
+                onPressed: _copyMcp,
+                icon: const Icon(Icons.content_copy, size: 14),
+                label: const Text('复制 MCP 配置（含真实令牌）', style: TextStyle(fontSize: 11)),
+              ),
+              _muted('粘贴到 Agent 的 mcp.json 即可；完整握手说明见页面底部'),
+            ]),
+          ])),
+          if (_configTab == 0) const SizedBox(height: 12),
+          // ── 第一屏：星云外观（唯一入口，与星云页开关同源）────────────
+          if (_configTab == 1) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+            _title('常用设置 · 星云外观（唯一入口 · 立即生效）'),
+            _muted('与星云页左上角开关写同一份配置；「设置」页不再重复放一套。'),
+            const SizedBox(height: 6),
+            Wrap(spacing: 12, runSpacing: 2, children: <Widget>[
+              _nebSlider('焦距', 'focal_length', 900, 400, 1600),
+              _nebSlider('星点大小', 'star_size', 3.2, 1, 8),
+              _nebSlider('自转速度', 'spin_speed', 0.00035, 0.00005, 0.002),
+            ]),
+            Wrap(spacing: 2, children: <Widget>[
+              _nebToggle('辉光', 'bloom', true),
+              _nebToggle('自动旋转', 'auto_rotate', true),
+              _nebToggle('突触连线', 'show_edges', false),
+              _nebToggle('边缘黑洞', 'show_black_hole', true),
+              _nebToggle('中央中枢', 'show_core', true),
+              _nebToggle('呼吸闪烁', 'twinkle', true),
+            ]),
+          ])),
+          if (_configTab == 1) const SizedBox(height: 12),
+          if (_configTab == 0) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
             _title('预设与内核'),
             Wrap(spacing: 10, crossAxisAlignment: WrapCrossAlignment.center, children: <Widget>[
               if (_presets.isNotEmpty)
@@ -615,7 +810,9 @@ class _FullConfigPageState extends State<FullConfigPage> {
                   value: _presets.contains(_preset) ? _preset : null,
                   dropdownColor: const Color(0xFF0A1424),
                   style: const TextStyle(color: Colors.white, fontSize: 11),
-                  items: _presets.map((name) => DropdownMenuItem<String>(value: name, child: Text(name))).toList(),
+                  items: _presets
+                      .map((name) => DropdownMenuItem<String>(value: name, child: Text(presetLabel(name))))
+                      .toList(),
                   onChanged: (value) => setState(() => _preset = value ?? _preset),
                 )
               else
@@ -644,9 +841,28 @@ class _FullConfigPageState extends State<FullConfigPage> {
             const SizedBox(height: 8),
             _muted(_message),
           ])),
-          const SizedBox(height: 12),
-          ...cards,
-          _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+          if (_configTab == 0) const SizedBox(height: 12),
+          if (_configTab == 1) _title('常用配置（网关 / 星云激活 / 外观 / 模型 / 召回）'),
+          if (_configTab == 1) ...commonCards,
+          if (_configTab == 2) const SizedBox(height: 4),
+          if (_configTab == 2) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+            InkWell(
+              onTap: () => setState(() => _showAdvanced = !_showAdvanced),
+              child: Row(children: <Widget>[
+                Icon(_showAdvanced ? Icons.expand_more : Icons.chevron_right,
+                    color: _accent, size: 18),
+                const SizedBox(width: 6),
+                Text('高级参数（${advancedCards.length} 组 · 存储 / 合并 / 遗忘 / 分层 / 丘脑 / 情感 / 同步）',
+                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                const Spacer(),
+                Text(_showAdvanced ? '点击收起' : '点击展开',
+                    style: const TextStyle(color: _hint, fontSize: 10)),
+              ]),
+            ),
+            if (_showAdvanced) ...advancedCards,
+          ])),
+          if (_configTab == 2) const SizedBox(height: 12),
+          if (_configTab == 2) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
             _title('Core Memory（可编辑核心记忆块）'),
             for (final entry in _coreCtl.entries)
               Padding(
@@ -676,35 +892,26 @@ class _FullConfigPageState extends State<FullConfigPage> {
               child: const Text('保存 Core Memory', style: TextStyle(fontSize: 11)),
             ),
           ])),
-          const SizedBox(height: 12),
-          _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
-            _title('MCP 接入（所有 Agent 共享同一份记忆）'),
-            _muted('Streamable HTTP：${_mcp['mcp_url'] ?? '—'}'),
-            _muted('鉴权头：${_mcp['bridge_header'] ?? 'X-Super-Brain-Bridge'}'),
+          if (_configTab == 0) const SizedBox(height: 12),
+          if (_configTab == 0) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+            _title('MCP 接入 · 完整说明与握手顺序'),
+            _muted('Streamable HTTP：${_mcp['mcp_url'] ?? 'http://127.0.0.1:8766/mcp'}'),
+            const Text('鉴权头必须恰好是 X-Super-Brain-Bridge: <令牌>，不能加 Bearer 前缀',
+                style: TextStyle(color: Color(0xFF7FE9FF), fontSize: 11)),
+            SelectableText('本机令牌：${_maskedToken(_localToken())}',
+                style: const TextStyle(color: _hint, fontSize: 11)),
+            _muted('令牌位置：${_mcp['token_path'] ?? '%APPDATA%\\super-brain\\mcp_token.txt'}（轮换后需同步更新）'),
+            _muted('握手顺序：initialize → notifications/initialized → 带 Mcp-Session-Id 调 tools/call'),
             SelectableText('stdio 启动器：${_mcp['stdio_launcher'] ?? '—'}',
                 style: const TextStyle(color: _hint, fontSize: 11)),
             const SizedBox(height: 8),
             OutlinedButton(
-              onPressed: () async {
-                final url = _mcp['mcp_url']?.toString() ?? 'http://127.0.0.1:8766/mcp';
-                final payload = jsonEncode(<String, dynamic>{
-                  'mcpServers': <String, dynamic>{
-                    'super-brain-memory': <String, dynamic>{
-                      'type': 'streamable-http', 'url': url,
-                      'headers': <String, dynamic>{'X-Super-Brain-Bridge': '<桥接令牌>'},
-                    },
-                  },
-                });
-                await Clipboard.setData(ClipboardData(text: payload));
-                if (mounted) {
-                  setState(() => _message = '已复制 MCP JSON；请把 <桥接令牌> 换成 mcp_token.txt 中的令牌');
-                }
-              },
-              child: const Text('复制 MCP 配置', style: TextStyle(fontSize: 11)),
+              onPressed: _copyMcp,
+              child: const Text('复制 MCP 配置（与顶部同一入口）', style: TextStyle(fontSize: 11)),
             ),
           ])),
-          const SizedBox(height: 12),
-          _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+          if (_configTab == 0) const SizedBox(height: 12),
+          if (_configTab == 0) _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
             _title('后端进程（进程分离）'),
             SwitchListTile(
               dense: true,

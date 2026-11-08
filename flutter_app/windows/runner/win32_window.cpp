@@ -179,6 +179,28 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
+    // Tray-resident: closing hides the window; the memory service / MCP
+    // gateway keep running in the backend process.
+    case WM_CLOSE:
+      if (hide_on_close_) {
+        ::ShowWindow(hwnd, SW_HIDE);
+        return 0;
+      }
+      break;
+
+    // Dedicated message from the Dart tray menu "Quit", bypassing the hide
+    // interception above.
+    case WM_APP + 2:
+      hide_on_close_ = false;
+      ::DestroyWindow(hwnd);
+      return 0;
+
+    // Toggle hide-on-close when the Dart side enables/disables the tray
+    // (wparam != 0 means enabled).
+    case WM_APP + 3:
+      hide_on_close_ = (wparam != 0);
+      return 0;
+
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();

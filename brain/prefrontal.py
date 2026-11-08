@@ -39,6 +39,16 @@ __all__ = ["Prefrontal", "RecallHit"]
 _MS_PER_DAY = 86_400_000.0
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,30}|[《「\"]([^》」\"]{2,20})[》」\"]")
 _ARCHIVED = "archive"
+_INJECT_TOP_N = 3
+_INJECT_SUMMARY_CHARS = 120
+
+
+def _summarize(text: str) -> str:
+    """注入文本只给摘要：长记忆截断，避免 Agent 拿到原文后自由发散。"""
+    value = " ".join((text or "").split())
+    if len(value) <= _INJECT_SUMMARY_CHARS:
+        return value
+    return value[:_INJECT_SUMMARY_CHARS].rstrip() + "…（摘要）"
 
 
 def _now_ms() -> int:
@@ -308,15 +318,24 @@ class Prefrontal:
 
     # ── 收敛注入 ──────────────────────────────────────────────────────────
     def inject(self, hits: list[RecallHit], *, agent_id: str) -> str:
-        """把召回结果压成可注入上下文的文本（语气受好感度与冷静期影响）。"""
+        """收敛注入：只给 Top 3 摘要 + 一条抑制发散的执行约束。
+
+        前额叶的职责不是把记忆原文全倒给 Agent，而是给出最小充分上下文并
+        管住输出：否则 Agent 会复述原文、自由联想、越答越远（发散）。
+        `recall_memory` 的 hits 仍返回全文，供检查器/UI 查看。
+        """
         if not hits:
             return ""
         tone = self._amygdala.inject_tone(agent_id)
-        lines = [f"【记忆注入】{tone}"]
-        for index, hit in enumerate(hits, start=1):
+        lines = [
+            f"【记忆注入】{tone}",
+            "【执行约束】以下仅 3 条已核验记忆，据此收敛作答：停止发散、不展开无关联想、"
+            "不复述记忆原文；未命中的细节按未知处理，禁止编造。",
+        ]
+        for index, hit in enumerate(hits[:_INJECT_TOP_N], start=1):
             neuron = hit.neuron
             mood = f"P{neuron.pad.p:+.1f}/A{neuron.pad.a:+.1f}/D{neuron.pad.d:+.1f}"
             lines.append(
-                f"{index}. [{neuron.memory_type}/{neuron.tier} {mood}] {neuron.content}"
+                f"{index}. [{neuron.memory_type}/{neuron.tier} {mood}] {_summarize(neuron.content)}"
             )
         return "\n".join(lines)

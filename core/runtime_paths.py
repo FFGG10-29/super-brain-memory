@@ -59,8 +59,21 @@ def user_dir() -> Path:
     return path
 
 
+def _data_pointer() -> str:
+    """Flutter「数据目录一键迁移」写下的目标；重启后端后生效。
+
+    优先级低于 SUPER_BRAIN_DATA_DIR 环境变量（离线验证/排障要能随时覆盖）。
+    文件放在 user_dir()，与 core.desktop_features._pointer_path() 严格同源。
+    """
+    try:
+        payload = json.loads((user_dir() / "data_pointer.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(payload.get("path") or "") if isinstance(payload, dict) else ""
+
+
 def data_dir() -> Path:
-    override = os.environ.get("SUPER_BRAIN_DATA_DIR")
+    override = os.environ.get("SUPER_BRAIN_DATA_DIR") or _data_pointer()
     if override:
         path = Path(override)
     elif is_frozen():

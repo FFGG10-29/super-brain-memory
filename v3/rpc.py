@@ -46,14 +46,26 @@ class RpcHandler(RpcExtension):
     def _graph(self, **_: Any) -> dict[str, Any]:
         return self._daemon.graph()
 
-    def _memories(self, limit: int = 200, **_: Any) -> list[dict[str, Any]]:
-        return self._daemon.memories(limit=int(limit))
+    def _graph_chunk(self, offset: int = 0, limit: int = 500, **_: Any) -> dict[str, Any]:
+        """全量渲染：后端每批推 500 个轻量节点，前端边收边渲染。"""
+        return self._daemon.graph_chunk(offset=int(offset), limit=int(limit))
 
-    def _recall(self, q: str = "", limit: int = 8, **_: Any) -> dict[str, Any]:
-        # 无头后端（thread 模式）走真实六通道召回；process 模式退回只读投影的轻量召回
-        if self._daemon.app is not None:
+    def _memories(self, limit: int = 200, offset: int = 0, **_: Any) -> list[dict[str, Any]]:
+        return self._daemon.memories(limit=int(limit), offset=int(offset))
+
+    def _recall(self, q: str = "", limit: int = 8, deep: bool = False, **_: Any) -> dict[str, Any]:
+        """默认走只读投影的字符 2-gram 召回（毫秒级，前端点查询立刻有结果）。
+
+        deep=True 才走真实六通道（embedding / RRF / 精排），供「召回归因」页使用。
+        历史上该路径在重排/模型加载时会挂起 60-120s（见 DSH 项目档案
+        `super-brain-memory-mcp-x-super-brain-bridge...` 的 known recall-hang），
+        因此绝不能作为前端默认点击路径。
+        """
+        if deep and self._daemon.app is not None:
             return self._svc.recall(str(q), limit=int(limit))
-        return self._daemon.recall(str(q), limit=int(limit))
+        result = self._daemon.recall(str(q), limit=int(limit))
+        result["deep"] = False
+        return result
 
     def _health(self, **_: Any) -> dict[str, Any]:
         return self._daemon.health()

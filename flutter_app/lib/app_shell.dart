@@ -2,14 +2,19 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'analytics.dart';
 import 'backend_launcher.dart';
 import 'brain_client.dart';
+import 'context_pages.dart';
 import 'nebula_page.dart';
 import 'pages.dart';
 import 'pages_extra.dart';
 import 'prefs.dart';
+import 'system_features.dart';
+import 'system_gauges.dart';
+import 'win32.dart';
 
-/// LivingMemory 风格外壳：左侧十四页导航 + 顶栏（空间/搜索/导出/全屏）+ 底部状态栏。
+/// LivingMemory 风格外壳：左侧十八页导航 + 顶栏（空间/搜索/实时仪表/导出/全屏）+ 底部状态栏。
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -22,17 +27,30 @@ class _AppShellState extends State<AppShell> {
   final _nebulaKey = GlobalKey<NebulaPageState>();
   final TextEditingController _globalSearch = TextEditingController();
   Timer? _statusTimer;
+  StreamSubscription<Map<String, dynamic>>? _eventsSub;
+  bool _trayRequested = false;
 
   int _index = 0;
+  int _groupIndex = 0;
+  // 切页计数：只有当前页的 key 随之变化，达到「切过去就重新拉数据」的效果
+  int _pageEpoch = 0;
   bool _fullscreen = false;
   String _space = '全部';
+  String _inspectorTarget = '';
   List<String> _spaces = <String>['全部', '情感记忆'];
   Map<String, dynamic> _status = <String, dynamic>{};
+
+  static const int _nebulaIndex = 0;
+  static const int _timelineIndex = 13;
+  static const int _inspectorIndex = 12;
 
   static const List<Map<String, Object>> _nav = <Map<String, Object>>[
     <String, Object>{'name': '星云视图', 'icon': Icons.blur_on},
     <String, Object>{'name': '记忆管理', 'icon': Icons.memory},
     <String, Object>{'name': '召回测试', 'icon': Icons.search},
+    <String, Object>{'name': '硬件仪表', 'icon': Icons.speed},
+    <String, Object>{'name': 'PAD 认知分区', 'icon': Icons.scatter_plot_outlined},
+    <String, Object>{'name': '2D 语义环', 'icon': Icons.hub_outlined},
     <String, Object>{'name': '系统概览', 'icon': Icons.monitor_heart},
     <String, Object>{'name': '展示数据', 'icon': Icons.data_object},
     <String, Object>{'name': '模型配置', 'icon': Icons.smart_toy_outlined},
@@ -43,8 +61,36 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '事件时间轴', 'icon': Icons.timeline},
     <String, Object>{'name': '批量导入', 'icon': Icons.upload_file},
     <String, Object>{'name': '全量配置', 'icon': Icons.tune_outlined},
+    <String, Object>{'name': '桌面能力', 'icon': Icons.desktop_windows_outlined},
     <String, Object>{'name': '关于', 'icon': Icons.info_outline},
+    <String, Object>{'name': '上下文状态', 'icon': Icons.dashboard_outlined},
+    <String, Object>{'name': '运行时记忆', 'icon': Icons.article_outlined},
+    <String, Object>{'name': '项目档案', 'icon': Icons.folder_copy_outlined},
+    <String, Object>{'name': '记忆空间', 'icon': Icons.workspaces_outline},
+    <String, Object>{'name': '技能管理', 'icon': Icons.auto_awesome_outlined},
   ];
+
+  /// 主导航分组：左栏只显示 7 个入口，组内子页放到顶栏下方的子导航条。
+  /// 值仍是上面的全局页面索引，_index / IndexedStack / 各跳转常量完全不用改。
+  static const List<Map<String, Object>> _groups = <Map<String, Object>>[
+    <String, Object>{'name': '星云视图', 'icon': Icons.blur_on, 'pages': <int>[0]},
+    <String, Object>{'name': '记忆工作台', 'icon': Icons.memory, 'pages': <int>[1, 2, 14]},
+    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13]},
+    <String, Object>{'name': 'Agent 上下文', 'icon': Icons.psychology_outlined, 'pages': <int>[18, 19, 20, 21, 22]},
+    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9]},
+    <String, Object>{'name': '系统设置', 'icon': Icons.tune, 'pages': <int>[11, 15, 16, 10]},
+    <String, Object>{'name': '关于', 'icon': Icons.info_outline, 'pages': <int>[17]},
+  ];
+
+  static List<int> _pagesOfGroup(int group) =>
+      _groups[group.clamp(0, _groups.length - 1)]['pages']! as List<int>;
+
+  static int _groupOf(int page) {
+    for (var g = 0; g < _groups.length; g++) {
+      if (_pagesOfGroup(g).contains(page)) return g;
+    }
+    return 0;
+  }
 
   @override
   void initState() {
@@ -55,16 +101,77 @@ class _AppShellState extends State<AppShell> {
       httpPort: prefs['http_port'] as int? ?? 8768,
       wsPort: prefs['ws_port'] as int? ?? 8767,
     );
+    _subscribe();
     _client.connectEvents();
     _loadSpaces();
     _refreshStatus();
     _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) => _refreshStatus());
   }
 
+  void _subscribe() {
+    _eventsSub?.cancel();
+    _eventsSub = _client.events.listen(_onEvent);
+  }
+
+  void _onEvent(Map<String, dynamic> event) {
+    final type = event['type']?.toString() ?? '';
+    if (type == 'connected' && !_trayRequested) {
+      _trayRequested = true;
+      unawaited(_enableTray());
+      return;
+    }
+    if (type != 'tray_action') return;
+    final action = event['action']?.toString() ?? '';
+    trayStatus.value = '托盘动作：$action';
+    switch (action) {
+      case 'open':
+        Win32Window.show();
+      case 'nebula':
+        Win32Window.show();
+        _goTo(_nebulaIndex);
+      case 'timeline':
+        Win32Window.show();
+        _goTo(_timelineIndex);
+      case 'quit':
+        unawaited(_quitFully());
+    }
+  }
+
+  /// 托盘「完全退出」：先让后端优雅停机，再关前端窗口。
+  /// 顺序不能反——否则后端还占着 Kùzu/LMDB 锁，前端已消失就没人收尾了。
+  Future<void> _quitFully() async {
+    try {
+      await _client.setTray(false);
+    } catch (_) {}
+    await _client.shutdownBackend();
+    await BackendLauncher.stopOwned();
+    Win32Window.quit();
+  }
+
+  Future<void> _enableTray() async {
+    try {
+      final result = await _client.setTray(true);
+      final ok = result['ok'] == true || result['running'] == true;
+      // 「关窗隐藏到托盘」默认关闭：Windows 11 常把新托盘图标折叠到溢出区，
+      // 用户看不到图标时一旦隐藏窗口就再也找不回来（表现为「软件打不开」）。
+      // 只有用户在「设置 → 诊断」里确认托盘图标可见并手动开启，才启用隐藏模式。
+      final hideOnClose = Prefs.get<bool>('hide_on_close', false);
+      trayStatus.value = ok
+          ? (hideOnClose
+              ? '托盘已启用 · 关窗隐藏到托盘（可在设置 → 诊断关闭）'
+              : '托盘已启用 · 关窗直接退出（隐藏已关闭，避免找不到窗口）')
+          : '托盘不可用：${result['message'] ?? result['error'] ?? '未知原因'}';
+      Win32Window.setTrayMode(ok && hideOnClose);
+    } on Object catch (error) {
+      trayStatus.value = '托盘启用失败：$error';
+      Win32Window.setTrayMode(false);
+    }
+  }
+
   Future<void> _loadSpaces() async {
     final data = await _client.spaces();
     if (!mounted) return;
-    final tiers = (data['tiers'] as Map<String, dynamic>? ?? <String, dynamic>{}).keys.toList();
+    final tiers = (data['tiers'] as Map<String, dynamic>? ?? <String, dynamic>{}) .keys.toList();
     final spaces = <String>['全部', '情感记忆', ...tiers].toSet().toList();
     setState(() {
       _spaces = spaces;
@@ -82,8 +189,79 @@ class _AppShellState extends State<AppShell> {
     setState(() {
       _client = BrainClient(host: host, httpPort: httpPort, wsPort: wsPort);
       _index = 0;
+      _groupIndex = 0;
+      _trayRequested = false;
     });
+    _subscribe();
     _client.connectEvents();
+  }
+
+  /// 统一切页入口：递增 epoch，让目标页重建并重新拉数据。
+  /// 再次点击当前页也会刷新（手动强刷）。
+  void _goTo(int index) {
+    if (!mounted) return;
+    setState(() {
+      _index = index;
+      _groupIndex = _groupOf(index);
+      _pageEpoch++;
+    });
+  }
+
+  /// 只有「当前活跃页」的 key 带 epoch：切页时仅重建目标页，
+  /// 其余页面 State 保留（不丢滚动位置与输入内容）。
+  List<Widget> _pagesWithKeys() {
+    final pages = <Widget>[
+      NebulaPage(key: _nebulaKey, client: _client),
+      MemoriesPage(client: _client),
+      RecallAnalyticsPage(client: _client, onOpenMemory: _openMemory, onNebulaSearch: _nebulaSearch),
+      HardwarePage(client: _client),
+      PadAnalyticsPage(client: _client, onOpenMemory: _openMemory),
+      Graph2DPage(client: _client, onOpenMemory: _openMemory, onNebulaSearch: _nebulaSearch),
+      SystemPage(client: _client),
+      DataPage(client: _client),
+      ModelPage(client: _client),
+      InterfacePage(client: _client),
+      SyncPage(client: _client),
+      SettingsPage(client: _client, onReconnect: _reconnect),
+      MemoryInspectorPage(
+        key: ValueKey<String>(_inspectorTarget),
+        client: _client,
+        initialId: _inspectorTarget,
+      ),
+      TimelinePage(client: _client),
+      ImportPage(client: _client),
+      FullConfigPage(client: _client),
+      SystemFeaturesPage(client: _client),
+      const AboutPage(),
+      ContextStatusPage(client: _client),
+      RuntimeMemoryPage(client: _client),
+      DocumentsPage(client: _client),
+      MemorySpacesPage(client: _client),
+      SkillsPage(client: _client),
+    ];
+    return <Widget>[
+      for (var i = 0; i < pages.length; i++)
+        KeyedSubtree(
+          key: ValueKey<String>(i == _index ? 'active-$i-$_pageEpoch' : 'idle-$i'),
+          child: pages[i],
+        ),
+    ];
+  }
+
+  /// 2D 语义环 / 召回归因 / PAD 散点 → 直接跳到检查器并选中该记忆。
+  void _openMemory(String id) {
+    if (id.isEmpty) return;
+    _inspectorTarget = id;
+    _goTo(_inspectorIndex);
+  }
+
+  /// 2D / 召回页 → 切到 3D 星云并触发检索光脉冲（同一份主库数据）。
+  void _nebulaSearch(String query) {
+    if (query.trim().isEmpty) return;
+    _goTo(_nebulaIndex);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _nebulaKey.currentState?.search(query.trim());
+    });
   }
 
   Future<void> _export() async {
@@ -98,8 +276,10 @@ class _AppShellState extends State<AppShell> {
   @override
   void dispose() {
     _statusTimer?.cancel();
+    _eventsSub?.cancel();
     _client.dispose();
     _globalSearch.dispose();
+    SingleInstance.release();
     super.dispose();
   }
 
@@ -107,6 +287,7 @@ class _AppShellState extends State<AppShell> {
   Widget build(BuildContext context) {
     final engines = (_status['engine_health']?['engines'] as List<dynamic>? ?? <dynamic>[]);
     final ok = engines.where((row) => (row as Map<String, dynamic>)['ok'] != false).length;
+    final groupPages = _pagesOfGroup(_groupIndex);
     return Scaffold(
       backgroundColor: const Color(0xFF05080E),
       body: Row(
@@ -125,23 +306,23 @@ class _AppShellState extends State<AppShell> {
                   ),
                   const Padding(
                     padding: EdgeInsets.symmetric(horizontal: 18, vertical: 4),
-                    child: Text('super-brain v3 · 3D 星云', style: TextStyle(color: Color(0xFF5D7690), fontSize: 10)),
+                    child: Text('super-brain v3 · 3D 星云 + 2D 控制台', style: TextStyle(color: Color(0xFF5D7690), fontSize: 10)),
                   ),
                   const SizedBox(height: 16),
                   Expanded(
                     child: ListView.builder(
-                      itemCount: _nav.length,
-                      itemBuilder: (context, i) => _NavItem(
-                        icon: _nav[i]['icon']! as IconData,
-                        label: _nav[i]['name']! as String,
-                        selected: _index == i,
-                        onTap: () => setState(() => _index = i),
+                      itemCount: _groups.length,
+                      itemBuilder: (context, g) => _NavItem(
+                        icon: _groups[g]['icon']! as IconData,
+                        label: _groups[g]['name']! as String,
+                        selected: _groupIndex == g,
+                        onTap: () => _goTo(_pagesOfGroup(g).first),
                       ),
                     ),
                   ),
                   const Padding(
                     padding: EdgeInsets.all(14),
-                    child: Text('拖拽翻滚 · 滚轮缩放\n双击复位 · 检索触发星爆',
+                    child: Text('主导航 7 组 · 组内子页见顶部\n拖拽翻滚 · 滚轮缩放 · 双击复位',
                         style: TextStyle(color: Color(0xFF3E5470), fontSize: 10, height: 1.6)),
                   ),
                 ],
@@ -150,7 +331,7 @@ class _AppShellState extends State<AppShell> {
           Expanded(
             child: Column(
               children: <Widget>[
-                // ── 顶栏 ────────────────────────────────────────────────
+                // ── 顶栏（含 CPU / 内存 / 显卡 实时仪表）───────────────
                 Container(
                   height: 52,
                   padding: const EdgeInsets.symmetric(horizontal: 18),
@@ -170,11 +351,16 @@ class _AppShellState extends State<AppShell> {
                           _nebulaKey.currentState?.applySpace(value);
                         },
                       ),
-                      const SizedBox(width: 14),
+                      const SizedBox(width: 10),
                       IconButton(
                         tooltip: '返回全景',
                         icon: const Icon(Icons.home_outlined, color: Color(0xFF8FA6C4), size: 18),
                         onPressed: () => _nebulaKey.currentState?.resetView(),
+                      ),
+                      IconButton(
+                        tooltip: '刷新当前页数据',
+                        icon: const Icon(Icons.refresh, color: Color(0xFF8FA6C4), size: 18),
+                        onPressed: () => _goTo(_index),
                       ),
                       Expanded(
                         child: TextField(
@@ -187,11 +373,13 @@ class _AppShellState extends State<AppShell> {
                             prefixIcon: Icon(Icons.search, color: Color(0xFF4FC3F7), size: 16),
                           ),
                           onSubmitted: (value) {
-                            setState(() => _index = 0);
+                            _goTo(_nebulaIndex);
                             _nebulaKey.currentState?.search(value);
                           },
                         ),
                       ),
+                      SystemGauges(client: _client),
+                      const VerticalDivider(color: Color(0xFF142238), width: 20),
                       IconButton(tooltip: '导出数据', icon: const Icon(Icons.download_outlined, color: Color(0xFF8FA6C4), size: 18), onPressed: _export),
                       IconButton(
                         tooltip: '全屏',
@@ -205,26 +393,48 @@ class _AppShellState extends State<AppShell> {
                     ],
                   ),
                 ),
+                // ── 子导航：当前主导航组内的页面（单页组不显示）──────────
+                if (groupPages.length > 1)
+                  Container(
+                    height: 40,
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF080F1C),
+                      border: Border(bottom: BorderSide(color: Color(0xFF142238))),
+                    ),
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: groupPages.length,
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemBuilder: (context, i) {
+                        final page = groupPages[i];
+                        final selected = page == _index;
+                        return Center(
+                          child: ChoiceChip(
+                            label: Text(
+                              _nav[page]['name']! as String,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: selected ? const Color(0xFF06121F) : const Color(0xFF8FA6C4),
+                              ),
+                            ),
+                            selected: selected,
+                            selectedColor: const Color(0xFF4FC3F7),
+                            backgroundColor: const Color(0xFF0E1B2D),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                            onSelected: (_) => _goTo(page),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
                 // ── 主区 ────────────────────────────────────────────────
                 Expanded(
                   child: IndexedStack(
+                    // 重连换 client 后整棵子树重建，各页面才会用新 client 重新拉数据
+                    key: ValueKey<int>(_client.hashCode),
                     index: _index,
-                    children: <Widget>[
-                      NebulaPage(key: _nebulaKey, client: _client),
-                      MemoriesPage(client: _client),
-                      RecallPage(client: _client),
-                      SystemPage(client: _client),
-                      DataPage(client: _client),
-                      ModelPage(client: _client),
-                      InterfacePage(client: _client),
-                      SyncPage(client: _client),
-                      SettingsPage(client: _client, onReconnect: _reconnect),
-                      MemoryInspectorPage(client: _client),
-                      TimelinePage(client: _client),
-                      ImportPage(client: _client),
-                      FullConfigPage(client: _client),
-                      const AboutPage(),
-                    ],
+                    children: _pagesWithKeys(),
                   ),
                 ),
                 // ── 底部状态栏 ──────────────────────────────────────────
@@ -241,6 +451,13 @@ class _AppShellState extends State<AppShell> {
                         style: const TextStyle(color: Color(0xFF6B839F), fontSize: 10),
                       ),
                       const Spacer(),
+                      ValueListenableBuilder<String>(
+                        valueListenable: trayStatus,
+                        builder: (context, value, _) => Padding(
+                          padding: const EdgeInsets.only(right: 14),
+                          child: Text(value, style: const TextStyle(color: Color(0xFF3E5470), fontSize: 10)),
+                        ),
+                      ),
                       ValueListenableBuilder<String>(
                         valueListenable: backendStatus,
                         builder: (context, value, _) => Text(

@@ -230,6 +230,27 @@ class V3Daemon:
                     self._send(202 if result.get("accepted") else 400, result)
                 elif path == "/v1/config":
                     self._send(200, daemon.save_client_config(dict(body)))
+                elif path == "/v1/rpc":
+                    # 通用 RPC 兜底：WS 未连上时，Flutter 与任意 HTTP 客户端
+                    # 都能调到 v3 的全部方法（含分层上下文 / 桌面能力 / 模型状态）。
+                    from v3.rpc import RpcHandler
+
+                    method = str(body.get("method", ""))
+                    args = body.get("args") or {}
+                    if not isinstance(args, dict):
+                        self._send(400, {"error": "args must be an object"})
+                        return
+                    reply = RpcHandler(daemon).dispatch({"method": method, "args": args})
+                    if not reply.get("ok"):
+                        self._send(400, {"error": str(reply.get("error") or "RPC failed")})
+                        return
+                    result = reply.get("result")
+                    if isinstance(result, dict):
+                        self._send(200, result)
+                    elif isinstance(result, list):
+                        self._send(200, {"items": result, "result": result})
+                    else:
+                        self._send(200, {"result": result})
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -283,17 +304,59 @@ class V3Daemon:
                 })
 
     # ── 只读视图（直读 SQLite 投影，不开六引擎）─────────────────────────
-    def _rows(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    def _rows(self, *, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         if not self._projection_db.exists():
             return []
         try:
             con = sqlite3.connect(f"file:{self._projection_db.as_posix()}?mode=ro", uri=True)
             con.row_factory = sqlite3.Row
-            rows = con.execute("SELECT * FROM neurons WHERE is_active=1 LIMIT ?", (limit,)).fetchall()
+            rows = con.execute(
+                "SELECT * FROM neurons WHERE is_active=1 LIMIT ? OFFSET ?",
+                (max(0, int(limit)), max(0, int(offset))),
+            ).fetchall()
             con.close()
         except sqlite3.Error:
             return []
         return [dict(row) for row in rows]
+
+    def active_count(self) -> int:
+        """全量渲染的总节点数（只读投影，不加载模型）。"""
+        if not self._projection_db.exists():
+            return 0
+        try:
+            con = sqlite3.connect(f"file:{self._projection_db.as_posix()}?mode=ro", uri=True)
+            total = con.execute("SELECT COUNT(*) FROM neurons WHERE is_active=1").fetchone()[0]
+            con.close()
+            return int(total)
+        except sqlite3.Error:
+            return 0
+
+    def graph_chunk(self, *, offset: int = 0, limit: int = 500) -> dict[str, Any]:
+        """全量渲染的分批节点：每批最多 500 个，零边计算。
+
+        默认 graph() 只取 200 条并做 O(n²) 2-gram 相似度连边；3000+ 节点时
+        那一步会卡死。全量模式改走这里，边与细节由前端按 LOD 决定是否渲染。
+        """
+        rows = self._rows(limit=limit, offset=offset)
+        nodes = [
+            {
+                "id": str(row.get("id")),
+                "content": self._content(row),
+                "memory_type": row.get("memory_type", "fact"),
+                "tier": row.get("tier", "buffer"),
+                "pad": (row.get("pad_p", 0.0), row.get("pad_a", 0.0), row.get("pad_d", 0.0)),
+                "is_emotion": row.get("memory_type") == "emotion",
+                "confidence": row.get("confidence", 0.5),
+            }
+            for row in rows
+        ]
+        return {
+            "source": "projection-chunk",
+            "nodes": nodes,
+            "total": self.active_count(),
+            "offset": offset,
+            "limit": limit,
+        }
 
     @staticmethod
     def _content(row: dict[str, Any]) -> str:
@@ -319,7 +382,7 @@ class V3Daemon:
             "alarm_port": self.alarm.port,
         }
 
-    def memories(self, *, limit: int = 100) -> list[dict[str, Any]]:
+    def memories(self, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return [
             {
                 "id": row.get("id"),
@@ -329,7 +392,7 @@ class V3Daemon:
                 "pad": (row.get("pad_p"), row.get("pad_a"), row.get("pad_d")),
                 "is_active": row.get("is_active"),
             }
-            for row in self._rows(limit=limit)
+            for row in self._rows(limit=limit, offset=offset)
         ]
 
     def recall(self, query: str, *, limit: int = 8) -> dict[str, Any]:

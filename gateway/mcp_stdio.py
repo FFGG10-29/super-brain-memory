@@ -139,11 +139,24 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
             "pad": result.neuron.pad.as_tuple(),
         }
     if name == "recall_memory":
-        hits = app.prefrontal.recall(
-            str(arguments["query"]), agent_id=agent_id, limit=int(arguments.get("top_k", 5))
-        )
-        return {
-            "hits": [
+        query = str(arguments.get("query", ""))
+        limit = int(arguments.get("limit") or arguments.get("top_k") or 3)
+        deep = bool(arguments.get("deep", False))
+        from core.context_layers import get_context_layers
+        from core.fast_recall import convergence_injection, fast_recall
+
+        layers = get_context_layers()
+        if not deep:
+            # 独占模式默认也走轻量投影（<0.05s），与 HTTP 桥接路径对齐。
+            rows = app.storage.relational.query("neuron", active_only=True, limit=500)
+            result = fast_recall([dict(row) for row in rows], query, limit)
+            hits = result["hits"]
+            injection = convergence_injection(hits)
+        else:
+            hits_obj = app.prefrontal.recall(
+                query, agent_id=agent_id, limit=limit,
+            )
+            hits = [
                 {
                     "id": hit.neuron.uuid7_id,
                     "content": hit.neuron.content,
@@ -151,8 +164,17 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
                     "channels": list(hit.channels),
                     "memory_type": hit.neuron.memory_type,
                 }
-                for hit in hits
+                for hit in hits_obj
             ]
+            injection = app.prefrontal.inject(hits_obj, agent_id=agent_id)
+        projection = layers.compose(query)
+        if projection:
+            injection = (injection + "\n\n" + projection).strip()
+        return {
+            "hits": hits,
+            "injection": injection,
+            "context_layers": layers.status()["layers"],
+            "recall_mode": "six-channel" if deep else "projection",
         }
     if name == "timeline_query":
         rows = app.storage.relational.query(
@@ -189,7 +211,12 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
         }
     if name == "health_check":
         return {"engines": [status.as_dict() for status in app.health_report()]}
-    return {"error": f"未知工具：{name}"}
+    # 分层上下文 / 硬件仪表等本地层能力：桌面没开、独占数据库时也能用
+    from gateway.tool_catalog import dispatch_standalone
+    local = dispatch_standalone(name, arguments)
+    if local is not None:
+        return local
+    return {"error": f"未知工具：{name}（该工具需要桌面后端在线，请先启动超级大脑）"}
 
 
 MCP_TOOL_DEFS: list[dict[str, Any]] = [
@@ -246,6 +273,12 @@ MCP_TOOL_DEFS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
+
+
+# 单一真源：stdio 的 list_tools() 与 HTTP 的 tools/list 共用同一张表。
+# 下面保留的旧列表仅作迁移参考，实际暴露给 Agent 的是 catalog 版本。
+from gateway.tool_catalog import MCP_TOOL_DEFS as _CATALOG_TOOL_DEFS  # noqa: E402
+MCP_TOOL_DEFS = _CATALOG_TOOL_DEFS
 
 
 def build_server() -> Server:

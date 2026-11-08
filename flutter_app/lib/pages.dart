@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
 import 'prefs.dart';
+import 'win32.dart';
 
 const Color _accent = Color(0xFF4FC3F7);
 const Color _hint = Color(0xFF8FA6C4);
@@ -60,21 +62,36 @@ class MemoriesPage extends StatefulWidget {
 class _MemoriesPageState extends State<MemoriesPage> {
   final TextEditingController _input = TextEditingController();
   List<MemoryRow> _rows = <MemoryRow>[];
+  StreamSubscription<Map<String, dynamic>>? _eventsSub;
   String _status = '—';
+  String _typeFilter = '全部';
+  bool _newestFirst = true;
 
   @override
   void initState() {
     super.initState();
     _reload();
-    widget.client.events.listen((event) {
+    _eventsSub = widget.client.events.listen((Map<String, dynamic> event) {
       if (event['type'] == 'node_created' && mounted) _reload();
     });
+  }
+
+  @override
+  void dispose() {
+    _eventsSub?.cancel();
+    _input.dispose();
+    super.dispose();
   }
 
   Future<void> _reload() async {
     try {
       final rows = await widget.client.memories();
-      if (mounted) setState(() => _rows = rows);
+      if (mounted) {
+        setState(() {
+          _rows = rows;
+          _status = '共 ${rows.length} 条 · ${_newestFirst ? "最新在前" : "最早在前"}';
+        });
+      }
     } catch (error) {
       if (mounted) setState(() => _status = '读取失败：$error');
     }
@@ -87,66 +104,163 @@ class _MemoriesPageState extends State<MemoriesPage> {
       final result = await widget.client.saveMemory(content);
       _input.clear();
       setState(() => _status = '已受理 ${result['event_id']}（${result['ack_ms']} ms）→ 后台处理中');
+      await _reload();
     } catch (error) {
       setState(() => _status = '写入失败：$error');
     }
   }
 
+  /// 记忆 id 是 UUIDv7：前 48 bit 就是毫秒时间戳，可直接拿来排序/显示，
+  /// 不必改后端接口。非 v7 的 id 落在合理年份之外，回退到字典序。
+  int? _timeOf(String id) {
+    final hex = id.replaceAll('-', '');
+    if (hex.length < 12) return null;
+    final ms = int.tryParse(hex.substring(0, 12), radix: 16);
+    if (ms == null || ms < 946684800000 || ms > 4102444800000) return null;
+    return ms;
+  }
+
+  String _timeLabel(String id) {
+    final ms = _timeOf(id);
+    if (ms == null) return '';
+    final d = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
+  }
+
+  List<MemoryRow> get _visible {
+    final list = _rows
+        .where((MemoryRow r) => _typeFilter == '全部' || r.memoryType == _typeFilter)
+        .toList();
+    list.sort((MemoryRow a, MemoryRow b) {
+      final ta = _timeOf(a.id) ?? 0;
+      final tb = _timeOf(b.id) ?? 0;
+      final byTime = ta != tb ? ta.compareTo(tb) : a.id.compareTo(b.id);
+      return _newestFirst ? -byTime : byTime;
+    });
+    return list;
+  }
+
+  Widget _typeChips() {
+    final types = <String>{'全部', for (final MemoryRow r in _rows) r.memoryType}.toList();
+    return Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      children: <Widget>[
+        for (final type in types)
+          ChoiceChip(
+            label: Text(
+              type == '全部'
+                  ? '全部 ${_rows.length}'
+                  : '$type ${_rows.where((MemoryRow r) => r.memoryType == type).length}',
+              style: TextStyle(
+                fontSize: 10,
+                color: _typeFilter == type
+                    ? const Color(0xFF06121F)
+                    : const Color(0xFFBFD8F5),
+              ),
+            ),
+            selected: _typeFilter == type,
+            selectedColor: const Color(0xFF4FC3F7),
+            backgroundColor: const Color(0xFF0E1B2D),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            onSelected: (_) => setState(() => _typeFilter = type),
+          ),
+      ],
+    );
+  }
+
   @override
-  Widget build(BuildContext context) => PageFrame(
-        title: '记忆管理',
-        subtitle: '写入走完整链路（丘脑路由 → 语义合并 → 六引擎投影）；受理后由后台 Worker 完成，星云会点亮新节点',
-        child: Column(
-          children: <Widget>[
-            _Card(
-              child: Row(
-                children: <Widget>[
-                  Expanded(
-                    child: TextField(
-                      controller: _input,
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      decoration: const InputDecoration(
-                        hintText: '输入一条新记忆…',
-                        hintStyle: TextStyle(color: Color(0xFF63788F), fontSize: 13),
-                        border: InputBorder.none,
+  Widget build(BuildContext context) {
+    final visible = _visible;
+    return PageFrame(
+      title: '记忆管理',
+      subtitle: '按类型分类 · 默认最新记忆在最顶部 · 写入走丘脑路由 → 语义合并 → 六引擎投影',
+      child: Column(
+        children: <Widget>[
+          _Card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: TextField(
+                        controller: _input,
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                        decoration: const InputDecoration(
+                          hintText: '输入一条新记忆…',
+                          hintStyle: TextStyle(color: Color(0xFF63788F), fontSize: 13),
+                          border: InputBorder.none,
+                        ),
+                        onSubmitted: (_) => _save(),
                       ),
-                      onSubmitted: (_) => _save(),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  FilledButton(onPressed: _save, child: const Text('写入记忆')),
-                  const SizedBox(width: 12),
-                  OutlinedButton(onPressed: _reload, child: const Text('刷新')),
-                ],
-              ),
-            ),
-            const SizedBox(height: 10),
-            Align(alignment: Alignment.centerLeft, child: Text(_status, style: const TextStyle(color: _hint, fontSize: 11))),
-            const SizedBox(height: 10),
-            Expanded(
-              child: _Card(
-                child: ListView.separated(
-                  itemCount: _rows.length,
-                  separatorBuilder: (_, __) => const Divider(color: Color(0xFF16243A), height: 1),
-                  itemBuilder: (context, index) {
-                    final row = _rows[index];
-                    return ListTile(
-                      leading: Icon(
-                        row.memoryType == 'emotion' ? Icons.favorite : Icons.memory,
-                        color: row.memoryType == 'emotion' ? const Color(0xFFFF4D7D) : _accent,
-                        size: 18,
-                      ),
-                      title: Text(row.content, style: const TextStyle(color: Colors.white, fontSize: 13)),
-                      subtitle: Text('${row.memoryType} · ${row.tier} · PAD ${row.pad.map((v) => v.toStringAsFixed(1)).join('/')}',
-                          style: const TextStyle(color: _hint, fontSize: 10)),
-                    );
-                  },
+                    const SizedBox(width: 12),
+                    FilledButton(onPressed: _save, child: const Text('写入记忆')),
+                    const SizedBox(width: 12),
+                    OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+                  ],
                 ),
+                const SizedBox(height: 10),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: <Widget>[
+                    Expanded(child: _typeChips()),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed: () => setState(() {
+                        _newestFirst = !_newestFirst;
+                        _status = '共 ${_rows.length} 条 · ${_newestFirst ? "最新在前" : "最早在前"}';
+                      }),
+                      icon: Icon(_newestFirst ? Icons.arrow_downward : Icons.arrow_upward, size: 13),
+                      label: Text(_newestFirst ? '最新在前' : '最早在前',
+                          style: const TextStyle(fontSize: 10)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Align(
+              alignment: Alignment.centerLeft,
+              child: Text('$_status · 当前显示 ${visible.length} 条',
+                  style: const TextStyle(color: _hint, fontSize: 11))),
+          const SizedBox(height: 10),
+          Expanded(
+            child: _Card(
+              child: ListView.separated(
+                itemCount: visible.length,
+                separatorBuilder: (_, __) =>
+                    const Divider(color: Color(0xFF16243A), height: 1),
+                itemBuilder: (context, index) {
+                  final row = visible[index];
+                  final when = _timeLabel(row.id);
+                  return ListTile(
+                    leading: Icon(
+                      row.memoryType == 'emotion' ? Icons.favorite : Icons.memory,
+                      color: row.memoryType == 'emotion'
+                          ? const Color(0xFFFF4D7D)
+                          : _accent,
+                      size: 18,
+                    ),
+                    title: Text(row.content,
+                        style: const TextStyle(color: Colors.white, fontSize: 13)),
+                    subtitle: Text(
+                      '${when.isEmpty ? "" : "$when · "}${row.memoryType} · ${row.tier} · '
+                      'PAD ${row.pad.map((v) => v.toStringAsFixed(1)).join("/")}',
+                      style: const TextStyle(color: _hint, fontSize: 10),
+                    ),
+                  );
+                },
               ),
             ),
-          ],
-        ),
-      );
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 召回测试：结果分数 + 命中通道，可在星云页搜索触发光脉冲。
@@ -162,16 +276,35 @@ class _RecallPageState extends State<RecallPage> {
   final TextEditingController _query = TextEditingController();
   List<RecallHit> _hits = <RecallHit>[];
   String _status = '输入查询后回车';
+  bool _deep = false;
+  bool _busy = false;
 
   Future<void> _run() async {
+    if (_query.text.trim().isEmpty) {
+      setState(() => _status = '请输入查询内容');
+      return;
+    }
+    // 关键：点下去立刻给反馈，否则慢召回时界面像「没反应」
+    setState(() {
+      _busy = true;
+      _status = _deep ? '深度召回中（六通道精排，可能较慢）…' : '检索中…';
+    });
     try {
-      final hits = await widget.client.recall(_query.text);
+      final hits = await widget.client.recall(_query.text, deep: _deep);
+      if (!mounted) return;
       setState(() {
         _hits = hits;
-        _status = '命中 ${hits.length} 条（字符 2-gram 余弦，只读投影、不加载模型）';
+        _busy = false;
+        _status = hits.isEmpty
+            ? '未命中（换个关键词，或打开「深度召回」）'
+            : '命中 ${hits.length} 条 · ${_deep ? '六通道精排' : '字符 2-gram 只读投影'}';
       });
     } catch (error) {
-      setState(() => _status = '召回失败：$error');
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _status = '召回失败：$error';
+      });
     }
   }
 
@@ -192,11 +325,22 @@ class _RecallPageState extends State<RecallPage> {
                       onSubmitted: (_) => _run(),
                     ),
                   ),
-                  FilledButton(onPressed: _run, child: const Text('召回')),
+                  FilledButton(onPressed: _busy ? null : _run, child: const Text('召回')),
                 ],
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                const Text('深度召回（六通道精排，可能慢）', style: TextStyle(color: _hint, fontSize: 11)),
+                SizedBox(
+                  height: 28,
+                  child: Switch(value: _deep, onChanged: (bool v) => setState(() => _deep = v)),
+                ),
+                if (_busy)
+                  const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+              ],
+            ),
             Align(alignment: Alignment.centerLeft, child: Text(_status, style: const TextStyle(color: _hint, fontSize: 11))),
             const SizedBox(height: 10),
             Expanded(
@@ -307,34 +451,44 @@ class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _host = TextEditingController(text: Prefs.get<String>('host', '127.0.0.1'));
   late final TextEditingController _http = TextEditingController(text: Prefs.get<int>('http_port', 8768).toString());
   late final TextEditingController _ws = TextEditingController(text: Prefs.get<int>('ws_port', 8767).toString());
-  double _focal = 900;
-  double _starSize = 3.2;
-  double _spin = 0.00035;
-  bool _bloom = true;
-  bool _autoRotate = true;
   String _status = '—';
+  int _settingsTab = 0;
+  bool _fullRender = Prefs.get<bool>('full_render', false);
 
-  @override
-  void initState() {
-    super.initState();
-    _load();
+  Widget _settingsChip(int index, String label, IconData icon) => ChoiceChip(
+        label: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+          Icon(icon, size: 13,
+              color: _settingsTab == index ? const Color(0xFF06121F) : _accent),
+          const SizedBox(width: 5),
+          Text(label,
+              style: TextStyle(
+                fontSize: 11,
+                color: _settingsTab == index
+                    ? const Color(0xFF06121F)
+                    : const Color(0xFFBFD8F5),
+              )),
+        ]),
+        selected: _settingsTab == index,
+        selectedColor: const Color(0xFF4FC3F7),
+        backgroundColor: const Color(0xFF0E1B2D),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        onSelected: (_) => setState(() => _settingsTab = index),
+      );
+
+  String _nebSummary() {
+    final value = Prefs.load()['nebula'];
+    if (value is! Map || value.isEmpty) return '当前使用出厂默认值（尚未调整过）';
+    return value.entries.map((e) => '${e.key} = ${e.value}').join('  ·  ');
   }
 
-  Future<void> _load() async {
-    try {
-      final config = await widget.client.config();
-      final nebula = config['nebula'] as Map<String, dynamic>? ?? <String, dynamic>{};
-      if (!mounted) return;
-      setState(() {
-        _focal = (nebula['focal_length'] as num? ?? 900).toDouble();
-        _starSize = (nebula['star_size'] as num? ?? 3.2).toDouble();
-        _spin = (nebula['spin_speed'] as num? ?? 0.00035).toDouble();
-        _bloom = nebula['bloom'] != false;
-        _autoRotate = nebula['auto_rotate'] != false;
-      });
-    } catch (_) {
-      // 后端未启动时保留本地默认值
-    }
+  void _setFullRender(bool value) {
+    Prefs.save(<String, dynamic>{'full_render': value});
+    setState(() {
+      _fullRender = value;
+      _status = value
+          ? '已开启全量渲染：切到「星云视图」按 500 条/批渐进加载全部记忆'
+          : '已关闭全量渲染：恢复默认 200 节点视图';
+    });
   }
 
   void _save() {
@@ -346,25 +500,6 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _status = '连接参数已保存并重新连接');
   }
 
-  Future<void> _saveNebula() async {
-    final patch = <String, dynamic>{
-      'nebula': <String, dynamic>{
-        'focal_length': _focal,
-        'star_size': _starSize,
-        'spin_speed': _spin,
-        'bloom': _bloom,
-        'auto_rotate': _autoRotate,
-      }
-    };
-    Prefs.save(<String, dynamic>{'nebula': patch['nebula']});
-    try {
-      await widget.client.saveConfig(patch);
-      setState(() => _status = '3D 参数已同步到后端（刷新星云页生效）');
-    } catch (error) {
-      setState(() => _status = '已存本地；后端未连接：$error');
-    }
-  }
-
   @override
   Widget build(BuildContext context) => PageFrame(
         title: '设置',
@@ -372,41 +507,120 @@ class _SettingsPageState extends State<SettingsPage> {
         child: ListView(
           children: <Widget>[
             _Card(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const Text('后端连接', style: TextStyle(color: Colors.white, fontSize: 14)),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: <Widget>[
-                      Expanded(flex: 3, child: _field('主机', _host)),
-                      const SizedBox(width: 12),
-                      Expanded(child: _field('HTTP 端口', _http)),
-                      const SizedBox(width: 12),
-                      Expanded(child: _field('WS 端口', _ws)),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  FilledButton(onPressed: _save, child: const Text('保存并重新连接')),
-                ],
-              ),
+              child: Row(children: <Widget>[
+                _settingsChip(0, '连接', Icons.settings_ethernet),
+                const SizedBox(width: 8),
+                _settingsChip(1, '外观', Icons.blur_on),
+                const SizedBox(width: 8),
+                _settingsChip(2, '诊断', Icons.medical_services_outlined),
+                const Spacer(),
+                const Text('设置页分类子标签', style: TextStyle(color: _hint, fontSize: 10)),
+              ]),
             ),
             const SizedBox(height: 12),
-            _Card(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const Text('3D 星云', style: TextStyle(color: Colors.white, fontSize: 14)),
-                  _slider('焦距（透视强度）', _focal, 400, 1600, (v) => setState(() => _focal = v)),
-                  _slider('星点大小', _starSize, 1, 8, (v) => setState(() => _starSize = v)),
-                  _slider('自转速度', _spin * 10000, 1, 20, (v) => setState(() => _spin = v / 10000)),
-                  SwitchListTile(title: const Text('加色辉光 Bloom', style: TextStyle(color: _hint, fontSize: 12)), value: _bloom, onChanged: (v) => setState(() => _bloom = v)),
-                  SwitchListTile(title: const Text('自动缓慢旋转', style: TextStyle(color: _hint, fontSize: 12)), value: _autoRotate, onChanged: (v) => setState(() => _autoRotate = v)),
-                  const SizedBox(height: 8),
-                  FilledButton(onPressed: _saveNebula, child: const Text('保存 3D 参数')),
-                ],
+            if (_settingsTab == 0)
+              _Card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('后端连接', style: TextStyle(color: Colors.white, fontSize: 14)),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: <Widget>[
+                        Expanded(flex: 3, child: _field('主机', _host)),
+                        const SizedBox(width: 12),
+                        Expanded(child: _field('HTTP 端口', _http)),
+                        const SizedBox(width: 12),
+                        Expanded(child: _field('WS 端口', _ws)),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton(onPressed: _save, child: const Text('保存并重新连接')),
+                  ],
+                ),
               ),
-            ),
+            if (_settingsTab == 1)
+              _Card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('星云外观（唯一入口）', style: TextStyle(color: Colors.white, fontSize: 14)),
+                    const SizedBox(height: 6),
+                    const Text(
+                      '焦距 / 星点大小 / 自转 / 辉光 / 连线 / 黑洞 / 中枢等外观参数，'
+                      '统一在「系统设置 → 全量配置 → 外观与常用」修改并立即生效。'
+                      '这里不再重复放一套滑块，星云页左上角的悬浮开关写的是同一份配置。',
+                      style: TextStyle(color: _hint, fontSize: 11, height: 1.5),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(_nebSummary(), style: const TextStyle(color: _accent, fontSize: 10, height: 1.5)),
+                    const Divider(color: Color(0xFF22344C), height: 22),
+                    SwitchListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _fullRender,
+                      onChanged: (value) => _setFullRender(value),
+                      title: const Text('[●] 全量渲染模式（性能警告）',
+                          style: TextStyle(color: Colors.white, fontSize: 12)),
+                      subtitle: const Text(
+                        '加载全部记忆节点（默认仅 200 条）。3000+ 节点时后端按 500 条/批推送、'
+                        '前端边收边渲染，并自动启用 LOD：镜头拉远即关闭连线/标签/光晕。'
+                        'GTX 1060 建议保持「突触连线」关闭。',
+                        style: TextStyle(color: _hint, fontSize: 10, height: 1.5),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (_settingsTab == 2)
+              _Card(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    const Text('启动与进程诊断', style: TextStyle(color: Colors.white, fontSize: 14)),
+                    const SizedBox(height: 6),
+                    const Text(
+                      '''· 双击没反应：多半是上次启动异常留下的「无窗口僵尸前端」占着单实例端口 38767。
+· 新版会自愈：第二实例发现端口被占却找不到主窗口时，自动强杀僵尸并接管。
+· 启动异常写入 %APPDATA%/super-brain/startup_error.log，并释放端口锁后退出。
+· 后端是独立进程；托盘「完全退出」会先优雅停后端再关前端，不会留孤儿。''',
+                      style: TextStyle(color: _hint, fontSize: 11, height: 1.7),
+                    ),
+                    const SizedBox(height: 10),
+                    SwitchListTile(
+                      dense: true,
+                      value: Prefs.get<bool>('hide_on_close', false),
+                      title: const Text('关窗隐藏到托盘',
+                          style: TextStyle(color: Colors.white, fontSize: 11)),
+                      subtitle: const Text(
+                        '仅在任务栏右下角确实能看到托盘图标时开启；'
+                        '否则窗口被隐藏后会找不到（默认关闭，点 X 直接退出）',
+                        style: TextStyle(color: _hint, fontSize: 10),
+                      ),
+                      onChanged: (bool value) {
+                        Prefs.save(<String, dynamic>{'hide_on_close': value});
+                        Win32Window.setTrayMode(value);
+                        setState(() => _status = value
+                            ? '已开启关窗隐藏到托盘'
+                            : '已关闭隐藏：点 X 直接退出，窗口不会再消失');
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      onPressed: () async {
+                        try {
+                          final s = await widget.client.snapshot();
+                          final engines = (s['engine_health']?['engines'] as List<dynamic>? ?? <dynamic>[]);
+                          if (mounted) setState(() => _status = '后端在线 · ${engines.length} 个引擎已探活');
+                        } catch (error) {
+                          if (mounted) setState(() => _status = '后端未连接：$error');
+                        }
+                      },
+                      child: const Text('检查后端状态', style: TextStyle(fontSize: 11)),
+                    ),
+                  ],
+                ),
+              ),
             const SizedBox(height: 10),
             Text(_status, style: const TextStyle(color: _hint, fontSize: 11)),
           ],
@@ -419,13 +633,6 @@ class _SettingsPageState extends State<SettingsPage> {
         decoration: InputDecoration(labelText: label, labelStyle: const TextStyle(color: _hint, fontSize: 11), border: const OutlineInputBorder()),
       );
 
-  Widget _slider(String label, double value, double min, double max, ValueChanged<double> onChanged) => Row(
-        children: <Widget>[
-          SizedBox(width: 130, child: Text(label, style: const TextStyle(color: _hint, fontSize: 11))),
-          Expanded(child: Slider(value: value.clamp(min, max).toDouble(), min: min, max: max, onChanged: onChanged)),
-          SizedBox(width: 56, child: Text(value.toStringAsFixed(value > 10 ? 0 : 4), style: const TextStyle(color: _accent, fontSize: 11))),
-        ],
-      );
 }
 
 /// 系统概览：六引擎健康 + PAD/分层采样 + 昼夜任务手动执行。
@@ -487,7 +694,7 @@ class _SystemPageState extends State<SystemPage> {
                     ..._engines.map((row) => Padding(
                           padding: const EdgeInsets.symmetric(vertical: 4),
                           child: Text(
-                            '${row['name'] ?? '?'} · ${row['description'] ?? ''} · ${row['ok'] == false ? '异常' : '正常'}',
+                            '${row['name'] ?? row['engine'] ?? '?'} · ${row['description'] ?? row['detail'] ?? ''} · ${row['ok'] == false ? '异常' : '正常'}',
                             style: const TextStyle(color: _hint, fontSize: 11),
                           ),
                         )),
@@ -705,16 +912,64 @@ class SyncPage extends StatefulWidget {
 class _SyncPageState extends State<SyncPage> {
   List<Map<String, dynamic>> _snapshots = <Map<String, dynamic>>[];
   String _status = '—';
+  final TextEditingController _repoUrl = TextEditingController();
+  final TextEditingController _localDir = TextEditingController();
+  final TextEditingController _deviceId = TextEditingController();
+  final TextEditingController _interval = TextEditingController();
 
   @override
   void initState() {
     super.initState();
     _reload();
+    _loadConfig();
+  }
+
+  @override
+  void dispose() {
+    _repoUrl.dispose();
+    _localDir.dispose();
+    _deviceId.dispose();
+    _interval.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadConfig() async {
+    try {
+      final config = await widget.client.config();
+      final sections = config['sections'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final sync = sections['sync'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      if (!mounted) return;
+      _repoUrl.text = sync['repo_url']?.toString() ?? '';
+      _localDir.text = sync['local_repo_dir']?.toString() ?? '';
+      _deviceId.text = sync['device_id']?.toString() ?? '';
+      _interval.text = sync['sync_interval_sec']?.toString() ?? '300';
+      setState(() {});
+    } catch (error) {
+      if (mounted) setState(() => _status = '读取同步配置失败：$error');
+    }
+  }
+
+  Future<void> _saveRepo() async {
+    final result = await widget.client.setConfig(<String, dynamic>{
+      'sync': <String, dynamic>{
+        'repo_url': _repoUrl.text.trim(),
+        'local_repo_dir': _localDir.text.trim(),
+        'device_id': _deviceId.text.trim(),
+        'sync_interval_sec': int.tryParse(_interval.text.trim()) ?? 300,
+      },
+    });
+    if (!mounted) return;
+    setState(() => _status = result['error']?.toString() ?? '同步仓库已保存；重启内核后生效');
   }
 
   Future<void> _reload() async {
-    final rows = await widget.client.snapshots();
-    if (mounted) setState(() => _snapshots = rows);
+    try {
+      final rows = await widget.client.snapshots();
+      if (mounted) setState(() => _snapshots = rows);
+    } catch (error) {
+      // 后端离线 / 返回格式变化时只影响这一页，绝不能冒泡成全局退出。
+      if (mounted) setState(() => _status = '快照列表暂不可用：$error');
+    }
   }
 
   Future<void> _sync() async {
@@ -744,6 +999,58 @@ class _SyncPageState extends State<SyncPage> {
               OutlinedButton(onPressed: _reload, child: const Text('刷新')),
             ]),
             const SizedBox(height: 10),
+            _Card(child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text('同步仓库设置（Git 私库 / 本机镜像）',
+                    style: TextStyle(color: Colors.white, fontSize: 13)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _repoUrl,
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                  decoration: const InputDecoration(
+                    labelText: '仓库地址 repo_url（留空表示不同步）',
+                    labelStyle: TextStyle(color: _hint, fontSize: 10),
+                    isDense: true, border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: _localDir,
+                  style: const TextStyle(color: Colors.white, fontSize: 11),
+                  decoration: const InputDecoration(
+                    labelText: '本地仓库目录 local_repo_dir',
+                    labelStyle: TextStyle(color: _hint, fontSize: 10),
+                    isDense: true, border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(children: <Widget>[
+                  Expanded(child: TextField(
+                    controller: _deviceId,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                    decoration: const InputDecoration(
+                      labelText: '设备标识 device_id',
+                      labelStyle: TextStyle(color: _hint, fontSize: 10),
+                      isDense: true, border: OutlineInputBorder(),
+                    ),
+                  )),
+                  const SizedBox(width: 8),
+                  SizedBox(width: 130, child: TextField(
+                    controller: _interval,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                    decoration: const InputDecoration(
+                      labelText: '同步间隔(秒)',
+                      labelStyle: TextStyle(color: _hint, fontSize: 10),
+                      isDense: true, border: OutlineInputBorder(),
+                    ),
+                  )),
+                ]),
+                const SizedBox(height: 8),
+                OutlinedButton(onPressed: _saveRepo, child: const Text('保存仓库设置', style: TextStyle(fontSize: 11))),
+              ],
+            )),
+            const SizedBox(height: 10),
             Align(alignment: Alignment.centerLeft, child: Text(_status, style: const TextStyle(color: _hint, fontSize: 11))),
             const SizedBox(height: 10),
             Expanded(
@@ -768,20 +1075,94 @@ class _SyncPageState extends State<SyncPage> {
 
 class AboutPage extends StatelessWidget {
   const AboutPage({super.key});
+
+  static const TextStyle _body =
+      TextStyle(color: _hint, fontSize: 11, height: 1.7);
+  static const TextStyle _head = TextStyle(
+      color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600);
+
+  Widget _section(String title, List<String> lines) => _Card(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(title, style: _head),
+            const SizedBox(height: 8),
+            ...lines.map((String line) => Padding(
+                  padding: const EdgeInsets.only(bottom: 3),
+                  child: Text(line, style: _body),
+                )),
+          ],
+        ),
+      );
+
   @override
-  Widget build(BuildContext context) => const PageFrame(
-        title: '关于',
-        subtitle: 'v3 事件驱动记忆内核 · Flutter 外壳',
-        child: _Card(
-          child: Text(
-            '交互层：Flutter 3D 星云（纯 Dart CustomPainter + 旋转矩阵 + 透视投影，零第三方依赖）\n'
-            '控制面：Windows 服务（WinSW）托管 Daemon，Daemon 内管 Model Worker\n'
-            '数据面：NDJSON journal（唯一真源）+ SQLite WAL inbox（租约队列）+ 可选 Honker 闹钟\n'
-            '计算面：Worker 消费事件 → 抽取/语义合并/PAD/FSRS/六库投影 → WS 广播增量\n\n'
-            '写路径：journal fsync → inbox → 202 accepted（不等待模型）；最终结果由 WS 推送。\n'
-            'Flutter 只经 HTTP/WebSocket 访问内核，不直连任何存储或模型。',
-            style: TextStyle(color: _hint, fontSize: 13, height: 1.8),
-          ),
+  Widget build(BuildContext context) => PageFrame(
+        title: '关于 超级大脑',
+        subtitle: 'Super Brain v3.1 · Living Memory · 本地优先的长期记忆中枢',
+        child: ListView(
+          children: <Widget>[
+            _section('它是什么', <String>[
+              '一套完全跑在本机的长期记忆系统：把事实、偏好、情绪、项目文档与技能分层保存，'
+                  '再按需注入给任意 AI Agent，让不同会话、不同工具共享同一份记忆。',
+              '数据不出本机，不依赖云端账号；没有「用对话改进模型」这种条款。',
+              '前端 Flutter，后端 Python 冻结为 headless-server.exe，两者进程分离，'
+                  '前端崩溃不影响记忆服务。',
+            ]),
+            const SizedBox(height: 10),
+            _section('六引擎存储', <String>[
+              'SQLite（WAL + FTS5）：神经元主库、双时态、outbox、全文检索',
+              'LanceDB：1024 维语义向量（BGE-M3），dense 召回',
+              'Kùzu：实体 / 关系 / 超图编码',
+              'LMDB：KV 画像与偏好',
+              'DuckDB：时序 OLAP 与命中率埋点',
+              'HyperNetX：超图与 PAD 认知分区',
+              '事件日志（NDJSON journal）是唯一真源：先落盘 fsync → inbox 队列 → 202 accepted，'
+                  'Worker 异步做抽取 / 去重 / 语义合并 / PAD / FSRS，再由 WebSocket 广播增量。',
+            ]),
+            const SizedBox(height: 10),
+            _section('分层上下文', <String>[
+              '运行时记忆：MEMORY.md（项目约定）与 USER.md（用户画像），每轮确定性注入，'
+                  '带 critical / normal / low 优先级，写满自动归档低优先级旧条目。',
+              '项目档案：先检索标题与摘要，需要细节才读全文；记录 last_read，最久未用优先归档。',
+              '记忆空间：可建多个空间并指定 Provider，只有激活的空间参与召回。',
+              '技能管理：版本化技能，按使用成功率自进化，低成功率自动标记待改进。',
+              '注入由前额叶收敛：只给 Top 3 摘要 + 「停止发散」执行约束，'
+                  '避免 Agent 复述原文或自由联想。',
+            ]),
+            const SizedBox(height: 10),
+            _section('Agent 接入（MCP）', <String>[
+              '地址：http://127.0.0.1:8766/mcp（streamable-http）',
+              '鉴权头必须恰好是 X-Super-Brain-Bridge: <令牌>，不能加 Bearer 前缀。',
+              '握手顺序：initialize → notifications/initialized → 带 Mcp-Session-Id 调 tools/call；'
+                  '裸调会挂起。令牌在 %APPDATA%\\super-brain\\mcp_token.txt。',
+              '当前暴露 52 个工具 + 6 个 MCP resources。首次接入先调 context_manifest '
+                  '拿能力清单（层 / 角色 / actions / routes / 预算）。',
+              '「全量配置 → 复制 MCP 配置」会产出含真实令牌的完整 JSON，任意 Agent 可直接粘贴。',
+            ]),
+            const SizedBox(height: 10),
+            _section('交互与桌面能力', <String>[
+              '3D 星云：纯 Dart CustomPainter + 旋转矩阵 + 透视投影，零第三方 pub 依赖；'
+                  '球壳分布的星系 + 跨簇弱连线，拖拽翻滚、滚轮缩放、双击复位、检索触发星爆。',
+              '2D 语义环 / PAD 散点 / 召回归因三块分析面板可点选联动到记忆检查器。',
+              '硬件仪表：CPU / 内存 / NVIDIA 显卡利用率、显存与温度，2 秒采样。',
+              '托盘与单实例：dart:ffi 调 Win32；点 X 隐藏进托盘，托盘右键「完全退出」'
+                  '会先让后端优雅停机再退出，Job Object 保证前端被强杀时后端不残留。',
+              '开机自启、密钥串（DPAPI）、数据目录迁移均可在「桌面能力」页配置。',
+            ]),
+            const SizedBox(height: 10),
+            _section('长时挂机与数据安全', <String>[
+              '日志：10 MB 单文件切割、保留 5 份，避免挂机把磁盘写满。',
+              'WAL：每 5 分钟及停机时执行 PRAGMA wal_checkpoint(TRUNCATE)，收缩 -wal 文件。',
+              '子进程：CREATE_NO_WINDOW + Job Object，Worker 不会变成孤儿。',
+              '数据目录迁移采用「复制 + 指针」，默认保留原目录；目标已有记忆库时拒绝覆盖。',
+            ]),
+            const SizedBox(height: 10),
+            _section('版本与许可', <String>[
+              'Super Brain v3.1 · Flutter 3.47.9 / Dart 3.13 · Python 3.12 · PyInstaller 6.22',
+              '后端基于 rusEFI/epicEFI 无关的独立实现；Qt 前端仅保留为隐藏调试入口，不随发行包分发。',
+              '图标、界面与内核均为本项目自研，本地使用，不上传任何遥测。',
+            ]),
+          ],
         ),
       );
 }

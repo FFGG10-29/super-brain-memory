@@ -72,6 +72,7 @@ class HeadlessServer:
             registry=self.registry, hippocampus=self.app.hippocampus,
             prefrontal=self.app.prefrontal, relational=self.app.storage.relational,
             engines=self.app.storage.all(), config=self.config,
+            rpc_fallback=self._rpc_via_daemon,
         )
         self.bridge_token = read_local_token() or secrets.token_urlsafe(24)
         if not read_local_token():
@@ -86,6 +87,52 @@ class HeadlessServer:
         self._circadian = circadian
         # Flutter「应用并重启内核」会走到 v3 的 restart RPC；挂钩子保证 MCP 网关同步换核
         self.daemon.restart_kernel = self.restart_kernel
+        # 托盘「完全退出」通过 system.shutdown RPC 触发优雅停机（含 WAL 收缩）
+        self.shutdown_event = threading.Event()
+        self.daemon.shutdown_callback = self.request_shutdown
+        self._wal_thread: threading.Thread | None = None
+
+    def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
+        """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""
+        from v3.rpc import RpcHandler
+        reply = RpcHandler(self.daemon).dispatch({"method": method, "args": args})
+        if not reply.get("ok"):
+            return {"error": "RpcError", "method": method,
+                    "message": str(reply.get("error") or "RPC 调用失败")}
+        result = reply.get("result")
+        return result if isinstance(result, dict) else {"result": result}
+
+    def request_shutdown(self) -> None:
+        """延迟 1 秒置位，让 RPC 响应先发回前端，再走 serve() 的优雅清理。"""
+        threading.Timer(1.0, self.shutdown_event.set).start()
+
+    def _wal_targets(self) -> tuple[str | Path, ...]:
+        """主库 + v3 目录下所有 SQLite 库（inbox / journal / 投影）。"""
+        extra: list[str | Path] = []
+        try:
+            extra.extend(sorted(self.root.glob("*.db")))
+            extra.extend(sorted(self.root.glob("*.sqlite3")))
+        except OSError:
+            pass
+        return tuple(extra)
+
+    def checkpoint_wal(self) -> list[dict[str, Any]]:
+        """立即收缩 WAL（停机前 / 空闲定时都会调）。"""
+        from core.wal_maintenance import checkpoint_data_dir
+        return checkpoint_data_dir(self.config.storage.sqlite_path, extra=self._wal_targets())
+
+    def _start_wal_maintenance(self, interval_s: float = 300.0) -> None:
+        """每 5 分钟在空闲时 TRUNCATE 一次，防止 -wal 挂机膨胀。"""
+        def loop() -> None:
+            while not self.shutdown_event.wait(interval_s):
+                try:
+                    self.checkpoint_wal()
+                except Exception:  # noqa: BLE001  维护线程不能拖垮服务
+                    pass
+        self._wal_thread = threading.Thread(
+            target=loop, name="wal-maintenance", daemon=True,
+        )
+        self._wal_thread.start()
 
     def start(self) -> dict[str, Any]:
         # v3 先起（WS/HTTP/worker 用注入的 app），再起 MCP 网关
@@ -105,6 +152,7 @@ class HeadlessServer:
         launcher = ensure_launcher()
         if self._circadian:
             self.app.circadian.start()
+        self._start_wal_maintenance()
         return {
             "mcp_url": f"http://127.0.0.1:{actual_port}/mcp",
             "http_url": f"http://127.0.0.1:{self.daemon._http_port}/",
@@ -147,6 +195,11 @@ class HeadlessServer:
             self._mcp_server.server_close()
         if self._mcp_thread is not None:
             self._mcp_thread.join(timeout=2.0)
+        # 停机前收缩 WAL，避免被强杀/重启后留下巨大 -wal 与锁
+        try:
+            self.checkpoint_wal()
+        except Exception:  # noqa: BLE001
+            pass
         clear_local_bridge()
         self.app.journal.flush()
         self.daemon.stop()  # 内部会 app.close()（唯一持有者）
@@ -161,10 +214,10 @@ def serve(server: HeadlessServer) -> None:
     print("无头后端已就绪：")
     for key, value in info.items():
         print(f"  {key}: {value}")
-    print("Ctrl-C 优雅停止…")
+    print("Ctrl-C 或 system.shutdown 优雅停止…")
     try:
-        while True:
-            time.sleep(0.5)
+        while not server.shutdown_event.wait(0.5):
+            pass
     except KeyboardInterrupt:
         pass
     finally:

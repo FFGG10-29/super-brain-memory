@@ -16,7 +16,9 @@ New-Item -ItemType Directory -Force -Path $dist | Out-Null
 $flutterRelease = Join-Path $root 'flutter_app\build\windows\x64\runner\Release'
 $flutterExe = Join-Path $flutterRelease 'super_brain.exe'
 if (Test-Path $flutterExe) {
-    Copy-Item -Recurse -Force (Join-Path $flutterRelease '*') $dist
+    # 不用 Copy-Item -Recurse '<dir>\*'：通配符展开会把子目录内容拍平到目标根。
+    & robocopy $flutterRelease $dist /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy Flutter failed with exit code $LASTEXITCODE" }
     Write-Output "Flutter frontend: $flutterExe"
 } else {
     Write-Output 'WARN: Flutter Release not found; run flutter_app\scripts\build_windows.ps1 (requires Flutter SDK).'
@@ -28,7 +30,8 @@ $backendExe = Join-Path $backend 'headless-server.exe'
 if (Test-Path $backendExe) {
     $target = Join-Path $dist 'backend'
     New-Item -ItemType Directory -Force -Path $target | Out-Null
-    Copy-Item -Recurse -Force (Join-Path $backend '*') $target
+    & robocopy $backend $target /E /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "robocopy backend failed with exit code $LASTEXITCODE" }
     Write-Output "Backend: $target\headless-server.exe"
 } else {
     Write-Output 'WARN: backend build missing; run scripts\build_portable.py --headless then PyInstaller super-brain-backend.spec.'
@@ -54,10 +57,39 @@ if ($IncludeDebugConsole) {
     Write-Output "Debug console (hidden entry): $debug  ->  python -m ui.desktop"
 }
 
-# 4) Compile installer if Inno Setup is available
-$iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-if ($iscc) {
-    & $iscc.Source (Join-Path $PSScriptRoot 'setup.iss')
+# 4) Brand icon: same app.ico the old Qt/Python frontend used.
+#    dist\app.ico -> installer root / uninstall entry; backend\app.ico -> Win32 tray.
+$brandIcon = Join-Path $root 'ui\desktop\assets\app.ico'
+if (Test-Path $brandIcon) {
+    Copy-Item -Force $brandIcon (Join-Path $dist 'app.ico')
+    New-Item -ItemType Directory -Force -Path (Join-Path $dist 'backend') | Out-Null
+    Copy-Item -Force $brandIcon (Join-Path $dist 'backend\app.ico')
+    Write-Output "Brand icon: $brandIcon"
+} else {
+    Write-Output 'WARN: brand icon missing; tray falls back to default Windows icon.'
+}
+
+# 5) Compile installer if Inno Setup is available.
+#    winget 默认装到用户级目录且不会加入 PATH，只查 Get-Command 会永远跳过编译。
+$issFile = Join-Path $PSScriptRoot 'setup.iss'
+$isccCmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+$isccPath = if ($isccCmd) { $isccCmd.Source } else { $null }
+if (-not $isccPath) {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+        'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+        'C:\Program Files\Inno Setup 6\ISCC.exe'
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) { $isccPath = $candidate; break }
+    }
+}
+if ($isccPath) {
+    Write-Output "ISCC: $isccPath"
+    & $isccPath $issFile
+    if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
     Write-Output 'installer built in release\'
 } else {
     Write-Output 'ISCC.exe not found; dist\ is ready. Install Inno Setup 6 and run: ISCC.exe scripts\installer\setup.iss'

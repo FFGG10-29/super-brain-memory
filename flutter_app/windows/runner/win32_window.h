@@ -92,6 +92,11 @@ class Win32Window {
 
   bool quit_on_close_ = false;
 
+  // Tray-resident mode: enabled by the Dart side via WM_APP+3 after the tray
+  // starts. When on, WM_CLOSE hides the window and the backend keeps running;
+  // when off, closing the window exits as usual.
+  bool hide_on_close_ = false;
+
   // window handle for top level window.
   HWND window_handle_ = nullptr;
 

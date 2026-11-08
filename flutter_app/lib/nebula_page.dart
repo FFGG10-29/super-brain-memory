@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -8,8 +9,9 @@ import 'brain_client.dart';
 import 'graph_model.dart';
 import 'nebula_math.dart';
 import 'nebula_painter.dart';
+import 'prefs.dart';
 
-/// 3D 星云页：鼠标拖拽翻滚（yaw/pitch）、滚轮缩放、语义星系簇、WS 光脉冲。
+/// 3D 星云页：拖拽翻滚、滚轮缩放、语义星团、景深、LOD 与全量渲染。
 class NebulaPage extends StatefulWidget {
   const NebulaPage({super.key, required this.client});
 
@@ -28,6 +30,57 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   BrainGraph _graph = BrainGraph(nodes: <BrainNode>[], edges: <BrainEdge>[], clusters: <GalaxyCluster>[]);
   String _space = '全部';
   NebulaStyle _style = const NebulaStyle();
+
+  /// 星云外观唯一真源：flutter_prefs.json 的 nebula 段。
+  Map<String, dynamic> _neb() {
+    final value = Prefs.load()['nebula'];
+    return value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
+  }
+
+  double _nebNum(String key, double fallback) => (_neb()[key] as num?)?.toDouble() ?? fallback;
+  bool _nebBool(String key, bool fallback) => _neb()[key] as bool? ?? fallback;
+
+  NebulaStyle _styleFromPrefs() => NebulaStyle(
+        focal: _nebNum('focal_length', 900),
+        // 星点直径钳制在 1.4~4.5：设置页滑块/旧配置里出现 8.0 这种值，
+        // 会让 1261 个节点全变成 9px 光球，屏幕上就只剩「一堆光点」。
+        starSize: _nebNum('star_size', 3.2).clamp(1.4, 4.5),
+        bloom: _nebBool('bloom', true),
+        autoRotate: _nebBool('auto_rotate', true),
+        spinSpeed: _nebNum('spin_speed', 0.00035),
+        showEdges: _nebBool('show_edges', false),
+        showBlackHole: _nebBool('show_black_hole', true),
+        showCore: _nebBool('show_core', true),
+        twinkle: _nebBool('twinkle', true),
+        showGravity: _nebBool('show_gravity', true),
+        parallax: _nebBool('parallax', true),
+        fullMode: _fullMode,
+      );
+
+  void _toggleNeb(String key, bool fallback) {
+    final next = _neb()..[key] = !_nebBool(key, fallback);
+    Prefs.save(<String, dynamic>{'nebula': next});
+    setState(() => _style = _styleFromPrefs());
+  }
+
+  Widget _miniToggle(String label, String key, bool fallback) {
+    final on = _nebBool(key, fallback);
+    return InkWell(
+      onTap: () => _toggleNeb(key, fallback),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: on ? const Color(0x224FC3F7) : const Color(0x111A2ACC),
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(color: on ? const Color(0x664FC3F7) : const Color(0xFF24344C)),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                color: on ? const Color(0xFF9FE6FF) : const Color(0xFF6B839F), fontSize: 10)),
+      ),
+    );
+  }
+
   List<List<double>> _stardust = <List<double>>[];
   final List<Pulse3D> _pulses = <Pulse3D>[];
   final Set<String> _highlighted = <String>{};
@@ -37,8 +90,15 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   double _pitch = -0.22;
   double _zoom = 1.0;
   double _burst = 0.0;
+  double _coreBurst = 0.0;
   String _status = '正在连接记忆内核…';
   String _connection = '离线';
+
+  bool _fullMode = false;
+  bool _loading = false;
+  int _loadAttempts = 0;
+  double _progress = 0.0;
+  bool _panelExpanded = true;
 
   @override
   void initState() {
@@ -46,14 +106,20 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     _controller = AnimationController(vsync: this, duration: const Duration(hours: 1))..repeat();
     _controller.addListener(_tick);
     _buildStardust();
-    _load();
+    _fullMode = Prefs.get<bool>('full_render', false);
+    if (_fullMode) {
+      _loadAll();
+    } else {
+      _load();
+    }
     widget.client.connectEvents();
     _subscription = widget.client.events.listen(_onEvent);
   }
 
   void _buildStardust() {
     final rng = math.Random(20261106);
-    _stardust = List<List<double>>.generate(900, (i) => <double>[
+    // 三层：数量与亮度递增，渲染时按层给不同视差速度。
+    _stardust = List<List<double>>.generate(1500, (i) => <double>[
           rng.nextDouble() * 1600,
           rng.nextDouble() * 1000,
           rng.nextDouble(),
@@ -64,25 +130,138 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   Future<void> _load() async {
     try {
       final graph = await widget.client.graph();
-      final config = await widget.client.config();
-      final nebula = (config['nebula'] as Map<String, dynamic>? ?? <String, dynamic>{});
       if (!mounted) return;
+      if (graph.nodes.isEmpty) {
+        // 后端还没起来 / 数据目录不对：绝不把「空图」当成成功画到屏幕上。
+        _loadAttempts++;
+        debugPrint('[nebula] _load 空结果（第 $_loadAttempts 次）'
+            ' err=${widget.client.lastGraphError}');
+        if (_loadAttempts <= 10) {
+          setState(() => _status = '等待后端返回记忆节点…（第 $_loadAttempts 次重试）');
+          Timer(const Duration(milliseconds: 900), () {
+            if (mounted && _full.nodes.isEmpty && !_loading) unawaited(_load());
+          });
+        } else {
+          setState(() => _status = '后端已连接但 graph 返回 0 节点：请检查数据目录 / 后端日志');
+        }
+        return;
+      }
+      _loadAttempts = 0;
+      debugPrint('[nebula] _load 成功：${graph.nodes.length} 节点，'
+          '首个=${graph.nodes.first.id} 坐标范围检查=${_extent(graph)}');
       setState(() {
         _full = graph;
         _graph = graph.filtered(_space);
-        _style = NebulaStyle(
-          focal: (nebula['focal_length'] as num? ?? 900).toDouble(),
-          starSize: (nebula['star_size'] as num? ?? 3.2).toDouble(),
-          bloom: nebula['bloom'] != false,
-          autoRotate: nebula['auto_rotate'] != false,
-          spinSpeed: (nebula['spin_speed'] as num? ?? 0.00035).toDouble(),
-        );
-        final dust = graph.clusters.fold<int>(0, (sum, c) => sum + c.dust.length);
-        _status = '${graph.nodes.length} 节点 · ${graph.edges.length} 突触 · '
-            '${graph.clusters.length} 星系 · $dust 星尘粒子';
+        _style = _styleFromPrefs();
+        _status = '${graph.nodes.length} 节点（默认 200）· ${graph.edges.length} 突触 · '
+            '${graph.clusters.length} 星团';
       });
     } catch (error) {
+      debugPrint('[nebula] _load 异常：$error');
       if (mounted) setState(() => _status = '后端未连接：$error');
+      _loadAttempts++;
+      if (_loadAttempts <= 10) {
+        Timer(const Duration(milliseconds: 900), () {
+          if (mounted && _full.nodes.isEmpty && !_loading) unawaited(_load());
+        });
+      }
+    }
+  }
+
+  /// 诊断用：坐标是否全为 0 / NaN / 溢出（肉眼看不见节点的第二类原因）。
+  String _extent(BrainGraph graph) {
+    var minX = double.infinity, maxX = -double.infinity;
+    var bad = 0;
+    for (final node in graph.nodes) {
+      final x = node.position.x;
+      if (x.isNaN || x.isInfinite) bad++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+    }
+    return 'x∈[${minX.toStringAsFixed(1)}, ${maxX.toStringAsFixed(1)}] bad=$bad';
+  }
+
+  BrainNode _nodeFromRow(Map<String, dynamic> row) {
+    final pad = (row['pad'] as List<dynamic>? ?? <dynamic>[0, 0, 0])
+        .map((v) => (v as num? ?? 0).toDouble())
+        .toList();
+    return BrainNode(
+      id: row['id']?.toString() ?? '',
+      content: row['content']?.toString() ?? '',
+      memoryType: row['memory_type']?.toString() ?? 'fact',
+      tier: row['tier']?.toString() ?? 'buffer',
+      confidence: (row['confidence'] as num? ?? 0.5).toDouble(),
+      isEmotion: row['is_emotion'] == true || row['memory_type'] == 'emotion',
+      pad: pad,
+    );
+  }
+
+  /// 全量模式：向后端请求全部记忆，按 500 一批渐进渲染，边收边出图。
+  /// 全部到齐后重排成「致密星团 + 悬臂」，并靠 LOD 保住帧率。
+  Future<void> _loadAll() async {
+    setState(() {
+      _loading = true;
+      _progress = 0.0;
+      _status = '正在向后端请求全量记忆…';
+    });
+    try {
+      final rows = await widget.client.allMemories();
+      if (!mounted) return;
+      debugPrint('[nebula] 全量模式取到 ${rows.length} 行');
+      if (rows.isEmpty) {
+        setState(() {
+          _loading = false;
+          _status = '未取到全量记忆，已保留默认视图';
+        });
+        await _load();
+        return;
+      }
+      // 第一批先建好星团骨架，后续批次只做轻量追加，避免逐批 O(n²) 聚类。
+      final first = rows.take(500).toList();
+      _full = BrainGraph.fromRows(first);
+      _graph = _full.filtered(_space);
+      for (var i = 500; i < rows.length; i += 500) {
+        final end = math.min(i + 500, rows.length);
+        _full.addNodes(rows.sublist(i, end).map(_nodeFromRow).toList());
+        if (!mounted) return;
+        setState(() {
+          _graph = _full.filtered(_space);
+          _progress = end / rows.length;
+          _status = '正在加载 $end / ${rows.length} 条记忆节点 · 渲染压力极大…';
+        });
+        // 让出一帧，保证进度条与新增节点真的被绘制出来。
+        await Future<void>.delayed(const Duration(milliseconds: 24));
+      }
+      _full.recluster();
+      if (!mounted) return;
+      setState(() {
+        _graph = _full.filtered(_space);
+        _style = _styleFromPrefs();
+        _loading = false;
+        _progress = 1.0;
+        _status = '${_graph.nodes.length} 节点 · 全量渲染 · 拉远自动 LOD 保命';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _status = '全量加载失败：$error';
+      });
+      await _load();
+    }
+  }
+
+  void _setFullMode(bool on) {
+    Prefs.save(<String, dynamic>{'full_render': on});
+    setState(() {
+      _fullMode = on;
+      _style = _styleFromPrefs();
+      _highlighted.clear();
+    });
+    if (on) {
+      unawaited(_loadAll());
+    } else {
+      unawaited(_load());
     }
   }
 
@@ -91,6 +270,12 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     final type = event['type']?.toString() ?? '';
     if (type == 'connected') {
       setState(() => _connection = 'WS 已连接');
+      // WS 有时比后端监听端口更晚就绪：首屏那次取数可能已经失败。
+      // 连上就把空图重新拉一遍，否则界面会一直停在 0 节点。
+      if (_full.nodes.isEmpty && !_loading) {
+        debugPrint('[nebula] WS 已连接，重新加载记忆图');
+        unawaited(_fullMode ? _loadAll() : _load());
+      }
       return;
     }
     if (type == 'reconnecting') {
@@ -108,25 +293,44 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
       _full.addNode(node);
       _graph = _full.filtered(_space);
       _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(node), similarity: 0.85));
+      _coreBurst = 1.0;
       setState(() => _status = '${_graph.nodes.length} 节点 · 新记忆已点亮');
-    } else if (type == 'pulse') {
-      final target = _graph.byId[event['target']?.toString() ?? ''];
-      if (target != null) {
-        _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(target), similarity: 0.7));
+    } else if (type == 'pulse' || type == 'recall' || type == 'node_accessed') {
+      final ids = <String>{};
+      final target = event['target']?.toString();
+      if (target != null && target.isNotEmpty) ids.add(target);
+      final raw = event['hits'] ?? event['ids'];
+      if (raw is List) {
+        for (final hit in raw) {
+          final id = hit is Map ? (hit['id']?.toString() ?? '') : hit.toString();
+          if (id.isNotEmpty) ids.add(id);
+        }
+      }
+      var lit = 0;
+      for (final id in ids) {
+        final node = _graph.byId[id];
+        if (node == null) continue;
+        node.flash = 1.0;
+        _pulses.add(Pulse3D(from: _origin, to: _graph.worldOf(node), similarity: 0.7));
+        lit++;
+      }
+      if (lit > 0 && mounted) {
+        _coreBurst = 1.0;
+        setState(() => _status = '$lit 条记忆刚被用到 · 中枢爆发');
       }
     }
   }
 
   void _tick() {
-    if (_pulses.isEmpty && _highlighted.isEmpty && _burst <= 0) return;
     for (final pulse in _pulses) {
       pulse.step();
     }
     _pulses.removeWhere((pulse) => pulse.done);
     for (final node in _graph.nodes) {
-      if (node.flash > 0) node.flash = math.max(0, node.flash - 0.04);
+      if (node.flash > 0) node.flash = math.max(0, node.flash - 0.012);
     }
-    if (_burst > 0) _burst = math.max(0, _burst - 0.004); // 星爆缓慢消散
+    if (_burst > 0) _burst = math.max(0, _burst - 0.004);
+    if (_coreBurst > 0) _coreBurst = math.max(0, _coreBurst - 0.012);
   }
 
   Future<void> search(String query) async {
@@ -145,8 +349,9 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         }
       }
       setState(() {
-        _burst = 1.0; // 触发 LivingMemory 式检索星爆
-        _status = '「$query」命中 ${hits.length} 条 · 星爆齐射';
+        _burst = 1.0;
+        _coreBurst = 1.0;
+        _status = '「$query」命中 ${hits.length} 条 · 中枢爆发 + 星爆齐射';
       });
     } catch (error) {
       if (mounted) setState(() => _status = '召回失败：$error');
@@ -215,6 +420,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
                       highlighted: _highlighted,
                       stardust: _stardust,
                       burst: _burst,
+                      coreBurst: _coreBurst,
                     ),
                     child: Container(),
                   );
@@ -223,40 +429,152 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
             ),
           ),
         ),
+
+        // ── 左上：半透明毛玻璃悬浮控制面板（可折叠）────────────────────
         Positioned(
           left: 18,
           top: 16,
           child: _GlassPanel(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                const Text('超级大脑 · 3D 星云', style: TextStyle(color: Color(0xFF7FE9FF), fontSize: 15, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 6),
-                Text(_status, style: const TextStyle(color: Color(0xFF9FB6D4), fontSize: 11)),
-                Text(' $_connection · 拖拽翻滚 · 滚轮缩放 · 双击复位', style: const TextStyle(color: Color(0xFF6B839F), fontSize: 10)),
-              ],
+            child: AnimatedSize(
+              duration: const Duration(milliseconds: 180),
+              alignment: Alignment.topLeft,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+                    const Text('超级大脑 · 3D 星云',
+                        style: TextStyle(color: Color(0xFF7FE9FF), fontSize: 13,
+                            fontWeight: FontWeight.w600)),
+                    const SizedBox(width: 8),
+                    InkWell(
+                      onTap: () => setState(() => _panelExpanded = !_panelExpanded),
+                      child: Icon(
+                        _panelExpanded ? Icons.unfold_less : Icons.unfold_more,
+                        size: 15, color: const Color(0xFF6B839F),
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 5),
+                  Text(_status, style: const TextStyle(color: Color(0xFF9FB6D4), fontSize: 10)),
+                  if (_loading) ...<Widget>[
+                    const SizedBox(height: 6),
+                    SizedBox(
+                      width: 250,
+                      height: 3,
+                      child: LinearProgressIndicator(
+                        value: _progress,
+                        backgroundColor: const Color(0xFF1B2A42),
+                        valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF4FC3F7)),
+                      ),
+                    ),
+                  ],
+                  if (_panelExpanded) ...<Widget>[
+                    const SizedBox(height: 4),
+                    Text('$_connection · 拖拽翻滚 · 滚轮缩放 · 双击复位',
+                        style: const TextStyle(color: Color(0xFF6B839F), fontSize: 9)),
+                    const SizedBox(height: 7),
+                    InkWell(
+                      onTap: () => _setFullMode(!_fullMode),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: _fullMode ? const Color(0x33FF9A5B) : const Color(0x140A1B2E),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                              color: _fullMode ? const Color(0x88FF9A5B) : const Color(0x442F4A6B)),
+                        ),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+                          Icon(_fullMode ? Icons.radio_button_checked : Icons.radio_button_off,
+                              size: 12,
+                              color: _fullMode
+                                  ? const Color(0xFFFFC08A)
+                                  : const Color(0xFF6B839F)),
+                          const SizedBox(width: 6),
+                          Text('全量渲染模式 (性能警告)',
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  color: _fullMode
+                                      ? const Color(0xFFFFD2AC)
+                                      : const Color(0xFF9FB6D4))),
+                        ]),
+                      ),
+                    ),
+                    const SizedBox(height: 7),
+                    SizedBox(
+                      width: 268,
+                      child: Wrap(spacing: 5, runSpacing: 5, children: <Widget>[
+                        _miniToggle('突触连线', 'show_edges', false),
+                        _miniToggle('辉光', 'bloom', true),
+                        _miniToggle('呼吸闪烁', 'twinkle', true),
+                        _miniToggle('中枢', 'show_core', true),
+                        _miniToggle('黑洞', 'show_black_hole', true),
+                        _miniToggle('引力线', 'show_gravity', true),
+                        _miniToggle('视差星尘', 'parallax', true),
+                        _miniToggle('自动旋转', 'auto_rotate', true),
+                      ]),
+                    ),
+                    const SizedBox(height: 6),
+                    const SizedBox(
+                      width: 268,
+                      child: Text(
+                        '近处节点大而亮、远处小而暗偏红/蓝；镜头拉远自动关连线与标签。'
+                        '中枢＝刚用过的记忆，黑洞＝久未使用，被召回即闪金光。',
+                        style: TextStyle(color: Color(0xFF4E6A8A), fontSize: 9, height: 1.5),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
         ),
+
+        // ── 右上：检索 ──────────────────────────────────────────────────
         Positioned(
           right: 18,
           top: 16,
           child: _GlassPanel(
             child: SizedBox(
-              width: 260,
+              width: 240,
               child: TextField(
                 controller: _search,
                 style: const TextStyle(color: Colors.white, fontSize: 12),
                 decoration: const InputDecoration(
                   hintText: '检索记忆并激活光脉冲…',
-                  hintStyle: TextStyle(color: Color(0xFF63788F), fontSize: 12),
+                  hintStyle: TextStyle(color: Color(0xFF63788F), fontSize: 11),
                   border: InputBorder.none,
-                  icon: Icon(Icons.search, color: Color(0xFF4FC3F7), size: 18),
+                  icon: Icon(Icons.search, color: Color(0xFF4FC3F7), size: 17),
                 ),
                 onSubmitted: search,
               ),
             ),
+          ),
+        ),
+
+        // ── 右下：小地图 / 雷达 ─────────────────────────────────────────
+        Positioned(
+          right: 18,
+          bottom: 18,
+          child: _GlassPanel(
+            padding: 8,
+            child: Column(mainAxisSize: MainAxisSize.min, children: <Widget>[
+              const Text('全局星图',
+                  style: TextStyle(color: Color(0xFF6B839F), fontSize: 9)),
+              const SizedBox(height: 4),
+              SizedBox(
+                width: 104,
+                height: 104,
+                child: CustomPaint(
+                  painter: MiniMapPainter(
+                    clusters: _graph.clusters,
+                    yaw: _yaw,
+                    zoom: _zoom,
+                    nodeCount: _graph.nodes.length,
+                  ),
+                ),
+              ),
+            ]),
           ),
         ),
       ],
@@ -264,18 +582,29 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   }
 }
 
+/// 半透明毛玻璃悬浮面板：背景高斯模糊 + 低不透明度底色。
 class _GlassPanel extends StatelessWidget {
-  const _GlassPanel({required this.child});
+  const _GlassPanel({required this.child, this.padding = 12});
   final Widget child;
+  final double padding;
 
   @override
-  Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: const Color(0xE0061020),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: const Color(0xFF1B2A42)),
+  Widget build(BuildContext context) => ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+          child: Container(
+            padding: EdgeInsets.all(padding),
+            decoration: BoxDecoration(
+              color: const Color(0x700A1526),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0x334FC3F7)),
+              boxShadow: const <BoxShadow>[
+                BoxShadow(color: Color(0x33000000), blurRadius: 18, offset: Offset(0, 6)),
+              ],
+            ),
+            child: child,
+          ),
         ),
-        child: child,
       );
 }

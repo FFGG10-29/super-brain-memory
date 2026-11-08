@@ -15,23 +15,9 @@ from core.interfaces import HealthCheckable, RelationalRepository
 from brain.hippocampus import Hippocampus
 from brain.prefrontal import Prefrontal
 from gateway.registry import Agent, AgentRegistry
+from gateway.tool_catalog import RPC_MAP, TOOL_SCHEMAS, manifest as context_manifest
 
 __all__ = ["MCPToolkit", "TOOL_SCHEMAS"]
-
-TOOL_SCHEMAS = [
-    {"name": "save_memory", "description": "写入一条记忆（含 PAD 情绪坐标）",
-     "inputSchema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
-    {"name": "recall_memory", "description": "六路召回并收敛注入",
-     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
-    {"name": "timeline_query", "description": "按事件时间查询记忆",
-     "inputSchema": {"type": "object", "properties": {"since_ms": {"type": "integer"}, "until_ms": {"type": "integer"}}}},
-    {"name": "profile_read", "description": "读取当前 Agent 的画像记忆",
-     "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "conflict_report", "description": "列出被封存/演进的历史事实",
-     "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "health_check", "description": "六引擎健康状态",
-     "inputSchema": {"type": "object", "properties": {}}},
-]
 
 
 class MCPToolkit:
@@ -51,6 +37,7 @@ class MCPToolkit:
         relational: RelationalRepository,
         engines: list[HealthCheckable] | None = None,
         config: BrainConfig | None = None,
+        rpc_fallback: Any | None = None,
     ) -> None:
         self._registry = registry
         self._hippocampus = hippocampus
@@ -58,6 +45,8 @@ class MCPToolkit:
         self._relational = relational
         self._engines = engines or []
         self._config = config or get_config()
+        # 未命中内置工具时转发给 v3 RPC：所有扩展能力自动成为 MCP 工具
+        self._rpc_fallback = rpc_fallback
 
     def authenticate(self, headers: dict) -> Agent:
         authorization = str(headers.get("authorization") or headers.get("Authorization") or "")
@@ -101,14 +90,27 @@ class MCPToolkit:
             }
 
         if tool == "recall_memory":
-            limit = int(args.get("limit") or self._config.recall.top_k)
-            # namespaces=() 表示不按命名空间过滤：任何 Agent 写的记忆，其它 Agent 都能召回
-            hits = self._prefrontal.recall(
-                str(args.get("query", "")), agent_id=agent.agent_id,
-                namespaces=(), limit=limit,
-            )
-            return {
-                "hits": [
+            # 默认收敛到 Top 3：给 Agent 的注入越少越不容易发散。
+            # 顺手兼容历史上被忽略的 top_k 参数；显式传 limit 时完全尊重调用方。
+            limit = int(args.get("limit") or args.get("top_k") or min(self._config.recall.top_k, 3))
+            query = str(args.get("query", ""))
+            # 默认走只读投影的字符 2-gram 召回（毫秒级，与 Flutter 前端一致）。
+            # 六通道 embedding/RRF/精排实测 30-45s，只有 deep=true 才走，
+            # 避免 Agent 每轮提问都卡在检索上（DSH 档案里的 known recall-hang）。
+            deep = bool(args.get("deep", False))
+            from core.context_layers import get_context_layers
+
+            layers = get_context_layers()
+            mode = "projection"
+            rows: list[dict[str, Any]] = []
+            injection = ""
+            if deep or self._rpc_fallback is None:
+                mode = "six-channel"
+                # namespaces=() 表示不按命名空间过滤：任何 Agent 写的记忆其它 Agent 都能召回
+                hits = self._prefrontal.recall(
+                    query, agent_id=agent.agent_id, namespaces=(), limit=limit,
+                )
+                rows = [
                     {
                         "id": hit.neuron.uuid7_id,
                         "content": hit.neuron.content,
@@ -117,8 +119,41 @@ class MCPToolkit:
                         "channels": list(hit.channels),
                     }
                     for hit in hits
-                ],
-                "injection": self._prefrontal.inject(hits, agent_id=agent.agent_id),
+                ]
+                injection = self._prefrontal.inject(hits, agent_id=agent.agent_id)
+            else:
+                fast = self._rpc_fallback("recall", {"q": query, "limit": limit, "deep": False})
+                raw_hits = fast.get("hits", []) if isinstance(fast, dict) else []
+                rows = [
+                    {
+                        "id": str(row.get("id", "")),
+                        "content": str(row.get("content", "")),
+                        "score": float(row.get("score", 0.0)),
+                        "pad": list(row.get("pad") or []),
+                        "channels": list(row.get("channels") or []),
+                    }
+                    for row in raw_hits if isinstance(row, dict)
+                ]
+                head = [
+                    "【记忆注入】以下为只读投影召回的已核验记忆",
+                    "【执行约束】据此收敛作答：停止发散、不展开无关联想、不复述记忆原文；"
+                    "未命中的细节按未知处理，禁止编造。",
+                ]
+                for index, row in enumerate(rows[:3], start=1):
+                    text = row["content"]
+                    if len(text) > 120:
+                        text = text[:120].rstrip() + "…（摘要）"
+                    head.append(f"{index}. {text}")
+                injection = "\n".join(head) if rows else ""
+            # 每轮确定性注入的运行时记忆 + 相关档案摘要（dsh-mnemon 的三层 View）
+            projection = layers.compose(query)
+            if projection:
+                injection = (injection + "\n\n" + projection).strip()
+            return {
+                "hits": rows,
+                "injection": injection,
+                "context_layers": layers.status()["layers"],
+                "recall_mode": mode,
             }
 
         if tool == "timeline_query":
@@ -149,7 +184,18 @@ class MCPToolkit:
         if tool == "health_check":
             return {"engines": [status.as_dict() for status in (e.health() for e in self._engines)]}
 
-        raise ValueError(f"未知工具: {tool}")
+        if tool == "context_manifest":
+            # 能力发现：等价于 DSH Host SDK 的 manifest，Agent 首次接入先调它
+            return context_manifest()
+
+        method = RPC_MAP.get(tool)
+        if method is not None and self._rpc_fallback is not None:
+            args = dict(args)
+            if tool == "recall_deep":
+                args["deep"] = True
+            return self._rpc_fallback(method, args)
+        raise ValueError(f"未知工具: {tool}" + (
+            "（该工具需要桌面后端在线）" if method is not None else ""))
 
     def tool_list(self) -> list[dict]:
         return list(TOOL_SCHEMAS)

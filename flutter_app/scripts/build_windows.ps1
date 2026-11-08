@@ -25,7 +25,9 @@ try {
 
 & flutter pub get 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'flutter pub get failed' }
-& flutter build windows --release 2>&1 | Out-Host
+# --no-tree-shake-icons: 图标被 tree-shake 后，只在 const Map 里动态引用的字形
+# （如左栏「记忆洞察」「Agent 上下文」）会缺失，界面表现为菜单没图标。
+& flutter build windows --release --no-tree-shake-icons 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'flutter build windows failed' }
 
 $exe = Join-Path $app 'build\windows\x64\runner\Release\super_brain.exe'

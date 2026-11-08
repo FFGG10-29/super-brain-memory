@@ -1,6 +1,6 @@
 # 工作记忆 · 当前状态
 
-> 最后更新：2026-11-08 ｜ 当前阶段：**无头后端单进程统一内核 + Flutter 十四页已落地；后端改为冻结 exe 随 Flutter 安装包部署，Qt 降级为隐藏调试入口、不进发行包；待装 Flutter SDK 编译验收后再决定删 Qt；旧便携包已出（9.6GB，冻结态 GPU_OK）**
+> 最后更新：**2026-11-09** ｜ 当前阶段：**Flutter 前端定稿并已出安装包**（MSVC 已装，`flutter build windows --release` 通过；7 组主导航 + 组内子标签；3D 星云改为「星团云气 + 分类着色 + 细星点」；首屏 0 节点与节点糊成光球两个致命问题已定位修复；MCP 53 工具 / 6 resources 可从任意 Agent 直接接入；`flutter analyze` 0 issues、`pytest 141 passed`）
 
 ## 1. 进度总览
 
@@ -39,14 +39,14 @@
 | 首页资源仪表 + 模型运行总览 | ✅ | `system_stats.py`（psutil + nvidia-smi，2s 采样）；星云页顶部 CPU/内存/显卡；模型页顶部三通道 × 本地/远程 × 设备 × 状态 |
 | 窗口自适应屏幕 | ✅ | `MainWindow._fit_to_screen()`：按可用区收敛并居中；接口页改滚动区（原最小高度 859 会把窗口顶到 937） |
 | v3 事件驱动内核 | ✅ 与 v2 并行可回退 | `v3/`：daemon(HTTP 8768 + WS 8767) 只受理（journal group commit + fsync → inbox 租约队列 → 202），无状态 worker 后台 claim 复用 v2 认知链路；supervisor Job Object 防孤儿；`v3/web/` WebGL 星云由 daemon 直接 serve（见 ADR-019） |
-| Flutter 3D 星云客户端 | ✅ 十四页（待真机编译验收） | `flutter_app/`：WS RPC（`ws://host:8767/ws`，12s 超时降级 HTTP）连无头后端；纯 Dart 3D 星云（球壳/螺旋臂布局，CustomPainter 批量 drawPoints，3000+ 节点）；`v3/rpc.py` + `v3/rpc_ext.py` 是 RPC 分发器（见 ADR-020/021）。仓库内**无编译产物**，本机也未安装 Flutter SDK |
+| Flutter 3D 星云客户端 | ✅ 定稿（已编译出包） | `flutter_app/`：WS RPC（`ws://host:8767/ws`，12s 超时降级 HTTP）连无头后端；纯 Dart 3D 星云（球壳/螺旋臂布局，CustomPainter 批量 drawPoints，3000+ 节点）；`v3/rpc.py` + `v3/rpc_ext.py` 是 RPC 分发器（见 ADR-020/021）。仓库内**无编译产物**，本机也未安装 Flutter SDK |
 | 无头后端（单进程统一内核） | ✅ 端到端验收通过 | `headless_server.py`：`python -m headless_server` 一份 `build_app()` 同时开 8766 `/mcp`（含持久令牌 + stdio 启动器）、8768 `/v1/*`、8767 `/ws`；`V3Daemon(app=...)` 注入共享 app；配置/启动器/业务服务下沉到 `core/user_config.py`、`gateway/bridge_launcher.py`、`brain/memory_service.py`（见 ADR-021） |
 | Flutter 功能补齐 | ✅ | 新增记忆检查器（纠正/遗忘/敏感/审计）、事件时间轴、批量导入、全量配置（动态表单 + 预设 + Core Memory + MCP 配置）；`v3/rpc_ext.py` 补齐 `memory.*`/`timeline`/`import_memories`/`config.*`/`core_memory.*`/`gateway.status`；召回改走真实六通道而非 2-gram |
 | 后端自动拉起（进程分离） | ✅ | `backend_launcher.dart` 探活 `/v1/health` → `Process.start(..., detached)` 拉起 `python -m headless_server` → 轮询 30s；启动命令/目录存 `flutter_prefs.json`，「全量配置」页可改 |
 | 端到端验收脚本 | ✅ 全 PASS | `scripts/verify_headless.py`：临时目录隔离，验证 MCP 六工具、异步写入、全部 RPC（含此前 process 模式必失败的 4 个）、真实召回、导入、纠正、热重启换核后 MCP 仍可用 |
 | 后端随 Flutter 安装包部署 | ✅ 链路就绪（产物待构建） | `scripts/build_portable.py --headless` 生成 `backend_entry.py` + `super-brain-backend.spec`（excludes PySide6/keyring/psutil/ui.desktop），产物 `headless-server.exe`；`installer/build.ps1` 组装 `super_brain.exe` + `backend\`，`setup.iss` 安装后只启 Flutter；`backend_launcher.dart` 优先用安装目录 exe；一键脚本 `scripts/build_full_release.ps1`（`-InstallSdk` 可 clone Flutter stable）。见 ADR-022 |
 | Qt 隐藏调试入口 | ✅ 默认不加载 | `python -m ui.desktop` 是唯一入口；源码约 7,000 行 / 630 KB，真正开销在 PySide6 200–300MB，已排除出发行包；`-IncludeDebugConsole` 才额外打包。与后端互斥（Kùzu 单写者） |
-| 本机 SDK 事实 | ⚠ 无 Flutter SDK | C:/D: 全盘检索无 `flutter.bat` / `dart.exe`、无 `super_brain.exe`；环境变量 `FLUTTER_ROOT/DART_SDK/PUB_CACHE` 全空、PATH 无 flutter/dart。当前占用 8766 的是旧 `super-brain.exe`（Qt 桌面端，PID 12688），预览实例改用隔离数据 + 18766/7/8 |
+| 本机 SDK 事实 | ✅ 已装齐 | Flutter 3.47.9 / Dart 3.13.7 在 `D:/flutter`；VS BuildTools 已装（MSVC x64）；`flutter build windows --release --no-tree-shake-icons` 通过，产物 `flutter_app/build/windows/x64/runner/Release/`；绿色版验证目录 `D:/SuperBrain/` |
 
 启动：`python -m ui.desktop`；改完代码重启：`powershell -File scripts/restart_frontend.ps1`。
 离屏整窗截图：`python scripts/desktop_screenshots.py` → `data/screenshots/`。
@@ -180,3 +180,118 @@ Set-Location -LiteralPath 'B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory
 - `super-brain-cli.exe --probe-models --json` → `verdict=GPU_OK`、`all_on_gpu=true`、
   llm `active_gpu_layers=-1`、embedder/reranker 均 `CUDAExecutionProvider`、`sparse_enabled=true`、`cuda_dll_complete=true`（驱动 API 13.0）。
 - `super-brain.exe` 正常出窗口（十一页导航齐全），数据落 `%APPDATA%`，不写安装目录。
+
+---
+
+## 9. 2026-11-08 增补：Flutter 完全替代 Qt 的 6 项能力（已落地）
+
+用户要求 Flutter 完美替代 Qt，ADR-021 列的 6 项差异全部写成可运行代码，导航 **14 → 18 页**。
+
+| 能力 | 后端 | Flutter |
+|---|---|---|
+| CPU/内存/显卡仪表 | `core/system_stats.py`（psutil + nvidia-smi，2s 守护线程） | `system_gauges.dart`：顶栏环形仪表 + `硬件仪表` 大表页 |
+| 召回归因 | `recall` 已有 `audit.counts/injected/weights/similarities` + `injection` | `analytics.dart::RecallAnalyticsPage`：通道分解 / 单条归因 / 注入上下文 |
+| PAD 认知分区 | `pad.distribution`（主库 pad_p/a/d） | `PadAnalyticsPage`：P–A 散点 + 分类型/分层均值 |
+| 2D 语义环联动 | `graph.projection`（Qt `_semantic_position` 等价，确定性坐标） | `Graph2DPage` + `MemoryInspectorPage.initialId` + 3D 星云回跳 |
+| 托盘/单实例/自启 | `core/win32_tray.py`（ctypes Shell_NotifyIconW + WS 广播）、`core/desktop_features.py`（winreg） | `win32.dart`（端口锁 + user32 FFI）、`win32_window.cpp` 拦截 WM_CLOSE、`桌面能力` 页 |
+| 钥匙串 + 数据迁移 | `SecretStore`（keyring→DPAPI 兜底）、`migrate_data()` + `runtime_paths.data_dir()` 读 `data_pointer.json` | `system_features.dart` 页 |
+
+关键坑（新增）：
+- **冻结包 excludes `ui.desktop`**：后端能力必须全部下沉到 `core.*`，不能在 `v3/rpc_ext.py` 里 import `ui.desktop.*`，否则发行包启动即 ModuleNotFoundError。
+- **hiddenimports**：`scripts/build_portable.py` 的 `--headless` spec 已补 `core.system_stats` / `core.desktop_features` / `core.win32_tray` / `psutil` / `winreg`（函数内惰性 import 静态分析会漏）。
+- **ctypes 类型**：`ctypes.wintypes` 没有 `HCURSOR/HBRUSH/HMENU` 别名，所有 Win32 句柄统一用 `wintypes.HANDLE`；`GetModuleHandleW` 必须显式设 `restype=HINSTANCE`，否则 x64 指针被截断成 32 位。
+- **零 pub 依赖**：`dart:ffi` 调 `user32.dll`，UTF-16 缓冲区用 `msvcrt.dll` 的 malloc/free；没引入 `package:ffi` 或托盘/window_manager 插件。
+- **数据迁移 pointer 同源**：`desktop_features._pointer_path()` 与 `runtime_paths._data_pointer()` 都必须用 `user_dir()/data_pointer.json`，不要用 `SUPER_BRAIN_CONFIG_DIR`（两套目录会不一致）。
+
+验证：`flutter analyze` **No issues found**、`pytest tests -q` **141 passed**、新增 RPC 隔离探针 9 方法全 OK（PAD 均值/投影确定性断言通过）、`py_compile` 全过、托盘 ctypes start/stop 实测通过、采样真实返回 GTX 1060/49°C。
+唯一剩余阻塞：**MSVC 需管理员 UAC**，`flutter build windows --release` 与 C++ `WM_CLOSE` 拦截尚未真机编译验收。
+
+---
+
+## 10. 2026-11-09 增补：Flutter 前端定稿（已出安装包）
+
+### 10.1 导航结构（最终形态）
+
+左栏 **7 组主导航**，组内页面放顶栏下的 `ChoiceChip` 子标签：
+
+| 组 | 页面（全局索引） |
+|---|---|
+| 星云视图 | 3D 星云 `0` |
+| 记忆工作台 | 记忆管理 `1` · 召回测试 `2` · 批量导入 `14` |
+| 记忆洞察 | PAD 认知分区 `4` · 2D 语义环 `5` · 记忆检查器 `12` · 事件时间轴 `13` |
+| Agent 上下文 | 上下文状态 `18` · 运行时记忆 `19` · 项目档案 `20` · 记忆空间 `21` · 技能管理 `22` |
+| 运行监控 | 硬件仪表 `3` · 系统概览 `6` · 展示数据 `7` · 模型配置 `8` · 接口与端口 `9` |
+| 系统设置 | 设置 `11` · 全量配置 `15` · 桌面能力 `16` · 同步与备份 `10` |
+| 关于 | 关于 `17` |
+
+- 设置页内部再分 3 个子标签（连接 / 外观 / 诊断），星云参数只在「外观」出现一次；
+- 「全量配置」按 12 组分类，常用组置顶、高级组默认折叠，**鼠标悬停每个字段有中文说明**
+  （`flutter_app/lib/config_docs.dart` 由 `ui/desktop/widgets.py` 的 FIELD_LABELS/HINTS 用 AST 抽取生成，128/128 全中文）；
+- 「记忆管理」按 `memory_type` / `tier` 分类 Chip，UUIDv7 时间戳解析后**最新记忆置顶**。
+
+### 10.2 两个致命问题（根因与修法，务必记住）
+
+**① 首屏 0 节点（记忆 1000 / 节点 0）**
+
+- 根因：`main.dart` 里 `BackendLauncher.ensureRunning()` 是 `unawaited`，UI 首帧立刻构建；
+  `NebulaPage.initState → client.graph()` 此时后端还没监听端口 → WS 连不上 → 走 HTTP 兜底 →
+  连接被拒 → 返回 `{'error': ...}`。
+  而 `BrainGraph.fromJson()` 对没有 `nodes` 的 Map **不报错、直接产出空图**，
+  `_load()` 又把它当成功 → 状态栏「0 节点（默认 200）」，之后再也不会重试。
+- 修法（`brain_client.dart` / `nebula_page.dart`）：
+  1. `graph()` 带 3 次重试，且「没有 nodes 字段」按失败处理并记 `lastGraphError`；
+  2. `_load()` 空结果不当成功，900ms 重试最多 10 次，UI 显示「等待后端返回记忆节点…（第 n 次重试）」；
+  3. `_onEvent('connected')` 时若仍是空图，自动重新加载（WS 比端口晚就绪的兜底）；
+  4. `_httpFallback` 对 `{"result": {...}}` 的 **Map 结果也要拆包**（旧版只拆数组，
+     这正是「后端明明有 1261 条、星云却是 0 节点」的另一条路径）；
+  5. 加 `debugPrint('[nebula] graph ok: raw/parsed/edges/clusters')` 与坐标范围检查，
+     以后同类问题看日志即可定位，不用再猜。
+
+**② 节点糊成「一堆光点」**
+
+- 根因：`%APPDATA%\super-brain\flutter_prefs.json` 里 `nebula.star_size = 8.0`（默认 3.2）。
+  渲染时近景点直径 ≈ `starSize × 1.15` → 9px 光球，1261 个叠在一起就是肥皂泡。
+- 修法：`_styleFromPrefs()` 把 `starSize` 钳在 **1.4~4.5**；点直径按 `0.58×` 收小；
+  bloom 只在最近的一小撮点上、alpha 0.06；结构改由**每簇一团 tint 色径向云气**承担（alpha 0.20）。
+
+### 10.3 星云视觉（定稿参数）
+
+- **布局**：内容 2-gram 贪心聚类 → 12 星团；簇内 66% 双致密核（近高斯）+ 34% 对数螺旋悬臂；
+  跨簇弱连线；世界坐标归一化到 `targetExtent = 350`（否则 1261 节点时簇心飞到 ±800，屏幕只剩零星几粒）。
+- **着色**：按 `memory_type` 分类上色——`fact` 金橙 `0xFFFFB454`、`scenario` 紫罗兰 `0xFF9B72FF`、
+  `code` 青蓝 `0xFF3BE8FF`、`emotion` 紫红 `0xFFFF3F86`、`profile` 暖金 `0xFFFFD166`；
+  `fact` 内再按内容正则识别代码类；星团主色 = 簇内多数分类。
+  注意：**不要用后端 `is_emotion`（pad_a>0.6）兜底**，它会把 90% 节点染成紫红。
+- **中枢**：白色恒星，`_drawCore` 整体压暗约 30%（核心 0xC8 白、半径 27），星芒变细变短。
+- **黑洞**：半径整体缩到原来的 ~62%（视界 38 / 光子环 44 / 吸积盘 96），移到 `(0.88w, 0.66h)`，
+  只作角落景深道具。
+- **连线**：`show_edges` 默认关；开启后按 6 个相位桶用 `sin(spinTime*1.7 + phase)` 做透明度/线宽呼吸。
+- **性能**：LOD 三档（zoom<0.72 只画点）、全量模式 `memories(limit=100000)` 兼容路径 + 500/批渐进渲染，
+  500 条后 `recluster()` 一次成团。
+
+### 10.4 图标树摇（两个菜单图标空白）
+
+- 现象：左栏「记忆洞察」「Agent 上下文」两项图标空白，其余正常。
+- 根因：`flutter build windows --release` 默认 `--tree-shake-icons`，
+  这两个图标**只**出现在 `const List<Map<String, Object>>` 里（动态取值 `_groups[g]['icon']`），
+  静态收集不到 → `MaterialIcons-Regular.otf` 被裁成 5.6KB，对应字形被删。
+- 修法：构建命令加 **`--no-tree-shake-icons`**（字体 1.6MB，全字形）；已在本地构建流程采用。
+
+### 10.5 MCP 能力面（Agent 直接可用）
+
+- `gateway/tool_catalog.py` 是**单一真源**：53 个工具定义 + `RPC_MAP` + `manifest` + `resource_list/read`
+  + `dispatch_standalone`（stdio 独占模式用）。
+- 6 个 resources：`brain://runtime/memory`、`brain://project/archive`、`brain://spaces`、
+  `brain://skills`、`brain://manifest`、`brain://health`。
+- 鉴权头是 **`X-Super-Brain-Bridge`（不能写 Bearer）**；HTTP 端点 `http://127.0.0.1:8766/mcp`。
+- `recall_memory` 默认走只读投影 2-gram（毫秒级），`deep=true` 才走六通道（30~45s），返回值带 `recall_mode`。
+- 分层上下文 `core/context_layers.py`：运行时记忆 / 项目档案 / 记忆空间 / 技能 四层，落盘 `Data/context`。
+
+### 10.6 发行
+
+- 前端产物：`flutter_app/build/windows/x64/runner/Release/`（`super_brain.exe` + `data/app.so`）。
+- 部署验证位置：`D:\SuperBrain\`（绿色版），后端 `D:\SuperBrain\backend\headless-server.exe`（PyInstaller 冻结，2026-11-09 00:00）。
+- **注意**：该冻结后端尚未包含 `graph.chunk` RPC，全量模式自动降级到 `memories(limit=100000)`；
+  下次重打后端即可补上（`v3/rpc.py::_graph_chunk` 已在源码里）。
+- 安装包：`scripts/installer/setup.iss` + ISCC（`lzma2/normal`，关闭固实压缩以降低内存，
+  避免与后端抢资源时 `ucrtbase.dll 0xC0000409`）；分卷按 `release/` 里的既有方案（每卷 < 2GB + sha256）。

@@ -213,13 +213,20 @@ a = Analysis(
         "brain.memory_service", "brain.memory_editor", "brain.memory_consolidator", "brain.activation",
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",
         "gateway.mcp_stdio", "gateway.http_adapter", "gateway.mcp_server",
-        "gateway.bridge_launcher", "core.user_config",
+        "gateway.tool_catalog", "gateway.bridge_launcher",
+        # 函数内延迟导入，PyInstaller 静态分析抓不到，冻结包会 ModuleNotFoundError
+        "core.context_layers", "core.fast_recall", "core.wal_maintenance",
+        "core.structured_log", "core.runtime_paths", "core.user_config",
+        # Flutter 完全替代 Qt 后下沉到 core 的桌面能力（函数内惰性 import，静态分析会漏）
+        "core.system_stats", "core.desktop_features", "core.win32_tray",
+        # psutil 是 CPU/内存仪表的硬依赖，绝不能 exclude
+        "psutil", "winreg",
     ],
     hookspath=[],
     runtime_hooks=[],
     # 调试入口（PySide6）不进发行包：省 200~300MB，运行时也不会被加载
     excludes=["tkinter", "matplotlib", "pytest", "IPython",
-              "PySide6", "keyring", "psutil", "ui.desktop"],
+              "PySide6", "keyring", "ui.desktop"],
     noarchive=False,
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
