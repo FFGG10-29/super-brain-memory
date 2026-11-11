@@ -25,10 +25,38 @@ try {
 
 & flutter pub get 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'flutter pub get failed' }
-# --no-tree-shake-icons: 图标被 tree-shake 后，只在 const Map 里动态引用的字形
-# （如左栏「记忆洞察」「Agent 上下文」）会缺失，界面表现为菜单没图标。
-& flutter build windows --release --no-tree-shake-icons 2>&1 | Out-Host
-if ($LASTEXITCODE -ne 0) { throw 'flutter build windows failed' }
+
+function Assert-FreshArtifact {
+    # 守卫：app.so（Dart AOT，UI 全在里面）必须比 lib\ 下最新源码新。
+    # 踩过的坑：flutter create 重建 runner 后，flutter build 增量构建可能误判
+    # 无需重编，打印成功但 app.so 还是旧的——界面表现为改动全部没生效。
+    $newestDart = (Get-ChildItem (Join-Path $app 'lib') -Recurse -Filter '*.dart' |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+    $so = Join-Path $app 'build\windows\x64\runner\Release\data\app.so'
+    if (-not (Test-Path $so)) { throw 'app.so not found — build did not produce artifacts' }
+    $soTime = (Get-Item $so).LastWriteTime
+    if ($soTime -lt $newestDart) {
+        throw ("STALE BUILD: app.so({0:HH:mm:ss}) older than {1} ({2:HH:mm:ss}) — run 'flutter clean' and rebuild" -f $soTime, 'lib/*.dart', $newestDart)
+    }
+}
+
+function Invoke-Build {
+    # --no-tree-shake-icons: 图标被 tree-shake 后，只在 const Map 里动态引用的字形
+    # （如左栏「记忆洞察」「Agent 上下文」）会缺失，界面表现为菜单没图标。
+    & flutter build windows --release --no-tree-shake-icons 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'flutter build windows failed' }
+}
+
+Invoke-Build
+try { Assert-FreshArtifact } catch {
+    Write-Output "WARNING: $($_.Exception.Message)"
+    Write-Output 'flutter clean + full rebuild...'
+    & flutter clean 2>&1 | Out-Host
+    & flutter pub get 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'flutter pub get failed' }
+    Invoke-Build
+    Assert-FreshArtifact   # 第二次还 stale 就是真问题，直接抛错
+}
 
 $exe = Join-Path $app 'build\windows\x64\runner\Release\super_brain.exe'
 Write-Output "BUILD OK: $exe"
