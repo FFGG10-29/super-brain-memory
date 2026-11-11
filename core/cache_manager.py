@@ -328,3 +328,21 @@ class CacheManager:
         except Exception:  # noqa: BLE001  指标写失败不影响缓存功能
             return 0
         return len(rows)
+
+
+# ── 进程级单例（v4.1-C 第一批消费者的统一获取入口）─────────────────────
+_MANAGER: CacheManager | None = None
+
+
+def configure_cache_manager(*, config: BrainConfig | None = None, kv: Any | None = None,
+                            timeseries: Any | None = None,
+                            bus: CacheInvalidationBus | None = None) -> CacheManager:
+    """headless_server 装配/换核时调用；重建实例并重新订阅失效总线。"""
+    global _MANAGER
+    _MANAGER = CacheManager(config=config, kv=kv, timeseries=timeseries, bus=bus)
+    return _MANAGER
+
+
+def get_cache_manager() -> CacheManager | None:
+    """消费者统一入口；未装配（测试/独立脚本）返回 None，调用方回退无缓存路径。"""
+    return _MANAGER

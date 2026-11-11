@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -20,9 +21,11 @@ from typing import Any
 
 from brain.hyperedge_backfill import graph_density
 from config import BrainConfig, get_config
+from core.cache_manager import get_cache_manager
 from core.errors import EngineUnavailable
 from core.interfaces import (
     Embedder,
+    Embedding,
     GraphRepository,
     KVRepository,
     RelationalRepository,
@@ -111,6 +114,11 @@ class Prefrontal:
         top_k = int(limit or self._config.recall.top_k)
         oversample = max(1, self._config.recall.rrf_k_oversample) * top_k
 
+        # C11 召回结果短期缓存：命中则跳过整条链路（embedder/向量库/图库/精排）
+        cached = self._recall_cache_get(query, namespaces, top_k)
+        if cached is not None:
+            return cached
+
         # ★ B 包：把 dense 通道的 cosine 相似度带回总分（旧版只以通道名次进 RRF）
         dense_scores: dict[str, float] = {}
         channels = self._collect_channels(query, oversample, namespaces, dense_scores)
@@ -151,7 +159,72 @@ class Prefrontal:
         self.last_audit["degraded"] = self.last_degraded
         self.last_audit["narratives"] = len(self.last_narratives)
         self.last_audit["spreading_note"] = note
+        self._recall_cache_put(query, namespaces, top_k, result)
         return result
+
+    # ── C11 召回结果短期缓存 ─────────────────────────────────────────────
+    # 纪律：mgr 为 None / 任一读写异常 / 配置关闭 → 一律回退无缓存原路径；
+    # 值只存 neuron id + score + channels（id 必在值内，供 C0 总线按值精确失效）。
+    @staticmethod
+    def _recall_cache_key(query: str, namespaces: tuple[str, ...], top_k: int) -> str:
+        query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        ns_part = ",".join(sorted(namespaces))
+        return f"q={query_hash}|ns={ns_part}|k={top_k}"
+
+    def _recall_cache_get(
+        self, query: str, namespaces: tuple[str, ...], top_k: int,
+    ) -> list[RecallHit] | None:
+        mgr = get_cache_manager()
+        if mgr is None:
+            return None
+        try:
+            payload = mgr.get("recall", self._recall_cache_key(query, namespaces, top_k))
+        except Exception:  # noqa: BLE001  缓存读失败不阻断召回
+            return None
+        if payload is None:
+            return None
+        hits: list[RecallHit] = []
+        try:
+            for item in payload["items"]:
+                record = self._relational.get("neuron", str(item["id"]))
+                if record is None:
+                    continue
+                neuron = Neuron.from_record(record)
+                # 缓存命中后重过 is_active / tier / namespace 门：缓存值不含这些状态
+                if not neuron.is_active or neuron.tier == _ARCHIVED:
+                    continue
+                if namespaces and neuron.namespace not in namespaces:
+                    continue
+                hits.append(RecallHit(
+                    neuron=neuron,
+                    score=float(item["score"]),
+                    channels=tuple(str(channel) for channel in item["channels"]),
+                ))
+        except (KeyError, TypeError, ValueError):
+            return None
+        self.last_audit = {"cached": True, "query": query, "hits": len(hits)}
+        return hits
+
+    def _recall_cache_put(
+        self, query: str, namespaces: tuple[str, ...], top_k: int,
+        hits: list[RecallHit],
+    ) -> None:
+        mgr = get_cache_manager()
+        if mgr is None or not hits:
+            # 空结果不入缓存：空值内无 memory id，新写入无法使其精确失效
+            return
+        payload = {
+            "query": query,
+            "items": [
+                {"id": hit.neuron.uuid7_id, "score": float(hit.score),
+                 "channels": list(hit.channels)}
+                for hit in hits
+            ],
+        }
+        try:
+            mgr.set("recall", self._recall_cache_key(query, namespaces, top_k), payload)
+        except Exception:  # noqa: BLE001  缓存写失败绝不影响召回
+            pass
 
     def _audit(
         self,
@@ -198,10 +271,15 @@ class Prefrontal:
 
         embedding = None
         if self._embedder is not None:
-            try:
-                embedding = self._embedder.embed_query(query)
-            except EngineUnavailable:
-                embedding = None
+            # C12 embedding 缓存（lmdb，TTL 30 天已配）：命中则零模型调用
+            embedding = self._embedding_cache_get(query)
+            if embedding is None:
+                try:
+                    embedding = self._embedder.embed_query(query)
+                except EngineUnavailable:
+                    embedding = None
+                else:
+                    self._embedding_cache_put(query, embedding)
 
         from core.interfaces import RecallFilter
 
@@ -240,6 +318,55 @@ class Prefrontal:
             channels["profile"] = [str(record["id"]) for record in profile]
 
         return {name: hits for name, hits in channels.items() if hits}
+
+    # ── C12 embedding 缓存 ───────────────────────────────────────────────
+    # BGE-M3 的 sparse 本就是 dict[str, float]（token_id → lexical 权重，
+    # 见 engine/embedding.py _sparse_vectors），JSON 往返无损，无需 SparseVector
+    # 重建层：直接存 {"dense": [...], "sparse": {...}}，命中时重建 Embedding。
+    def _embedding_cache_key(self, query: str) -> str:
+        embedder = self._embedder
+        try:
+            dim = int(embedder.dense_dim)
+        except (AttributeError, TypeError, ValueError):
+            dim = -1
+        parts = f"{type(embedder).__name__}|{dim}|{query}"
+        return hashlib.sha256(parts.encode("utf-8")).hexdigest()
+
+    def _embedding_cache_get(self, query: str) -> Embedding | None:
+        mgr = get_cache_manager()
+        if mgr is None:
+            return None
+        try:
+            payload = mgr.get("embedding", self._embedding_cache_key(query))
+        except Exception:  # noqa: BLE001  缓存读失败不阻断召回
+            return None
+        if payload is None:
+            return None
+        try:
+            dense = [float(value) for value in payload["dense"]]
+            sparse = {
+                str(token): float(weight)
+                for token, weight in dict(payload["sparse"] or {}).items()
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        return Embedding(dense=dense, sparse=sparse)
+
+    def _embedding_cache_put(self, query: str, embedding: Embedding) -> None:
+        mgr = get_cache_manager()
+        if mgr is None:
+            return
+        payload = {
+            "dense": [float(value) for value in embedding.dense],
+            "sparse": {
+                str(token): float(weight)
+                for token, weight in dict(embedding.sparse or {}).items()
+            },
+        }
+        try:
+            mgr.set("embedding", self._embedding_cache_key(query), payload)
+        except Exception:  # noqa: BLE001  缓存写失败绝不影响召回
+            pass
 
     def _graph_channel(
         self, query: str, oversample: int, namespaces: tuple[str, ...] = ()

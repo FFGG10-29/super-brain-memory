@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import threading
 from collections import deque
@@ -41,6 +42,7 @@ class ChatEngine:
         token: str,
         sessions: SessionRegistry | None = None,
         bus: EventBus | None = None,
+        invalidation_bus: Any | None = None,
         host: str | None = None,
         port: int | None = None,
         pad_tracker: Any | None = None,
@@ -55,6 +57,11 @@ class ChatEngine:
         self._token = str(token)
         self._sessions = sessions or SessionRegistry()
         self._bus = bus or EventBus()
+        # C05：失效总线只保留注入参数（headless 的 cache_bus，session 语义的
+        # self._bus 不混用——Q33 裁决）；subscribe 接线由主线程完成。
+        self._invalidation_bus = invalidation_bus
+        self._snapshots: dict[str, dict] = {}
+        self._cache = self._resolve_cache()
         self._pad_tracker = pad_tracker
         self._media_service = media_service
         self._event_sink = event_sink
@@ -205,9 +212,13 @@ class ChatEngine:
         prompt = "\n".join(part for part in parts if part)
 
         # ③ 模型路由（进程内函数，不是 RPC）
+        # C16：把本轮召回片段 id 传给输出缓存，使 memory_updated 能精确失效缓存的回复
+        memory_ids = [str(hit.get("id")) for hit in (recall.get("hits") or [])
+                      if isinstance(recall, dict) and isinstance(hit, dict) and hit.get("id")]
         result = await asyncio.to_thread(
             self._router.complete, prompt,
             intent=intent, session_id=session_id, sensitive=sensitive,
+            memory_ids=memory_ids or None,
         )
         reply = str(result.get("text") or "")
         self._history[session_id].append(f"用户：{text}")
@@ -221,6 +232,11 @@ class ChatEngine:
             "fallback": bool(result.get("fallback")),
         })
 
+        # ④' C05 情节缓冲快照（Q30 裁决：合并进 _history 载体）：每轮把
+        #     {turn_count, 召回片段 id, persona_hash} 增量写入 episodic ns；
+        #     快照 stale 后下一轮在此重建（召回每轮都做，快照随轮覆盖）。
+        self._record_snapshot(session_id, recall)
+
         # ④ deep 结果从 8769 异步推回（不依赖 8767，不阻塞回复）
         if cfg.deep_async and intent == "deep_recall":
             task = asyncio.create_task(self._deep_recall(session_id, text, channel))
@@ -230,6 +246,80 @@ class ChatEngine:
         # ⑤ 只有「值得记住」的消息才写长期记忆，且必须经统一 WriteGate
         if self._worth_remembering(text, intent):
             await asyncio.to_thread(self._remember, text, intent)
+
+    # ── C05：情节缓冲快照（episodic ns）──────────────────────────────────
+    @staticmethod
+    def _resolve_cache() -> Any:
+        """统一约定入口；未装配（测试/独立脚本）返回 None，回退无缓存路径。"""
+        try:
+            from core.cache_manager import get_cache_manager
+            return get_cache_manager()
+        except Exception:  # noqa: BLE001  缓存模块异常不拖垮消息流引擎
+            return None
+
+    @staticmethod
+    def _recall_hit_ids(recall: Any) -> list[str]:
+        """从 recall_for_agent 结果的 hits 提取片段 id（失效精确判定的比对集）。"""
+        if not isinstance(recall, dict):
+            return []
+        hits = recall.get("hits")
+        if not isinstance(hits, list):
+            return []
+        return [str(row["id"]) for row in hits
+                if isinstance(row, dict) and row.get("id")]
+
+    def _persona_fingerprint(self) -> str:
+        """persona_hash：只随 channel / 上下文层版本 / 人格参数版本变化。
+
+        指纹不可用（单例未就绪等）时退化为仅 channel，绝不阻断对话。
+        """
+        parts = [str(getattr(self._config.chat, "persona_channel", ""))]
+        try:
+            from core.context_layers import get_context_layers
+            status = get_context_layers().status()
+            parts.append(f"layers:{status.get('revision', 0)}")
+            from core.persona import get_persona_layer
+            persona = get_persona_layer().status()
+            parts.append(
+                f"persona:{persona.get('versions', 0)}:{persona.get('params_count', 0)}")
+        except Exception:  # noqa: BLE001  指纹降级不阻断对话
+            pass
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+    def _record_snapshot(self, session_id: str, recall: Any) -> None:
+        """每轮处理完把快照增量写入 episodic ns（键=session_id，值 JSON 可序列化）。"""
+        previous = self._snapshots.get(session_id) or {}
+        snapshot = {
+            "turn_count": int(previous.get("turn_count", 0)) + 1,
+            "recalled_memory_ids": self._recall_hit_ids(recall),
+            "persona_hash": self._persona_fingerprint(),
+            "stale": False,  # 下一轮重建即清位：召回每轮都做，快照随轮覆盖
+        }
+        self._snapshots[session_id] = snapshot
+        cache = self._cache
+        if cache is None:
+            return  # 未装配缓存：仅保留进程内载体，回退原路径
+        try:
+            cache.set("episodic", session_id, snapshot)
+        except Exception as exc:  # noqa: BLE001  缓存失败不中断对话
+            self.last_error = f"snapshot cache failed: {type(exc).__name__}: {exc}"
+
+    def _on_memory_updated(self, event: dict[str, Any]) -> None:
+        """C05 失效判定：memory_updated 的 affected_ids 命中本轮召回片段 id 时
+        标记快照 stale（下一轮重建并重新召回）；其余快照一律不动（失效精确不清空）。
+
+        注意：不要把本方法挂到 self._bus（session 语义）；应由主线程把它订阅到
+        headless 的 cache_bus（self._invalidation_bus 仅保留注入参数）。
+        """
+        if not isinstance(event, dict) or event.get("type") != "memory_updated":
+            return
+        affected = {str(item) for item in (event.get("affected_ids") or []) if item}
+        if not affected:
+            return
+        for snapshot in self._snapshots.values():
+            ids = snapshot.get("recalled_memory_ids") or []
+            if affected.intersection(str(item) for item in ids):
+                snapshot["stale"] = True
 
     async def _push(self, session_id: str, kind: str, fields: dict[str, Any]) -> None:
         payload = encode(kind, session_id=session_id, **fields)

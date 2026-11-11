@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -24,12 +25,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from core.cache_manager import get_cache_manager
 from core.context_layers import get_context_layers
 from datetime import datetime
 
 __all__ = ["PersonaLayer", "get_persona_layer", "BASELINE_DOC_ID"]
 
 BASELINE_DOC_ID = "cccf1cb8fbad"
+
+# C14 人格参数进程内快照：ns="persona"，键固定 "persona_state"，
+# 值 = persona.json 完整状态 dict（params/history/guardrails/proposals/revision）。
+# ttl=0 永不过期，一致性完全靠写路径精确失效（_write 成功后 invalidate）。
+_CACHE_NS = "persona"
+_CACHE_KEY = "persona_state"
 
 # 骨架只读字段：身份 / 主人校验 / 底线 / 输出铁律 / 防 OOC 范围 / 记忆调用方式
 SKELETON_KEYS = (
@@ -107,17 +115,31 @@ class PersonaLayer:
                 })
 
     def _read(self) -> dict[str, Any]:
+        # C14：先查 persona ns 进程内快照，miss 才读盘并回填；mgr 未装配则回退直读盘。
+        mgr = get_cache_manager()
+        if mgr is not None:
+            cached = mgr.get(_CACHE_NS, _CACHE_KEY)
+            if isinstance(cached, dict):
+                return copy.deepcopy(cached)  # 防调用方原地改写污染缓存
         with self._lock:
             try:
-                return json.loads(self._file.read_text(encoding="utf-8"))
+                data = json.loads(self._file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 return {}
+        if mgr is not None and data:
+            mgr.set(_CACHE_NS, _CACHE_KEY, copy.deepcopy(data), ttl_sec=0)
+        return data
 
     def _write(self, data: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         tmp = self._file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self._file)
+        # C14：所有写路径（set_params/rollback/feedback/apply_proposal/set_baseline）
+        # 均经此处落盘，成功后对 persona_state 精确失效；mgr 未装配则只更新内存（回退语义）。
+        mgr = get_cache_manager()
+        if mgr is not None:
+            mgr.invalidate(_CACHE_NS, _CACHE_KEY)
 
     # ── 读 ──────────────────────────────────────────────────────────────
     def get(self) -> dict[str, Any]:

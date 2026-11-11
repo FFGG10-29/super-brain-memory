@@ -7,6 +7,7 @@ B2（API Key 走 SecretStore）、Q20（intent 与召回深度同源，由 ChatE
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import urllib.request
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from config import BrainConfig, get_config
+from core.cache_manager import get_cache_manager
 from core.user_config import on_change
 
 __all__ = ["ModelClient", "ModelRouter", "get_model_router", "reset_model_router"]
@@ -21,6 +23,18 @@ __all__ = ["ModelClient", "ModelRouter", "get_model_router", "reset_model_router
 LOCAL = "local"
 CLOUD = "cloud"
 PAID = "paid"
+
+# C16（Q34）：只有确定性问答 intent 才写输出缓存；emotion/consolidation/media 不写
+_OUTPUT_CACHE_INTENTS = frozenset({"chat", "code", "tool_call"})
+
+
+def _output_cache_key(prompt: str, preference: str, intent: str) -> str:
+    """C16 键：sha256(normalize(prompt) + model偏好 + intent)，一律 str。
+    normalize = 去首尾空白 + 压缩连续空白 + lower，语义等价输入共享同一键。"""
+    normalized = " ".join(str(prompt).split()).lower()
+    return hashlib.sha256(
+        (normalized + "\x00" + str(preference) + "\x00" + str(intent))
+        .encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -112,8 +126,11 @@ class ModelRouter:
         self._pool: list[ModelClient] = []
         # §16.14 号池实例（非 ModelClient 列表）：避免与供应商列表 self._pool 撞名
         self._account_pool: Any | None = None
-        # session_id -> (client_name, intent, expires_at)；intent 变化允许突破粘性
-        self._sticky: dict[str, tuple[str, str, float]] = {}
+        # C07（Q29）：session_id -> (client_name, intent, expires_at,
+        # required_caps, fallback_chain)。同 (intent, caps) 粘性生效；intent 或
+        # caps 变化允许突破；fallback_chain 由 complete() 构造 ordered 顺序后写回，
+        # 下次同 session 同 (intent, caps) 直接复用（链上仍逐个重跑 _eligible）。
+        self._sticky: dict[str, tuple[str, str, float, tuple[str, ...], list[str]]] = {}
         self.fallback_events: list[dict[str, Any]] = []
         self.reload()
         on_change(self._on_config_change)
@@ -191,10 +208,12 @@ class ModelRouter:
         *,
         sensitive: bool = False,
     ) -> ModelClient:
-        caps = tuple(required_caps or ())
+        caps = tuple(str(cap) for cap in (required_caps or ()))
         now = time.time()
         sticky = self._sticky.get(session_id)
-        if sticky and sticky[1] == intent and sticky[2] > now:
+        # C07：粘性命中要求 intent 与 caps 都一致；_eligible 仍要重跑（健康可变）
+        if (sticky and sticky[1] == intent and sticky[2] > now
+                and sticky[3] == caps):
             for client in self._pool:
                 if client.name == sticky[0] and self._eligible(client, caps, sensitive):
                     return client
@@ -213,7 +232,11 @@ class ModelRouter:
 
         best = max(candidates, key=score)
         ttl = float(self._config.model_router.sticky_ttl_sec)
-        self._sticky[session_id] = (best.name, intent, now + ttl)
+        # C07：同 (intent, caps) 未过期时保留旧 fallback_chain，否则清空待 complete() 写回
+        chain: list[str] = []
+        if sticky and sticky[1] == intent and sticky[2] > now and sticky[3] == caps:
+            chain = list(sticky[4])
+        self._sticky[session_id] = (best.name, intent, now + ttl, caps, chain)
         return best
 
     def complete(
@@ -224,19 +247,63 @@ class ModelRouter:
         session_id: str,
         required_caps: tuple[str, ...] | list[str] = (),
         sensitive: bool = False,
+        memory_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """调用并按 providers 顺序 fallback；429/超时/异常都记事件，不抛给 ChatEngine。"""
-        first = self.route(intent, session_id, required_caps, sensitive=sensitive)
-        ordered = [first] + [c for c in self._pool if c is not first
-                             and self._eligible(c, tuple(required_caps or ()), sensitive)]
+        """调用并按 providers 顺序 fallback；429/超时/异常都记事件，不抛给 ChatEngine。
+
+        C16：output 缓存开启且 intent ∈ {chat, code, tool_call} 时入口先查精确输出
+        缓存（sensitive 一律不读不写，防敏感内容落盘）；命中零模型调用直接返回。
+        `memory_ids` 由 ChatEngine 接线传入，写进缓存值的 affected_ids，
+        使 `memory_updated` 总线失效可精确命中（C0 按值匹配）。
+        """
+        caps = tuple(str(cap) for cap in (required_caps or ()))
+        mgr = get_cache_manager()
+        cache_key = ""
+        if mgr is not None and not sensitive and intent in _OUTPUT_CACHE_INTENTS:
+            cache_key = _output_cache_key(
+                prompt, str(self._config.model_router.intent_map.get(intent, "")), intent)
+            cached = mgr.get("output", cache_key)
+            if isinstance(cached, dict) and cached.get("text"):
+                return {"ok": True, "text": str(cached["text"]),
+                        "model": str(cached.get("model") or ""), "kind": "cache",
+                        "fallback": False, "cache_hit": True}
+
+        first = self.route(intent, session_id, caps, sensitive=sensitive)
+        # C07：sticky 已缓存同 (intent, caps) 的 fallback 链就直接复用；
+        # 链上每个客户端仍要重跑 _eligible（供应商健康/能力可能变化）。
+        now = time.time()
+        sticky = self._sticky.get(session_id)
+        same_key = bool(sticky and sticky[1] == intent and sticky[3] == caps
+                        and sticky[2] > now)
+        ordered: list[ModelClient] = []
+        if same_key and sticky[4]:
+            by_name = {c.name: c for c in self._pool}
+            ordered = [by_name[name] for name in sticky[4]
+                       if name in by_name
+                       and self._eligible(by_name[name], caps, sensitive)]
+        if not ordered:
+            ordered = [first] + [c for c in self._pool if c is not first
+                                 and self._eligible(c, caps, sensitive)]
+        # C07：把本次 ordered 顺序写回 sticky，下次同 (intent, caps) 直接复用；
+        # 未过期的同键 sticky 保留原 expires_at，避免粘性被 frequent complete 无限续期。
+        expires = sticky[2] if same_key else now + float(
+            self._config.model_router.sticky_ttl_sec)
+        self._sticky[session_id] = (first.name, intent, expires, caps,
+                                    [c.name for c in ordered])
         for client in ordered:
             started = time.perf_counter()
             try:
                 text = client.complete(prompt)
                 if text:
                     client.record(True, (time.perf_counter() - started) * 1000)
+                    if cache_key:
+                        # C16：只缓存确定性问答 intent；值含 affected_ids 供精确失效
+                        mgr.set("output", cache_key,
+                                {"text": text, "model": client.name,
+                                 "affected_ids": list(memory_ids or [])})
                     return {"ok": True, "text": text, "model": client.name,
-                            "kind": client.kind, "fallback": client is not first}
+                            "kind": client.kind, "fallback": client is not first,
+                            "cache_hit": False}
                 raise RuntimeError("空回复")
             except Exception as exc:  # noqa: BLE001  任一供应商失败都不中断对话
                 client.record(False, (time.perf_counter() - started) * 1000)
@@ -247,7 +314,7 @@ class ModelRouter:
                 if self._on_fallback is not None:
                     self._on_fallback(event)
         return {"ok": False, "text": "暂时无法生成回复（模型服务不可用）",
-                "model": "", "kind": LOCAL, "fallback": True}
+                "model": "", "kind": LOCAL, "fallback": True, "cache_hit": False}
 
 
 _router: ModelRouter | None = None

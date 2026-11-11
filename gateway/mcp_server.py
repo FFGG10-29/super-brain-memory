@@ -6,6 +6,7 @@ HTTP 适配器、单元测试共用；`serve()` 才按需 import 官方 mcp SDK�
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any
 
@@ -89,6 +90,60 @@ class MCPToolkit:
             return result
         except (GatewayAuthError, ValueError, KeyError) as exc:
             return {"error": type(exc).__name__, "message": str(exc)}
+
+    # ── C06：prompt_prefix 稳定前缀缓存 ──────────────────────────────────
+    @staticmethod
+    def _context_fingerprint(layers: Any) -> str:
+        """人格 / 上下文层版本指纹：任一层版本变化 → 前缀缓存键变化（旧键自然失效）。
+
+        ttl=0 永久缓存的「失效」即靠换键实现：runtime 层 revision、人格参数
+        versions/params_count 任一变化都会改变指纹。
+        """
+        parts: list[str] = []
+        try:
+            status = layers.status() or {}
+            parts.append(f"layers:{status.get('revision', 0)}")
+        except Exception:  # noqa: BLE001 - 层状态不可用不阻断召回
+            parts.append("layers:-")
+        try:
+            from core.persona import get_persona_layer
+            persona = get_persona_layer().status()
+            parts.append(
+                f"persona:{persona.get('versions', 0)}:{persona.get('params_count', 0)}")
+        except Exception:  # noqa: BLE001 - 人格层不可用不阻断召回
+            parts.append("persona:-")
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+    def _compose_with_prefix_cache(self, layers: Any, query: str, channel: str) -> str:
+        """compose 产出的缓存版组装：缓存稳定前缀 + 现算查询相关档案块。
+
+        稳定前缀 = compose("", channel)（空 query 不含档案块，其余部分与
+        compose(query) 完全一致——runtime 投影 / 分区标签 / bot 人格层均与
+        query 无关）；档案块按 query 现算并镜像 compose 的文档块格式。
+        未装配缓存管理器时整体回退 compose(query) 原路径。
+        """
+        from core.cache_manager import get_cache_manager
+        manager = get_cache_manager()
+        if manager is None:
+            return layers.compose(query, channel=channel)  # 回退无缓存路径
+        key = hashlib.sha256(
+            f"{channel}|{self._context_fingerprint(layers)}".encode("utf-8")).hexdigest()
+        prefix = manager.get("prompt_prefix", key)
+        if prefix is None:
+            prefix = layers.compose("", channel=channel)
+            manager.set("prompt_prefix", key, prefix, ttl_sec=0)  # ttl=0 永久，靠换键失效
+        parts = [prefix]
+        if query.strip():
+            docs = layers.documents_search(query, limit=3)
+            if docs:
+                # 与 core/context_layers.compose 的档案块逐字一致（镜像，勿单方改动）
+                lines = ["【项目档案摘要】仅标题与描述，需要细节请单独读取全文"]
+                for doc in docs:
+                    lines.append(
+                        f"- #{doc['id']} {doc.get('title', '')} — "
+                        f"{doc.get('description', '')[:120]}")
+                parts.append("\n".join(lines))
+        return "\n\n".join(part for part in parts if part)
 
     def _dispatch(self, tool: str, args: dict, agent: Agent) -> dict[str, Any]:
         # 超级大脑是**统一记忆中枢**：所有 Agent 默认写进同一个共享库、读同一份记忆。
@@ -230,7 +285,11 @@ class MCPToolkit:
                 injection = (injection + "\n\n" + blocks).strip()
             # 每轮确定性注入的运行时记忆 + 相关档案摘要（dsh-mnemon 的三层 View）
             # bot 通道额外注入 L0 人格层（骨架只读 + 当前可调参数），闲聊/指令双通道
-            projection = layers.compose(query, channel=channel)
+            # C06：compose 产出可拆 = 稳定前缀（runtime 投影 + 分区标签 + bot 人格层，
+            # 只随 channel / persona / 层版本变化）+ 查询相关档案块；前缀走 prompt_prefix
+            # ns 缓存（ttl=0 永久，指纹换键即失效）。archive 块格式镜像
+            # core/context_layers.compose（core/* 归另一成员，本文件不做改动）。
+            projection = self._compose_with_prefix_cache(layers, query, channel)
             if projection:
                 injection = (injection + "\n\n" + projection).strip()
             return {

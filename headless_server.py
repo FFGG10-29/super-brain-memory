@@ -90,6 +90,12 @@ class HeadlessServer:
             config=self.config, kv=self.app.storage.kv,
             timeseries=self.app.storage.timeseries, bus=self.cache_bus,
         )
+        # C0+：注册进程级单例，供 C12/C11/C02 等消费者统一获取
+        from core.cache_manager import configure_cache_manager
+
+        configure_cache_manager(config=self.config, kv=self.app.storage.kv,
+                                timeseries=self.app.storage.timeseries,
+                                bus=self.cache_bus)
 
         # 唯一真源：v2 主库路径的兄弟目录放 v3 的 journal/inbox（不另开六引擎）
         sqlite_path = Path(self.config.storage.sqlite_path)
@@ -154,7 +160,10 @@ class HeadlessServer:
             sessions=SessionRegistry(), pad_tracker=self.pad_tracker,
             media_service=self.media_service,
             event_sink=lambda content, **kw: self.daemon.handle_event(content, **kw),
+            invalidation_bus=self.cache_bus,
         )
+        # C05：把聊天会话快照接入失效总线（engine 侧只实现 _on_memory_updated，订阅在此）
+        self.cache_bus.subscribe(self.chat_engine._on_memory_updated)
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
         """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""
@@ -276,6 +285,11 @@ class HeadlessServer:
             config=self.config, kv=fresh.storage.kv,
             timeseries=fresh.storage.timeseries, bus=self.cache_bus,
         )
+        from core.cache_manager import configure_cache_manager
+
+        configure_cache_manager(config=self.config, kv=fresh.storage.kv,
+                                timeseries=fresh.storage.timeseries,
+                                bus=self.cache_bus)
         self.app = fresh
         self.daemon.app = fresh
         self.daemon.write_gate = new_gate

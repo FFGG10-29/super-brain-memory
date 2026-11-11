@@ -1,0 +1,20 @@
+[
+  {
+    "id": "msg-1794432588048-1x1v2t",
+    "from": "team-lead",
+    "to": "router-cache",
+    "type": "message",
+    "content": "环境提醒（来自 prefrontal-cache 的实测）：跑测试必须用项目内 `.venv\\Scripts\\python.exe`（Python 3.12.10 + pytest 9.2.0）。PATH 上的 `python` 是 WindowsApps stub（静默 exit 0 零输出），`D:\\Python312\\python.exe` 缺依赖。验收命令统一走 `.venv\\Scripts\\python.exe -m pytest ...`。",
+    "timestamp": "2026-11-11T21:29:48.048Z",
+    "read": true
+  },
+  {
+    "id": "shutdown-1794433181279",
+    "from": "team-lead",
+    "to": "router-cache",
+    "type": "shutdown_request",
+    "content": "{\"type\":\"shutdown_request\",\"request_id\":\"shutdown-1794433181279\",\"timeout_ms\":60000,\"reason\":\"验收通过，工作完成，感谢。\",\"from\":\"team-lead\",\"timestamp\":\"2026-11-11T21:39:41.279Z\"}",
+    "timestamp": "2026-11-11T21:39:41.279Z",
+    "read": true
+  }
+]

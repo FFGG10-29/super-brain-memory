@@ -1,0 +1,46 @@
+{
+  "name": "cache-parallel",
+  "mainConversationId": "5a246446129448ea9f52ca02953f1b45",
+  "workspacePath": "b:/BaiduSyncdisk/desktop/VSProject/super-brain-memory",
+  "createdAt": "2026-11-11T21:21:27.031Z",
+  "options": {
+    "workspacePath": "b:/BaiduSyncdisk/desktop/VSProject/super-brain-memory"
+  },
+  "members": [
+    {
+      "memberId": "prefrontal-cache@cache-parallel",
+      "name": "prefrontal-cache",
+      "role": "C12+C11 prefrontal 缓存",
+      "sessionId": "974f5179e4cc4465b9a6f4f5c5d3fd6d",
+      "status": "running"
+    },
+    {
+      "memberId": "distill-cache@cache-parallel",
+      "name": "distill-cache",
+      "role": "C02 蒸馏结果缓存",
+      "sessionId": "947eba4b5a2942c89b60a59a3b83eaf5",
+      "status": "running"
+    },
+    {
+      "memberId": "router-cache@cache-parallel",
+      "name": "router-cache",
+      "role": "C07+C16 路由与输出缓存",
+      "sessionId": "fadd72c5f77540e99f6f4f4618772bb3",
+      "status": "running"
+    },
+    {
+      "memberId": "chat-cache@cache-parallel",
+      "name": "chat-cache",
+      "role": "C05+C06 会话与前缀缓存",
+      "sessionId": "01f8a55052374172bbf4f3cf4adba1e7",
+      "status": "running"
+    },
+    {
+      "memberId": "persona-cache@cache-parallel",
+      "name": "persona-cache",
+      "role": "C14 人格快照缓存",
+      "sessionId": "0da63808ac02444697c1fd2d7cd9a291",
+      "status": "running"
+    }
+  ]
+}
