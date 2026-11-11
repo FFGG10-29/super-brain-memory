@@ -362,7 +362,7 @@ class AccountPool:
 
     def complete(self, prompt: str, *, model: str | None = None,
                  conversation_key: str = "") -> str:
-        model = model or getattr(self.config, "default_model", "")
+        model = model or str(getattr(self.config, "default_model", "") or "")
         messages = [{"role": "user", "content": prompt}]
         now = time.time()
         eligible = [a for a in self.accounts

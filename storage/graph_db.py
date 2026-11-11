@@ -127,7 +127,7 @@ class KuzuGraphDB(GraphRepository):
             {"new": new_id, "old": old_id, "tx": tx_from.to_token()},
         )
 
-    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[Record]:
+    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[dict[str, str]]:
         """E2：以该 neuron 为一端的 SUPERSEDES 边对端（双向匹配）。"""
         result = self._pool.get().execute(
             "MATCH (a:Entity)-[s:SUPERSEDES]-(b:Entity) "

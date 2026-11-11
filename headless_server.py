@@ -154,7 +154,7 @@ class HeadlessServer:
         self.pad_tracker = CurrentPadTracker(self.config)
         self.app.prefrontal.pad_tracker = self.pad_tracker
         # W8 / A4：单 topic 的只读投影走叙事缓存（钩子闭包动态读 self.app，换核后自动生效）
-        self.daemon.projection_hook = lambda topic, query, limit: fast_recall_projected(
+        self.daemon.projection_hook = lambda topic, query, limit: fast_recall_projected(  # type: ignore[attr-defined]
             topic, query, relational=self.app.storage.relational,
             kv=self.app.storage.kv, limit=limit,
         )

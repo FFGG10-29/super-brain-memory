@@ -256,6 +256,7 @@ class RelationalRepository(HealthCheckable, ABC):
         active_only: bool = True,
         limit: int = 50,
         offset: int = 0,
+        since_ms: int | None = None,   # W4：按时间窗过滤（hyperedge 补边用），None=不过滤
     ) -> list[Record]: ...
 
     @abstractmethod
@@ -369,7 +370,7 @@ class GraphRepository(HealthCheckable, ABC):
     @abstractmethod
     def supersede(self, new_id: str, old_id: str, *, tx_from: HLCStamp) -> None: ...
 
-    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[Record]:
+    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[dict[str, str]]:
         """E2：读取以该 neuron 为一端的 SUPERSEDES 边（对端 id）。
 
         非抽象默认实现：返回空列表（表示"无痕迹"）。具体实现可选覆写——
