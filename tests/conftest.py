@@ -13,6 +13,14 @@ import pytest
 
 # 任何测试都不许污染真实用户配置（%APPDATA%/super-brain）——必须在 import config 前设置
 os.environ["SUPER_BRAIN_CONFIG_DIR"] = tempfile.mkdtemp(prefix="brain_test_config_")
+# 号池移植后的隔离：.env 的 POOL_* 与本机真实凭证（加密态已可解密）绝不泄进测试。
+# 环境变量优先级高于 .env（pydantic-settings），在这里压死。
+os.environ["POOL_ENABLED"] = "false"
+os.environ["POOL_FREE_LANE"] = "false"
+os.environ["XDPOOL_ACCOUNTS_FILE"] = os.path.join(
+    tempfile.gettempdir(), "brain_test_no_xdpool_accounts.json")
+os.environ["WORKBUDDY_AUTH_FILE"] = os.path.join(
+    tempfile.gettempdir(), "brain_test_no_auth.info")
 
 from brain.amygdala import Amygdala
 from brain.hippocampus import Hippocampus

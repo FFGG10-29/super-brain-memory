@@ -194,7 +194,10 @@ def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[W
     if accounts_file:
         xdpool_path = Path(accounts_file)
     else:
-        xdpool_path = Path.home() / ".dsh" / ".xdpool" / "accounts.json"
+        # 测试隔离出口：XDPOOL_ACCOUNTS_FILE 重定向默认 accounts.json
+        env_file = os.environ.get("XDPOOL_ACCOUNTS_FILE", "")
+        xdpool_path = Path(env_file) if env_file else \
+            Path.home() / ".dsh" / ".xdpool" / "accounts.json"
     if xdpool_path.is_file():
         data = json.loads(xdpool_path.read_text(encoding="utf-8"))
         for entry in data.get("accounts") or []:
