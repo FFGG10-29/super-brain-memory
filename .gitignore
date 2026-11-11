@@ -3,6 +3,8 @@ data/
 .env
 *.pat
 *.token
+# 子代理团队运行时状态
+.codebuddy/teams/
 
 # Python
 __pycache__/
