@@ -47,8 +47,11 @@ class GraphHypergraph(HypergraphRepository):
 
     name = "hypergraph:kuzu"
 
-    def __init__(self, graph: GraphRepository) -> None:
+    def __init__(self, graph: GraphRepository, *, relational: Any | None = None) -> None:
         self._graph = graph
+        # W4 / Q14：骨架字段放主库 hyperedge 记录的 payload（JSON），不动 Hyperedge 模型
+        # （extra="forbid"），也不给 Kùzu HyperEvent 加列。未注入时只提供降级骨架。
+        self._relational = relational
 
     # ── 写入 ──────────────────────────────────────────────────────────────
     def add(self, hyperedge: Record) -> None:
@@ -68,6 +71,37 @@ class GraphHypergraph(HypergraphRepository):
 
     def hyperedges_of(self, entity_id: str, *, limit: int = 20) -> list[str]:
         return self._graph.hyperedges_of(entity_id, limit=limit)
+
+    def get_event_skeleton(self, hyperedge_id: str) -> str:
+        """Q14 / P4.2：把超边拼成可直接注入 prompt 的结构化文本块（不调 LLM）。
+
+        优先读主库 hyperedge 记录的 `skeleton` payload；历史数据没有骨架时
+        降级为「成员列表 + 提示」，保证任何超边都能作为叙事单元参与召回。
+        """
+        skeleton: dict[str, Any] = {}
+        if self._relational is not None:
+            try:
+                row = self._relational.get("hyperedge", hyperedge_id)
+                if isinstance(row, dict) and isinstance(row.get("skeleton"), dict):
+                    skeleton = dict(row["skeleton"])
+            except Exception:  # noqa: BLE001  主库不可读时走降级骨架
+                skeleton = {}
+        members = self.members(hyperedge_id)
+        if not skeleton:
+            lines = [f"【事件】{hyperedge_id[:8]}（历史数据，无骨架元数据）",
+                     "【成员】" + "；".join(f"{member[:8]}" for member in members),
+                     "【情绪】未知", "【后续】无"]
+            return "\n".join(lines)
+        parts = [f"【事件】{skeleton.get('time', '—')} "
+                 f"{skeleton.get('subject', '—')} {skeleton.get('action', '—')}"]
+        summaries = skeleton.get("member_summaries") or {}
+        parts.append("【成员】" + "；".join(
+            f"{key}：{value}" for key, value in summaries.items()
+        ) if summaries else "【成员】" + "；".join(members))
+        pad = skeleton.get("pad") or [0.0, 0.0, 0.0]
+        parts.append(f"【情绪】P={pad[0]} A={pad[1]} D={pad[2]}")
+        parts.append(f"【后续】{skeleton.get('follow_up') or '无'}")
+        return "\n".join(parts)
 
     def incidence(self, hyperedge_ids: Sequence[str] | None = None) -> Mapping[str, list[str]]:
         """关联矩阵的稀疏表示：{超边 id: [成员 id...]}。"""

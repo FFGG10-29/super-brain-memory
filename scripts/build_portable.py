@@ -113,6 +113,8 @@ a = Analysis(
         "main", "headless_server", "v3.daemon", "v3.worker", "v3.rpc", "v3.rpc_ext",
         "brain.memory_service", "brain.memory_editor", "brain.memory_consolidator", "brain.activation",
         "brain.write_gate", "brain.write_router", "brain.thalamus",
+        "brain.hyperedge_backfill", "storage.hypergraph_db",
+        "brain.pad_lexicon", "brain.current_pad_tracker",
         "chat.engine", "chat.protocol", "chat.event_bus", "chat.session_registry",
         "gateway.model_router",
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from brain.current_pad_tracker import CurrentPadTracker
 from brain.write_gate import WriteGate
 from chat.engine import ChatEngine
 from chat.session_registry import SessionRegistry
@@ -125,10 +126,13 @@ class HeadlessServer:
         self.model_router = get_model_router(
             self.config, secret_store=default_secret_store(),
         )
+        # W5：聊天与 IDE 查询共用同一份「当前会话 PAD」；换核时追踪器不重建
+        self.pad_tracker = CurrentPadTracker(self.config)
+        self.app.prefrontal.pad_tracker = self.pad_tracker
         self.chat_engine = ChatEngine(
             config=self.config, toolkit=self.toolkit, router=self.model_router,
             write_gate=self.write_gate, agent=self.chat_agent, token=self.chat_token,
-            sessions=SessionRegistry(),
+            sessions=SessionRegistry(), pad_tracker=self.pad_tracker,
         )
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -236,6 +240,7 @@ class HeadlessServer:
         self.daemon.write_gate = new_gate
         self.adapter.rebind_write_gate(new_gate)
         self.chat_engine.rebind(new_gate)  # W3：聊天写入也要切到新闸门
+        fresh.prefrontal.pad_tracker = self.pad_tracker  # W5：换核后追踪器继续生效
         self.daemon._memory_service = None
         self.registry._kv = fresh.storage.kv
         self.registry._timeseries = fresh.storage.timeseries

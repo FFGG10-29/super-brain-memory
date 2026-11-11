@@ -123,8 +123,8 @@ class RecallConfig(BaseSettings):
     p95_target_ms: int = 800                             # CPU 单次召回 P95
     pad_salience_arousal_weight: float = 0.6             # PAD 显著性里唤醒度的占比
     rerank_enabled: bool = True                          # False=跳过交叉编码精排（省时省电，低配设备）
-    rerank_top_n: int = 30                               # ★ B 包：精排候选上限（旧版 = k×4 全量灌给交叉编码器）
-    rerank_timeout_ms: int = 3000                        # ★ B 包：精排硬超时，超时回退 RRF 顺序，deep 不再卡 20s+
+    rerank_top_n: int = 20                               # W5 / C3：精排候选硬上限压到 20
+    rerank_timeout_ms: int = 8000                        # W5 / C3：端到端 deep 15s 预算内给精排 8s 硬超时
 
 
 class PlasticityConfig(BaseSettings):
@@ -305,6 +305,45 @@ class ModelRouterConfig(BaseSettings):
     })
 
 
+class SpreadingActivationConfig(BaseSettings):
+    """W5 / P4.1：激活扩散。稀疏图自动降 1 跳并告警。"""
+    model_config = SettingsConfigDict(env_prefix="SPREAD_")
+
+    enabled: bool = True
+    seed_top_k: int = 5
+    max_hops: int = 2
+    decay: dict[str, float] = Field(default_factory=lambda: {
+        "fact": 0.6, "scenario": 0.8, "code": 0.5, "emotion": 0.7, "profile": 0.6,
+    })
+    threshold: float = 0.15
+    max_candidates: int = 40
+    timeout_ms: int = 2000                    # 扩散阶段预算；超时回退无扩散 RRF
+
+
+class PadGatingConfig(BaseSettings):
+    """W5 / P4.3 + R4：当前情绪参与召回（分段，不是双权重相加）。"""
+    model_config = SettingsConfigDict(env_prefix="PADGATE_")
+
+    enabled: bool = True
+    w6: float = 0.4                          # PAD 相似度权重
+    arousal_threshold: float = 0.6           # A ≥ 此值且 P 负 → 压制负面记忆
+    negative_penalty: float = 0.5
+    warmup_turns: int = 5                    # 冷启动前 w6=0
+
+
+class HyperedgeBackfillConfig(BaseSettings):
+    """W4 / P4.0：从既有记忆补 hyperedge + MEMBER 边，给 W5 的激活扩散铺图。"""
+    model_config = SettingsConfigDict(env_prefix="BACKFILL_")
+
+    enabled: bool = True
+    similarity_threshold: float = 0.32       # 2-gram 余弦 ≥ 阈值才同簇
+    window_hours: int = 72                    # 同 topic 内的时间窗
+    min_members: int = 2                      # 成簇最小成员数
+    max_clusters: int = 200                   # 单次补边上限，防夜间窗口跑飞
+    skeleton_chars: int = 60                  # 成员摘要长度
+    sparse_degree_threshold: float = 2.0      # 平均度数低于此值 → 扩散降 1 跳 + 告警
+
+
 class ChatConfig(BaseSettings):
     """W2 / A2 + W3 / P2：8769 纯消息流。"""
     model_config = SettingsConfigDict(env_prefix="CHAT_")
@@ -344,6 +383,9 @@ class BrainConfig(BaseSettings):
     memory_type_routing: MemoryTypeRoutingConfig = Field(default_factory=MemoryTypeRoutingConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
     model_router: ModelRouterConfig = Field(default_factory=ModelRouterConfig)
+    hyperedge_backfill: HyperedgeBackfillConfig = Field(default_factory=HyperedgeBackfillConfig)
+    spreading_activation: SpreadingActivationConfig = Field(default_factory=SpreadingActivationConfig)
+    pad_gating: PadGatingConfig = Field(default_factory=PadGatingConfig)
 
 
 # 单例配置（懒加载于 main.py）

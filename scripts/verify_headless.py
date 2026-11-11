@@ -179,6 +179,8 @@ def main() -> int:
                       "suffix": ".txt", "fast": True}),
                     ("memories", "memories", {"limit": 20}),
                     ("graph", "graph", None),
+                    ("graph.density", "graph.density", None),
+                    ("graph.backfill", "graph.backfill", {"limit": 100}),
                     ("detail", "detail", None),
                     ("health", "health", None),
                     ("core_memory.get", "core_memory.get", None),

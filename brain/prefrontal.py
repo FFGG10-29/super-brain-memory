@@ -16,7 +16,9 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
+from brain.hyperedge_backfill import graph_density
 from config import BrainConfig, get_config
 from core.errors import EngineUnavailable
 from core.interfaces import (
@@ -89,6 +91,11 @@ class Prefrontal:
         self._config = config or get_config()
         # 最近一次召回的通道埋点（只读快照，供 UI 解释「为什么命中」）
         self.last_audit: dict[str, Any] = {}
+        # W5：事件骨架（整体注入，成员不单独占名次）与降级标记
+        self.last_narratives: list[dict[str, Any]] = []
+        self.last_degraded = False
+        # W5：当前会话 PAD 追踪器，由 headless_server 注入（聊天与 IDE 查询共用同一召回链路）
+        self.pad_tracker: Any | None = None
 
     # ── 召回主流程 ────────────────────────────────────────────────────────
     def recall(
@@ -107,6 +114,16 @@ class Prefrontal:
         # ★ B 包：把 dense 通道的 cosine 相似度带回总分（旧版只以通道名次进 RRF）
         dense_scores: dict[str, float] = {}
         channels = self._collect_channels(query, oversample, namespaces, dense_scores)
+        self.last_degraded = False
+
+        # W5 / P4.1：激活扩散。稀疏图自动降 1 跳；超时回退无扩散的 RRF 结果
+        spread_ids, degraded, note = self._spreading_channel(channels)
+        if spread_ids:
+            channels["spreading"] = spread_ids
+            self.last_degraded = degraded or bool(note)
+        # W5 / P4.2：hyperedge 作为叙事单元整体注入，内部成员从各通道移除
+        self.last_narratives = self._absorb_hyperedges(channels)
+
         rrf = self._rrf(channels)
         if not rrf:
             return []
@@ -131,6 +148,9 @@ class Prefrontal:
         reranked = self._rerank(query, candidates[:oversample], top_k)
         result = self._apply_tier_quota(reranked, top_k)
         self._audit(query, channels, result, agent_id, started_ms=now)
+        self.last_audit["degraded"] = self.last_degraded
+        self.last_audit["narratives"] = len(self.last_narratives)
+        self.last_audit["spreading_note"] = note
         return result
 
     def _audit(
@@ -245,6 +265,126 @@ class Prefrontal:
             )
         return list(dict.fromkeys(collected))
 
+    # ── W5 / P4.1：激活扩散 ──────────────────────────────────────────────
+    def _spreading_channel(
+        self, channels: dict[str, list[str]],
+    ) -> tuple[list[str], bool, str]:
+        """dense/fts 取 top-5 种子，沿 W4 补出的 MEMBER 边有限跳扩散。
+
+        Q39：扩散候选按激活值降序后**以名次参与 RRF**，不直接拿激活值加权，
+        与其余通道的融合逻辑一致。稀疏图降 1 跳，超时回退无扩散结果。
+        """
+        cfg = self._config.spreading_activation
+        if not cfg.enabled:
+            return [], False, ""
+        started = time.monotonic()
+        try:
+            density = graph_density(self._graph, self._config)
+        except Exception:  # noqa: BLE001  图库异常不阻断召回
+            return [], True, "图密度评估失败，跳过扩散"
+        hops = min(int(cfg.max_hops), 2)
+        note = ""
+        if density.sparse:
+            hops = 1
+            note = "图密度不足，降级 1 跳"
+        seeds = list(dict.fromkeys(
+            (channels.get("dense") or []) + (channels.get("fts") or [])
+        ))[:int(cfg.seed_top_k)]
+        if not seeds:
+            return [], False, note
+        decay = float(cfg.decay.get("fact", 0.6))
+        activation: dict[str, float] = {}
+        frontier = {seed: 1.0 for seed in seeds}
+        seen = set(seeds)
+        for _hop in range(1, hops + 1):
+            # >= 而非 >：timeout_ms=0 也要能确定性触发（Windows 单调时钟可能两次读数相同）
+            if (time.monotonic() - started) * 1000 >= float(cfg.timeout_ms):
+                note = (note + "；扩散超时回退").strip("；")
+                ordered = sorted(activation, key=lambda key: -activation[key])
+                return ordered[:int(cfg.max_candidates)], True, note
+            following: dict[str, float] = {}
+            for node, value in frontier.items():
+                try:
+                    hyperedge_ids = self._graph.hyperedges_of(node, limit=20)
+                except Exception:  # noqa: BLE001
+                    continue
+                for hyperedge_id in hyperedge_ids:
+                    try:
+                        members = self._graph.members(hyperedge_id)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for rank, member in enumerate(members):
+                        if not member or member in seen:
+                            continue
+                        score = value * decay / (1.0 + 0.1 * rank)
+                        if score < float(cfg.threshold):
+                            continue
+                        following[member] = max(following.get(member, 0.0), score)
+                        seen.add(member)
+            activation.update(following)
+            frontier = following
+        ordered = sorted(activation, key=lambda key: -activation[key])
+        return ordered[:int(cfg.max_candidates)], False, note
+
+    # ── W5 / P4.2：hyperedge 作为叙事单元 ────────────────────────────────
+    def _absorb_hyperedges(self, channels: dict[str, list[str]]) -> list[dict[str, Any]]:
+        """命中 ≥2 个成员时整段事件骨架注入，**内部成员不再单独占名次**（Q44）。
+
+        骨架经 `last_narratives` 交给 MCPToolkit 拼进 injection，不改 recall() 的
+        `list[RecallHit]` 返回契约（66 工具与 Flutter 端都无需改）。
+        """
+        hit_ids: set[str] = set()
+        for ids in channels.values():
+            hit_ids.update(ids)
+        if not hit_ids:
+            return []
+        try:
+            rows = self._relational.query("hyperedge", limit=200, since_ms=0)
+        except Exception:  # noqa: BLE001  旧库没有 hyperedge 记录时静默跳过
+            return []
+        from storage.hypergraph_db import GraphHypergraph
+
+        view = GraphHypergraph(self._graph, relational=self._relational)
+        narratives: list[dict[str, Any]] = []
+        absorbed: set[str] = set()
+        for row in rows:
+            members = [str(item) for item in (row.get("members") or [])]
+            shared = [item for item in members if item in hit_ids]
+            if len(shared) < 2:
+                continue
+            hyperedge_id = str(row.get("id") or "")
+            try:
+                text = view.get_event_skeleton(hyperedge_id)
+            except Exception:  # noqa: BLE001
+                continue
+            narratives.append({"id": hyperedge_id, "text": text, "members": shared})
+            absorbed.update(shared)
+        if absorbed:
+            for name in list(channels):
+                channels[name] = [item for item in channels[name] if item not in absorbed]
+            for name in [key for key, value in channels.items() if not value]:
+                del channels[name]
+        return narratives
+
+    # ── W5 / P4.3 + R4：当前 PAD 分段门控 ────────────────────────────────
+    def _pad_bonus(self, neuron: Neuron) -> float:
+        tracker = self.pad_tracker
+        gating = self._config.pad_gating
+        if tracker is None or not gating.enabled:
+            return 0.0
+        weight = tracker.weight_multiplier()
+        if weight == 0.0:
+            # 高负唤醒：不是把 w6 调小，而是直接压制负面记忆的召回配额
+            if getattr(tracker, "suppress_negative", False) and (
+                neuron.memory_type == "emotion" or neuron.pad.p < -0.2
+            ):
+                return -float(gating.negative_penalty)
+            return 0.0
+        state = tracker.current()
+        if state is None:
+            return 0.0
+        return float(gating.w6) * state.similarity(neuron.pad.as_tuple()) * weight
+
     def _rrf(self, channels: dict[str, list[str]]) -> dict[str, float]:
         constant = self._config.recall.rrf_constant
         scores: dict[str, float] = {}
@@ -267,6 +407,7 @@ class Prefrontal:
             + recall.w_synapse * retrievability
             + recall.w_pad * neuron.pad.salience()
             + recall.w_confidence * neuron.confidence
+            + self._pad_bonus(neuron)                   # W5：w6·当前PAD相似度（分段门控）
         )
 
     def _rerank(self, query: str, candidates: list[RecallHit], top_k: int) -> list[RecallHit]:

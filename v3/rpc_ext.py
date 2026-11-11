@@ -544,6 +544,45 @@ class RpcExtension:
             "note": "旧 graph() 的边是 2-gram 两两现算（无方向无谓词）；此处为 Kùzu 真实关系",
         }
 
+    # ── W4 / P4.0：补边与图密度（扩散上线前置）─────────────────────────
+    def _graph_backfill(self, limit: int = 500, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪", "clusters": 0}
+        try:
+            from brain.hyperedge_backfill import HyperedgeBackfill
+
+            return HyperedgeBackfill(
+                relational=app.storage.relational, graph=app.storage.graph,
+                config=app.config,
+            ).run(limit=int(limit))
+        except Exception as exc:  # noqa: BLE001  RPC 不能杀连接
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "clusters": 0}
+
+    def _graph_density(self, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪"}
+        try:
+            from brain.hyperedge_backfill import graph_density
+
+            density = graph_density(app.storage.graph, app.config)
+            return {"ok": True, **density.as_dict()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _graph_event_skeleton(self, hyperedge_id: str = "", **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None or not hyperedge_id:
+            return {"ok": False, "error": "需要 hyperedge_id 与就绪内核"}
+        try:
+            from storage.hypergraph_db import GraphHypergraph
+
+            view = GraphHypergraph(app.storage.graph, relational=app.storage.relational)
+            return {"ok": True, "text": view.get_event_skeleton(str(hyperedge_id))}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
     def _mirror_persona(self, params: dict[str, Any]) -> None:
         """镜像到 LMDB kv persona/fish/params，供 AstrBot 侧读取生成提示词。"""

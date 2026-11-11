@@ -43,6 +43,7 @@ class ChatEngine:
         bus: EventBus | None = None,
         host: str | None = None,
         port: int | None = None,
+        pad_tracker: Any | None = None,
     ) -> None:
         self._config = config
         self._toolkit = toolkit
@@ -52,6 +53,7 @@ class ChatEngine:
         self._token = str(token)
         self._sessions = sessions or SessionRegistry()
         self._bus = bus or EventBus()
+        self._pad_tracker = pad_tracker
         self._host = host or config.chat.host
         self._port = int(port if port is not None else config.chat.port)
         self._queues: dict[str, asyncio.Queue] = {}
@@ -163,6 +165,9 @@ class ChatEngine:
 
     async def _handle_message(self, session_id: str, text: str, device_id: str) -> None:
         cfg = self._config.chat
+        # W5 / C7：每轮喂入当前情绪（规则词典，<1ms），供前额叶 w6 分段门控
+        if self._pad_tracker is not None:
+            self._pad_tracker.observe(text)
         intent = classify_intent(text)  # Q20：模型路由与召回深度共用这一个 intent
         sensitive = self._is_sensitive(text)
         channel = cfg.persona_channel

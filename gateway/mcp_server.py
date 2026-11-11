@@ -219,6 +219,15 @@ class MCPToolkit:
                         text = text[:120].rstrip() + "…（摘要）"
                     head.append(f"{index}. {text}")
                 injection = "\n".join(head) if rows else ""
+            # W5 / P4.2：事件骨架作为整体注入，内部成员已由 prefrontal 从各通道移除
+            narratives = (list(getattr(self._prefrontal, "last_narratives", []) or [])
+                          if mode == "six-channel" else [])
+            if narratives:
+                blocks = "\n\n".join(
+                    f"【事件骨架 {index + 1}】\n{str(item.get('text') or '')}"
+                    for index, item in enumerate(narratives[:3])
+                )
+                injection = (injection + "\n\n" + blocks).strip()
             # 每轮确定性注入的运行时记忆 + 相关档案摘要（dsh-mnemon 的三层 View）
             # bot 通道额外注入 L0 人格层（骨架只读 + 当前可调参数），闲聊/指令双通道
             projection = layers.compose(query, channel=channel)
@@ -231,6 +240,8 @@ class MCPToolkit:
                 "recall_mode": mode,
                 "channel": channel,
                 "namespaces": list(ns_filter),
+                "narratives": narratives,
+                "degraded": bool(getattr(self._prefrontal, "last_degraded", False)),
             }
 
         if tool == "timeline_query":
