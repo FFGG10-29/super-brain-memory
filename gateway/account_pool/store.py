@@ -23,6 +23,7 @@ __all__ = [
     "discover_accounts",
     "discover_auth_file",
     "load_workbuddy_auth",
+    "load_ignored",
     "save_accounts_atomic",
 ]
 
@@ -202,7 +203,23 @@ def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[W
     return found
 
 
-def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential]) -> None:
+def load_ignored(path: Path) -> set[str]:
+    """accounts.json 顶层 ignored 列表（「移出号池」的账号 id；缺失视为空）。"""
+    path = Path(path)
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return set()
+    raw = data.get("ignored")
+    if not isinstance(raw, list):
+        return set()
+    return {str(item) for item in raw if item}
+
+
+def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential],
+                         ignored: Iterable[str] | None = None) -> None:
     """tmp 写 + os.replace + 0600（xdpool accounts.json 结构）。"""
     path = Path(path)
     now_ms = int(time.time() * 1000)
@@ -226,7 +243,9 @@ def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential]) ->
             },
             "savedAtMs": now_ms,
         })
-    payload = {"version": 1, "savedAtMs": now_ms, "accounts": entries}
+    payload: dict[str, Any] = {"version": 1, "savedAtMs": now_ms, "accounts": entries}
+    if ignored is not None:
+        payload["ignored"] = sorted({str(item) for item in ignored if item})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:

@@ -175,6 +175,8 @@ class CacheManager:
         self._timeseries = timeseries
         self._lock = threading.RLock()
         self._stores: dict[str, _MemoryLRU] = {}
+        # 运行时开关覆盖（前端缓存页 RPC）：不落盘，重启回到 config
+        self._runtime_enabled: dict[str, bool] = {}
         # ns -> {hits, misses, evictions, invalidations, latency_us}
         self._counters: dict[str, dict[str, float]] = {}
         self._evict_synced: dict[str, int] = {}
@@ -224,7 +226,15 @@ class CacheManager:
         block = getattr(self._config, "cache", None)
         if block is not None and not getattr(block, "enabled", True):
             return False
+        override = self._runtime_enabled.get(ns)
+        if override is not None:
+            return override
         return bool(self._settings(ns).get("enabled", True))
+
+    def set_enabled(self, ns: str, enabled: bool) -> None:
+        """运行时 per-ns 开关（cache.toggle RPC）：覆盖配置但不落盘。"""
+        with self._lock:
+            self._runtime_enabled[ns] = bool(enabled)
 
     def _store(self, ns: str) -> _MemoryLRU:
         with self._lock:

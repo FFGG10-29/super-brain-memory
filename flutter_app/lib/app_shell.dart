@@ -20,7 +20,7 @@ import 'system_features.dart';
 import 'system_gauges.dart';
 import 'win32.dart';
 
-/// LivingMemory 风格外壳：七组主导航（25 页）+ 顶栏（空间/搜索/实时仪表/导出/全屏）+ 底部状态栏。
+/// LivingMemory 风格外壳：十组主导航（29 页）+ 顶栏（空间/搜索/实时仪表/导出/全屏）+ 底部状态栏。
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -86,10 +86,13 @@ class _AppShellState extends State<AppShell> {
   /// 值仍是上面的全局页面索引，_index / IndexedStack / 各跳转常量完全不用改。
   static const List<Map<String, Object>> _groups = <Map<String, Object>>[
     <String, Object>{'name': '星云视图', 'icon': Icons.blur_on, 'pages': <int>[0]},
+    <String, Object>{'name': '人格设定', 'icon': Icons.pets_outlined, 'pages': <int>[23]},
     <String, Object>{'name': '记忆工作台', 'icon': Icons.memory, 'pages': <int>[1, 2, 14]},
-    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 23, 24, 28]},
+    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 24, 28]},
     <String, Object>{'name': 'Agent 上下文', 'icon': Icons.psychology_outlined, 'pages': <int>[18, 19, 20, 21, 22]},
-    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9, 25, 26, 27]},
+    <String, Object>{'name': '大肥鱼聊天', 'icon': Icons.chat_bubble_outline, 'pages': <int>[25]},
+    <String, Object>{'name': '号池网关', 'icon': Icons.dns_outlined, 'pages': <int>[26]},
+    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9, 27]},
     <String, Object>{'name': '系统设置', 'icon': Icons.tune, 'pages': <int>[11, 15, 16, 10]},
     <String, Object>{'name': '关于', 'icon': Icons.info_outline, 'pages': <int>[17]},
   ];
@@ -252,7 +255,7 @@ class _AppShellState extends State<AppShell> {
       SkillsPage(client: _client),
       PersonaPage(client: _client),
       NarrativeInsightPage(client: _client),
-      ChatPage(client: _client),
+      ChatPage(client: _client, onOpenSpace: () => _goTo(28)),
       PoolPage(client: _client),
       CachePage(client: _client),
       AiSpacePage(client: _client),
@@ -340,7 +343,7 @@ class _AppShellState extends State<AppShell> {
                   ),
                   const Padding(
                     padding: EdgeInsets.all(14),
-                    child: Text('主导航 7 组 · 组内子页见顶部\n拖拽翻滚 · 滚轮缩放 · 双击复位',
+                    child: Text('主导航 10 组 · 组内子页见顶部\n拖拽翻滚 · 滚轮缩放 · 双击复位',
                         style: TextStyle(color: Color(0xFF3E5470), fontSize: 10, height: 1.6)),
                   ),
                 ],

@@ -169,6 +169,8 @@ class HeadlessServer:
         )
         # C05：把聊天会话快照接入失效总线（engine 侧只实现 _on_memory_updated，订阅在此）
         self.cache_bus.subscribe(self.chat_engine._on_memory_updated)
+        # chat.history 等 RPC 需要从 daemon 侧够到 8769 引擎
+        self.daemon.chat_engine = self.chat_engine
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
         """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""

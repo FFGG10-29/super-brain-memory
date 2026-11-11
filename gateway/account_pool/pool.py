@@ -212,6 +212,8 @@ class AccountPool:
     def __init__(self, config: Any, *, transport: Transport | None = None) -> None:
         self.config = config
         self.accounts: list[WorkBuddyCredential] = []
+        # 「移出号池」清单：账号凭证保留在 accounts.json，但不再参与 failover
+        self.ignored: set[str] = set()
         self._timeout = float(getattr(config, "request_timeout_sec", 20.0))
         self._max_attempts = int(getattr(config, "max_attempts", 3))
         self._credential_dead_sec = float(getattr(config, "credential_dead_sec", 3600.0))
@@ -228,14 +230,50 @@ class AccountPool:
         self.accounts = store.discover_accounts(
             accounts_file=getattr(self.config, "accounts_file", "") or "",
             auth_file=getattr(self.config, "auth_file", "") or "")
+        self._load_ignored()
+
+    def _accounts_path(self) -> Path:
+        raw = getattr(self.config, "accounts_file", "") or ""
+        return Path(raw) if raw else Path.home() / ".dsh" / ".xdpool" / "accounts.json"
+
+    def _load_ignored(self) -> None:
+        try:
+            self.ignored = store.load_ignored(self._accounts_path())
+        except Exception:  # noqa: BLE001  忽略清单读失败不阻断号池
+            self.ignored = set()
 
     def _request(self, method: str, url: str, headers: dict[str, str], body: bytes):
         return self._transport(method, url, headers, body)
 
     def _persist(self) -> None:
-        raw = getattr(self.config, "accounts_file", "") or ""
-        path = Path(raw) if raw else Path.home() / ".dsh" / ".xdpool" / "accounts.json"
-        store.save_accounts_atomic(path, self.accounts)
+        store.save_accounts_atomic(self._accounts_path(), self.accounts,
+                                   ignored=self.ignored)
+
+    # -- 号池管理（前端号池页 RPC 的后端实现）------------------------------
+
+    def rescan(self) -> dict[str, int]:
+        """重新扫描凭证：xdpool accounts.json + WorkBuddy 登录态重新入池。"""
+        self.discover()
+        return {"total": len(self.accounts), "ignored": len(self.ignored),
+                "active": len(self.accounts) - sum(
+                    1 for a in self.accounts if a.account_id() in self.ignored)}
+
+    def logout(self, account_id: str) -> None:
+        """「退出登录」＝移出号池：凭证保留在 accounts.json，可随时恢复。"""
+        account_id = str(account_id or "")
+        if not account_id:
+            raise AccountPoolError("缺少 account_id")
+        self.ignored.add(account_id)
+        self._persist()
+
+    def restore(self, account_id: str) -> None:
+        """从忽略清单恢复并重新扫描入池。"""
+        account_id = str(account_id or "")
+        if not account_id:
+            raise AccountPoolError("缺少 account_id")
+        self.ignored.discard(account_id)
+        self._persist()
+        self.discover()
 
     # -- token ------------------------------------------------------------
 
@@ -366,7 +404,9 @@ class AccountPool:
         messages = [{"role": "user", "content": prompt}]
         now = time.time()
         eligible = [a for a in self.accounts
-                    if now >= a.dead_until and now >= a.cooldowns.get(model, 0.0)]
+                    if a.account_id() not in self.ignored
+                    and now >= a.dead_until
+                    and now >= a.cooldowns.get(model, 0.0)]
         if not eligible:
             raise AccountPoolError("号池没有可用账号（未 discover 或全部冷却/死亡）")
         last: Exception | None = None

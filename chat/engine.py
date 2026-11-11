@@ -182,6 +182,7 @@ class ChatEngine:
         intent = classify_intent(text)  # Q20：模型路由与召回深度共用这一个 intent
         sensitive = self._is_sensitive(text)
         channel = cfg.persona_channel
+        self._persist_message(session_id, "user", text)
 
         # W8 / P6.1：媒体意图先回文本 + typing，后台异步生成，不阻塞对话流
         if intent == "media":
@@ -191,6 +192,7 @@ class ChatEngine:
                 "text": "好的，正在生成…", "intent": intent, "model": "",
                 "provider_kind": "local", "fallback": False,
             })
+            self._persist_message(session_id, "assistant", "好的，正在生成…")
             task = asyncio.create_task(self._media_task(session_id, text))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -236,6 +238,7 @@ class ChatEngine:
             "provider_kind": result.get("kind", ""),
             "fallback": bool(result.get("fallback")),
         })
+        self._persist_message(session_id, "assistant", reply)
 
         # ④' C05 情节缓冲快照（Q30 裁决：合并进 _history 载体）：每轮把
         #     {turn_count, 召回片段 id, persona_hash} 增量写入 episodic ns；
@@ -251,6 +254,20 @@ class ChatEngine:
         # ⑤ 只有「值得记住」的消息才写长期记忆，且必须经统一 WriteGate
         if self._worth_remembering(text, intent):
             await asyncio.to_thread(self._remember, text, intent)
+
+    # ── 聊天记录持久化（sessions.db messages 表，v2）─────────────────────
+    def _persist_message(self, session_id: str, role: str, text: str) -> None:
+        try:
+            self._sessions.append_message(session_id, role, text)
+        except Exception as exc:  # noqa: BLE001  落库失败不阻断对话
+            self.last_error = f"chat persist failed: {type(exc).__name__}: {exc}"
+
+    def history(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """跨会话/重启的持久化记录（chat.history RPC 数据源）。"""
+        try:
+            return self._sessions.history(session_id, limit=limit)
+        except Exception:  # noqa: BLE001  读失败按空历史展示
+            return []
 
     # ── C05：情节缓冲快照（episodic ns）──────────────────────────────────
     @staticmethod

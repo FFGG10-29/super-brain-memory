@@ -4,7 +4,8 @@ import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
 
-/// 缓存使用情况页：真实数据（后端 cache.metrics → CacheManager.snapshot_metrics）。
+/// 缓存使用情况页：真实数据（cache.metrics）+ 每种缓存的用途说明 + 运行时开关。
+/// 开关走 cache.toggle（CacheManager.set_enabled，运行时覆盖、重启回到 config）。
 class CachePage extends StatefulWidget {
   const CachePage({super.key, required this.client});
 
@@ -22,10 +23,33 @@ class _CachePageState extends State<CachePage> {
   static const Color _ok = Color(0xFF4ADE80);
   static const Color _warn = Color(0xFFFACC15);
   static const Color _dead = Color(0xFFF87171);
+  static const Color _accent = Color(0xFF6EE7B7);
+
+  /// 每种缓存是干什么的（与 core/cache_manager.py / config.py 对齐）。
+  static const Map<String, String> _descriptions = <String, String>{
+    'recall': '召回结果缓存：相同查询直接复用检索结果，省一次图遍历',
+    'embedding': '向量嵌入缓存（LMDB）：同一段文本不重复过 embedding 模型',
+    'salience': '显著性打分缓存：省掉重复的显著度评估',
+    'episodic': '情节缓冲快照：记录会话轮次与召回片段 id，供记忆更新后精确失效',
+    'prompt_prefix': '提示词前缀缓存：人格注入等固定前缀不重复拼接',
+    'path': '路径/导航缓存：图上走过的路径复用',
+    'persona': '人格层参数缓存：L0 人格注入材料（容量小、永久）',
+    'route': '模型路由决策缓存：同样的意图/负载直接复用上次选路',
+    'doc_distill': '文档蒸馏缓存（LMDB 永久）：同一文档不重复蒸馏',
+    'output': '输出缓存：整段回复按 prompt 精确复用，语义漂移风险最高（默认关）',
+    'semantic': '语义输出缓存：近邻命中的问题直接复用回复（C17）',
+    'tool_read': '幂等读工具缓存：MCP 只读工具的重复调用直接返回',
+    'tool': '工具结果缓存（预留位）',
+    'thalamus': '丘脑意图分类缓存（预留位）',
+    'safety': '安全审查缓存（预留位）',
+    'narrative': '叙事缓存（预留位：由 W8 投影缓存承担）',
+    'conflict': '冲突检测缓存（预留位）',
+  };
 
   Map<String, dynamic> _data = <String, dynamic>{};
   String _message = '';
   bool _busy = false;
+  final Set<String> _toggling = <String>{};
 
   @override
   void initState() {
@@ -49,10 +73,37 @@ class _CachePageState extends State<CachePage> {
     }
   }
 
+  Future<void> _toggle(String ns, bool enabled) async {
+    if (_toggling.contains(ns)) return;
+    setState(() => _toggling.add(ns));
+    try {
+      final result = await widget.client.call('cache.toggle',
+          <String, dynamic>{'ns': ns, 'enabled': enabled});
+      if (!mounted) return;
+      if (result is Map && result['ok'] == true) {
+        final nsMap = (_data['namespaces'] as Map<dynamic, dynamic>? ?? {});
+        final row = nsMap[ns];
+        if (row is Map) {
+          final updated = Map<String, dynamic>.from(row);
+          updated['enabled'] = enabled;
+          nsMap[ns] = updated;
+        }
+        setState(() => _message = '');
+      } else {
+        setState(() => _message =
+            '开关失败：${result is Map ? (result['error'] ?? '未知原因') : '响应异常'}');
+      }
+    } catch (error) {
+      if (mounted) setState(() => _message = '开关失败：$error');
+    } finally {
+      if (mounted) setState(() => _toggling.remove(ns));
+    }
+  }
+
   Color _rateColor(double rate) =>
       rate >= 0.5 ? _ok : (rate >= 0.2 ? _warn : _hint);
 
-  // 单命名空间指标卡：命中率进度条 + 计数行。
+  // 单命名空间指标卡：用途说明 + 开关 + 命中率进度条 + 计数行。
   Widget _nsCard(String name, Map ns) {
     final enabled = (ns['enabled'] ?? false) == true;
     final entries = (ns['entries'] ?? 0) as int;
@@ -69,25 +120,48 @@ class _CachePageState extends State<CachePage> {
       decoration: BoxDecoration(
         color: _panel,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: _border),
+        border: Border.all(color: enabled ? _border : _border.withValues(alpha: 0.5)),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
         Row(children: <Widget>[
           Text(name,
-              style: const TextStyle(
-                  color: Colors.white, fontSize: 13, fontFamily: 'monospace')),
+              style: TextStyle(
+                  color: enabled ? Colors.white : _hint,
+                  fontSize: 13, fontFamily: 'monospace')),
           const SizedBox(width: 8),
-          _pill(enabled ? '开' : '关', enabled ? _ok : _hint),
+          _pill(enabled ? '开' : '关', enabled ? _ok : _dead),
           const Spacer(),
           Text('${ns['media']} · $entries/$capacity',
               style: const TextStyle(color: _hint, fontSize: 10)),
+          const SizedBox(width: 4),
+          SizedBox(
+            height: 26,
+            child: Switch(
+              value: enabled,
+              activeThumbColor: _accent,
+              activeTrackColor: _accent.withValues(alpha: 0.3),
+              inactiveThumbColor: _hint,
+              inactiveTrackColor: _border,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              onChanged: _toggling.contains(name)
+                  ? null
+                  : (value) => unawaited(_toggle(name, value)),
+            ),
+          ),
         ]),
-        const SizedBox(height: 8),
+        // 这个缓存是干什么的
+        Padding(
+          padding: const EdgeInsets.only(top: 2, bottom: 6),
+          child: Text(_descriptions[name] ?? '自定义命名空间',
+              style: TextStyle(
+                  color: enabled ? _hint : _hint.withValues(alpha: 0.6),
+                  fontSize: 11, height: 1.4)),
+        ),
         // 命中率进度条
         ClipRRect(
           borderRadius: BorderRadius.circular(4),
           child: LinearProgressIndicator(
-            value: hitRate.clamp(0.0, 1.0),
+            value: enabled ? hitRate.clamp(0.0, 1.0) : 0.0,
             minHeight: 6,
             backgroundColor: _border,
             valueColor: AlwaysStoppedAnimation<Color>(_rateColor(hitRate)),
@@ -123,8 +197,14 @@ class _CachePageState extends State<CachePage> {
         .map((entry) => MapEntry(entry.key.toString(),
             Map<String, dynamic>.from(entry.value as Map)))
         .toList()
-      ..sort((a, b) => ((b.value['hit_rate'] ?? 0) as num)
-          .compareTo((a.value['hit_rate'] ?? 0) as num));
+      ..sort((a, b) {
+        // 开着的排前面，其余按命中率降序
+        final ea = (a.value['enabled'] ?? false) == true;
+        final eb = (b.value['enabled'] ?? false) == true;
+        if (ea != eb) return ea ? -1 : 1;
+        return ((b.value['hit_rate'] ?? 0) as num)
+            .compareTo((a.value['hit_rate'] ?? 0) as num);
+      });
     return Scaffold(
       backgroundColor: _bg,
       body: RefreshIndicator(
@@ -136,7 +216,8 @@ class _CachePageState extends State<CachePage> {
               const Text('缓存使用情况',
                   style: TextStyle(color: Colors.white, fontSize: 18)),
               const Spacer(),
-              Text('总开关 ${(_data['enabled'] ?? false) == true ? '开' : '关'}',
+              Text('总开关 ${(_data['enabled'] ?? false) == true ? '开' : '关'}'
+                  '（运行时开关不落盘，重启回到配置）',
                   style: const TextStyle(color: _hint, fontSize: 11)),
               const SizedBox(width: 8),
               IconButton(

@@ -8,9 +8,12 @@ import 'chat_service.dart';
 /// 聊天入口测试页 —— 微信风格（浅色、绿/白气泡、顶栏"大肥鱼"）。
 /// 数据全部来自 8769 真实通道：hello 鉴权、typing、reply、error 帧。
 class ChatPage extends StatefulWidget {
-  const ChatPage({super.key, required this.client});
+  const ChatPage({super.key, required this.client, this.onOpenSpace});
 
   final BrainClient client;
+
+  /// 头像资料卡 →「进入 AI 空间」由外壳跳转（第 28 页）。
+  final VoidCallback? onOpenSpace;
 
   @override
   State<ChatPage> createState() => _ChatPageState();
@@ -23,6 +26,7 @@ class _ChatPageState extends State<ChatPage> {
   ChatService? _service;
   ChatLinkState _link = ChatLinkState.disconnected;
   String _tokenError = '';
+  String _sessionId = '';
   bool _typing = false;
   StreamSubscription<Map<String, dynamic>>? _framesSub;
   StreamSubscription<ChatLinkState>? _stateSub;
@@ -65,7 +69,10 @@ class _ChatPageState extends State<ChatPage> {
 
   void _onFrame(Map<String, dynamic> frame) {
     final type = frame['type'];
-    if (type == 'typing') {
+    if (type == 'hello_ack') {
+      _sessionId = (frame['session_id'] ?? '').toString();
+      unawaited(_loadHistory());
+    } else if (type == 'typing') {
       final state = frame['state'];
       if (mounted) setState(() => _typing = state != false);
     } else if (type == 'reply') {
@@ -91,6 +98,101 @@ class _ChatPageState extends State<ChatPage> {
         unawaited(_scrollDown());
       }
     }
+  }
+
+  /// hello_ack 后回放持久化记录（sessions.db，跨重启）；只在会话首帧拉一次。
+  Future<void> _loadHistory() async {
+    if (_sessionId.isEmpty || _messages.isNotEmpty) return;
+    try {
+      final data = await widget.client.call('chat.history', <String, dynamic>{
+        'session_id': _sessionId, 'limit': 200,
+      });
+      if (!mounted || _messages.isNotEmpty) return;
+      final rows = data is Map && data['ok'] == true
+          ? (data['messages'] as List? ?? <dynamic>[])
+          : <dynamic>[];
+      if (rows.isEmpty) return;
+      setState(() {
+        for (final row in rows) {
+          if (row is! Map) continue;
+          _messages.add(_Msg(
+            text: (row['text'] ?? '').toString(),
+            mine: (row['role'] ?? '').toString() == 'user',
+            model: '', kind: '', fallback: null,
+          ));
+        }
+      });
+      unawaited(_scrollDown());
+    } catch (_) {
+      // 历史拉取失败不阻断聊天
+    }
+  }
+
+  /// 头像 → 资料卡（ai.profile 真数据）+ AI 空间入口。
+  Future<void> _showProfileCard() async {
+    Map<String, dynamic> profile = <String, dynamic>{};
+    try {
+      final data = await widget.client.call('ai.profile', <String, dynamic>{});
+      if (data is Map && data['ok'] == true) {
+        profile = Map<String, dynamic>.from(data);
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (BuildContext context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+          child: Column(mainAxisSize: MainAxisSize.min, children: <Widget>[
+            CircleAvatar(
+              radius: 34,
+              backgroundColor: const Color(0xFF4A90D9),
+              child: Text((profile['avatar_emoji'] ?? '🐟').toString(),
+                  style: const TextStyle(fontSize: 30)),
+            ),
+            const SizedBox(height: 10),
+            Text((profile['nickname'] ?? '大肥鱼').toString(),
+                style: const TextStyle(
+                    color: _text, fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(
+              (profile['signature'] ?? '').toString().isEmpty
+                  ? '这个家伙很懒，什么都没留下'
+                  : (profile['signature'] ?? '').toString(),
+              style: const TextStyle(color: _hint, fontSize: 12),
+            ),
+            const SizedBox(height: 6),
+            Text('日记 ${(profile['diary_count'] ?? 0)} 篇',
+                style: const TextStyle(color: _hint, fontSize: 11)),
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: Material(
+                color: const Color(0xFF07C160),
+                borderRadius: BorderRadius.circular(8),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    widget.onOpenSpace?.call();
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 11),
+                    child: Center(
+                      child: Text('进入 AI 空间（动态 · 日记）',
+                          style: TextStyle(color: Colors.white, fontSize: 14)),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
   }
 
   Future<void> _scrollDown() async {
@@ -184,12 +286,17 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  Widget _avatar(bool mine) => CircleAvatar(
-        radius: 18,
-        backgroundColor: mine ? const Color(0xFF07C160) : const Color(0xFF4A90D9),
-        child: Text(mine ? '我' : '🐟',
-            style: const TextStyle(color: Colors.white, fontSize: 13)),
-      );
+  Widget _avatar(bool mine) {
+    final circle = CircleAvatar(
+      radius: 18,
+      backgroundColor: mine ? const Color(0xFF07C160) : const Color(0xFF4A90D9),
+      child: Text(mine ? '我' : '🐟',
+          style: const TextStyle(color: Colors.white, fontSize: 13)),
+    );
+    if (mine) return circle;
+    // 大肥鱼头像可点：资料卡 + AI 空间入口
+    return GestureDetector(onTap: _showProfileCard, child: circle);
+  }
 
   @override
   Widget build(BuildContext context) {

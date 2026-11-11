@@ -662,14 +662,17 @@ class RpcExtension:
         cfg = getattr(self._daemon, "_config", None)
         pool_cfg = getattr(cfg, "account_pool", None) if cfg is not None else None
         now = time.time()
+        ignored = set(getattr(pool, "ignored", None) or ())
         accounts = []
         for account in (getattr(pool, "accounts", None) or []):
+            account_id = account.account_id()
             accounts.append({
-                "id": account.account_id(),
+                "id": account_id,
                 "label": account.label(),
                 "region": account.region,
                 "dead": now < account.dead_until,
                 "dead_remaining_sec": max(0, round(account.dead_until - now)),
+                "ignored": account_id in ignored,
                 "model_cooldowns": {key: max(0, round(value - now))
                                     for key, value in account.cooldowns.items()
                                     if value > now},
@@ -680,9 +683,50 @@ class RpcExtension:
             "free_lane": bool(getattr(pool_cfg, "free_lane", False)),
             "default_model": str(getattr(pool_cfg, "default_model", "") or ""),
             "account_count": len(accounts),
+            "ignored_count": len(ignored),
             "accounts": accounts,
             "in_router": pool is not None,
         }
+
+    def _pool_rescan(self, **_: Any) -> dict[str, Any]:
+        """重新扫描凭证：xdpool accounts.json + WorkBuddy 登录态重新入池。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配（config.account_pool.enabled）"}
+        try:
+            return {"ok": True, **pool.rescan()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _pool_logout(self, account_id: str = "", **_: Any) -> dict[str, Any]:
+        """「退出登录」＝移出号池（凭证保留，可恢复）。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配"}
+        try:
+            pool.logout(account_id)
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _pool_restore(self, account_id: str = "", **_: Any) -> dict[str, Any]:
+        """从忽略清单恢复账号并重新扫描入池。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配"}
+        try:
+            pool.restore(account_id)
+            return {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _account_pool(self) -> Any:
+        try:
+            from gateway.model_router import get_model_router
+
+            return getattr(get_model_router(), "_account_pool", None)
+        except Exception:  # noqa: BLE001  路由未装配
+            return None
 
     def _cache_metrics(self, **_: Any) -> dict[str, Any]:
         from core.cache_manager import get_cache_manager
@@ -692,6 +736,19 @@ class RpcExtension:
             return {"ok": True, "available": False}
         return {"ok": True, "available": True, **manager.snapshot_metrics()}
 
+    def _cache_toggle(self, ns: str = "", enabled: bool = True, **_: Any) -> dict[str, Any]:
+        """缓存页运行时开关：per-ns 覆盖，不落盘（重启回到 config）。"""
+        from core.cache_manager import get_cache_manager
+
+        manager = get_cache_manager()
+        if manager is None:
+            return {"ok": False, "error": "缓存管理器未装配"}
+        ns = str(ns or "")
+        if not ns:
+            return {"ok": False, "error": "缺少 ns"}
+        manager.set_enabled(ns, bool(enabled))
+        return {"ok": True, "ns": ns, "enabled": bool(enabled)}
+
     def _chat_token(self, **_: Any) -> dict[str, Any]:
         """前端聊天入口测试页取 chat 专用令牌（8767 管理端同机可信）。"""
         try:
@@ -700,6 +757,16 @@ class RpcExtension:
             return {"ok": True, "token": ensure_chat_token()}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _chat_history(self, session_id: str = "", limit: int = 200, **_: Any) -> dict[str, Any]:
+        """聊天记录回放（sessions.db messages 表，跨重启）。"""
+        engine = getattr(self._daemon, "chat_engine", None)
+        if engine is None:
+            return {"ok": False, "error": "聊天引擎未启用（config.chat.enabled）"}
+        session_id = str(session_id or "")
+        if not session_id:
+            return {"ok": False, "error": "缺少 session_id"}
+        return {"ok": True, "messages": engine.history(session_id, limit=int(limit))}
 
     # ── AI 空间（QQ 风格个人主页：资料/签名/动态/日记，数据源=超大脑本体）──
     def _ai_narratives(self, limit: int = 30, **_: Any) -> list[dict[str, Any]]:

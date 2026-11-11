@@ -18,7 +18,7 @@ from core.runtime_paths import user_dir
 
 __all__ = ["SCHEMA_VERSION", "SessionRegistry"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _now() -> int:
@@ -76,10 +76,23 @@ class SessionRegistry:
             "session_id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL, "
             "last_active_at_ms INTEGER NOT NULL, device_list TEXT NOT NULL DEFAULT '[]')"
         )
+        self._create_messages()
+
+    def _create_messages(self) -> None:
+        """v2：聊天记录持久化（role=user/assistant，按 session 存）。"""
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT NOT NULL, role TEXT NOT NULL, "
+            "text TEXT NOT NULL, ts_ms INTEGER NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id)"
+        )
 
     def _migrate_v1_to_v2(self) -> None:
-        """占位：v2 加字段时在这里 ALTER TABLE，不删库重建。"""
-        return None
+        """v1 → v2：补建聊天消息表，不动 sessions 数据。"""
+        self._create_messages()
 
     # ── 会话 CRUD ─────────────────────────────────────────────────────────
     def create(self) -> str:
@@ -137,6 +150,27 @@ class SessionRegistry:
             return [str(x) for x in json.loads(row["device_list"])]
         except (ValueError, TypeError):
             return []
+
+    # ── 聊天记录持久化（v2）───────────────────────────────────────────────
+    def append_message(self, session_id: str, role: str, text: str,
+                       ts_ms: int | None = None) -> None:
+        """一轮对话落库；失败只抛给调用方（引擎侧吞掉，不阻断回复）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO messages(session_id, role, text, ts_ms) VALUES (?, ?, ?, ?)",
+                (session_id, str(role), str(text),
+                 int(ts_ms if ts_ms is not None else _now())),
+            )
+
+    def history(self, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """按时间升序取最近 limit 条（前端打开聊天页时回放）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, text, ts_ms FROM messages WHERE session_id=? "
+                "ORDER BY id DESC LIMIT ?", (session_id, max(1, int(limit)))
+            ).fetchall()
+        return [{"role": str(row["role"]), "text": str(row["text"]),
+                 "ts_ms": int(row["ts_ms"])} for row in reversed(rows)]
 
     # ── 在线连接 fan-out（内存，重启后可重连恢复）────────────────────────
     def add_connection(self, session_id: str, connection: Any) -> None:
