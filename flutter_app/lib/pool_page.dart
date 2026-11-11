@@ -4,11 +4,11 @@ import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
 
-/// 号池页 —— 对齐 dsh-xdpool 原版布局：账号池表格（账号/区域/状态/操作）+
-/// 重新扫描凭证。操作全部是后端真实能力：
-///   pool.status（状态）/ pool.rescan（重新扫描凭证）
-///   pool.logout（移出号池，凭证保留可恢复）/ pool.restore（恢复入池）
-/// 模型目录倍率、一键签到、浏览器登录是外部 xdpool 面板能力，未内置（见页脚说明）。
+/// 号池网关 —— 对齐 dsh-xdpool 原版：账号池表格（账号/区域/状态/已服务/操作）+
+/// 重新扫描凭证 + 一键签到 + 模型目录（WorkBuddy 倍率/上下文/限时免费/开关）+
+/// 免密 lane 全量免费模型（70+，opencode listing 实时）+ 拉起 WorkBuddy 登录。
+/// 全部走后端真实 RPC：pool.status/rescan/logout/restore/catalog/
+/// catalog_refresh/model_toggle/checkin/login_start。
 class PoolPage extends StatefulWidget {
   const PoolPage({super.key, required this.client});
 
@@ -27,8 +27,20 @@ class _PoolPageState extends State<PoolPage> {
   static const Color _warn = Color(0xFFFACC15);
   static const Color _dead = Color(0xFFF87171);
   static const Color _accent = Color(0xFF6EE7B7);
+  static const Color _promo = Color(0xFFF472B6);
+
+  /// 实测拒绝 reasoning_effort=off 的模型（off-thinking.ts issue #34），硬墙。
+  static const Set<String> _refusesOff = <String>{
+    'deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg', 'deepseek-v4-pro',
+    'primary-model', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra',
+    'gpt-5.6-luna', 'gemini-3.5-flash',
+  };
+  static const List<String> _thinkingLevels = <String>[
+    'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+  ];
 
   Map<String, dynamic> _data = <String, dynamic>{};
+  Map<String, dynamic> _catalog = <String, dynamic>{};
   String _message = '';
   bool _busy = false;
   String _acting = '';
@@ -39,13 +51,20 @@ class _PoolPageState extends State<PoolPage> {
     unawaited(_load());
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool forceCatalog = false}) async {
     setState(() => _busy = true);
     try {
-      final data = await widget.client.poolStatus();
+      final status = await widget.client.poolStatus();
+      Map<String, dynamic> catalog = <String, dynamic>{};
+      try {
+        final result = await widget.client.call('pool.catalog',
+            <String, dynamic>{'force': forceCatalog});
+        if (result is Map<String, dynamic>) catalog = result;
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
-        _data = data;
+        _data = status;
+        _catalog = catalog;
         _message = '';
       });
     } catch (error) {
@@ -55,14 +74,26 @@ class _PoolPageState extends State<PoolPage> {
     }
   }
 
-  Future<void> _rpc(String method, Map<String, dynamic> args, String tag) async {
+  Future<void> _rpc(String method, Map<String, dynamic> args, String tag,
+      {String? okMessage}) async {
     if (_acting.isNotEmpty) return;
     setState(() => _acting = tag);
     try {
       final result = await widget.client.call(method, args);
       if (!mounted) return;
       if (result is Map && result['ok'] == true) {
-        await _load();
+        if (method.startsWith('pool.catalog')) {
+          setState(() {
+            _catalog = Map<String, dynamic>.from(result);
+            _message = '';
+          });
+        } else {
+          setState(() => _message = okMessage ?? '');
+          await _load();
+        }
+        if (okMessage != null && method != 'pool.catalog') {
+          setState(() => _message = okMessage);
+        }
       } else {
         setState(() => _message =
             '$method 失败：${result is Map ? (result['error'] ?? '未知原因') : '响应异常'}');
@@ -74,24 +105,18 @@ class _PoolPageState extends State<PoolPage> {
     }
   }
 
-  Future<void> _confirm(String title, String content, Future<void> Function() act) async {
-    final yes = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext context) => AlertDialog(
-        backgroundColor: _panel,
-        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 15)),
-        content: Text(content, style: const TextStyle(color: _hint, fontSize: 12)),
-        actions: <Widget>[
-          TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('取消', style: TextStyle(color: _hint))),
-          TextButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('确定', style: TextStyle(color: _accent))),
-        ],
-      ),
-    );
-    if (yes == true) await act();
+  Future<void> _toggleModel(String modelId, bool enabled) async {
+    setState(() => _acting = 'toggle-$modelId');
+    try {
+      await widget.client
+          .call('pool.model_toggle', <String, dynamic>{'model_id': modelId, 'enabled': enabled});
+      if (!mounted) return;
+      setState(() => _message = enabled ? '已启用 $modelId' : '已禁用 $modelId');
+    } catch (error) {
+      if (mounted) setState(() => _message = '开关失败：$error');
+    } finally {
+      if (mounted) setState(() => _acting = '');
+    }
   }
 
   Widget _pill(String text, Color tone) => Container(
@@ -104,7 +129,29 @@ class _PoolPageState extends State<PoolPage> {
         child: Text(text, style: TextStyle(color: tone, fontSize: 10)),
       );
 
-  // 账号行：● 账号 | 区域 | 状态 | 操作（移出号池/恢复）——对齐原版表格列。
+  Widget _actionButton(String label, IconData icon, String tag, VoidCallback onTap,
+      {Color tone = _accent}) {
+    final acting = _acting == tag;
+    return TextButton.icon(
+      onPressed: _acting.isNotEmpty ? null : onTap,
+      icon: acting
+          ? const SizedBox(width: 12, height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2, color: _accent))
+          : Icon(icon, size: 14, color: tone),
+      label: Text(label, style: TextStyle(color: tone, fontSize: 12)),
+      style: TextButton.styleFrom(
+        backgroundColor: tone.withValues(alpha: 0.1),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(6),
+            side: BorderSide(color: tone.withValues(alpha: 0.4))),
+      ),
+    );
+  }
+
+  // 账号行：● 账号 | 区域 | 状态 | 已服务 | 操作（退出登录/恢复）
   Widget _accountRow(Map account) {
     final id = (account['id'] ?? '').toString();
     final label = (account['label'] ?? id).toString();
@@ -112,13 +159,14 @@ class _PoolPageState extends State<PoolPage> {
     final ignored = (account['ignored'] ?? false) == true;
     final dead = (account['dead'] ?? false) == true;
     final deadSec = (account['dead_remaining_sec'] ?? 0) as int;
+    final served = (account['served'] ?? 0) as int;
     final cooldowns = (account['model_cooldowns'] as Map<dynamic, dynamic>? ?? {});
     final status = ignored
         ? _pill('已移出', _hint)
         : dead
-            ? _pill('登录态失效 ${deadSec}s', _dead)
+            ? _pill('失效 ${deadSec}s', _dead)
             : (cooldowns.isNotEmpty
-                ? _pill('冷却中(${cooldowns.length}模型)', _warn)
+                ? _pill('冷却(${cooldowns.length}模型)', _warn)
                 : _pill('ready', _ok));
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
@@ -145,6 +193,11 @@ class _PoolPageState extends State<PoolPage> {
         Expanded(
           flex: 4,
           child: Align(alignment: Alignment.centerLeft, child: status),
+        ),
+        Expanded(
+          flex: 2,
+          child: Text('已服务 $served',
+              style: const TextStyle(color: _hint, fontSize: 10)),
         ),
         SizedBox(
           width: 84,
@@ -179,6 +232,378 @@ class _PoolPageState extends State<PoolPage> {
     );
   }
 
+  // 模型行：两行式——信息+启用开关；思考档 / 图片 / 上下文预算 / 拉起。
+  Widget _modelRow(Map model) {
+    final id = (model['id'] ?? '').toString();
+    final name = (model['name'] ?? id).toString();
+    final multiplier = model['multiplier'];
+    final ctx = model['context_window'];
+    final promoFree = (model['promo_free'] ?? false) == true;
+    final image = (model['image'] ?? false) == true;
+    final reasoning = (model['reasoning'] ?? false) == true;
+    final wire = (model['wire'] ?? '').toString();
+    final regionSensitive = (model['region_sensitive'] ?? false) == true;
+    final pref = _pref(id);
+    final disabled = _disabled.contains(id) || pref['enabled'] == false;
+    final prefImage = pref.containsKey('image') ? pref['image'] == true : image;
+    final thinking = (pref['thinking'] ?? '').toString();
+    final ctxBudget = pref['ctx_budget'];
+    final tags = <String>[
+      if (multiplier is num) 'x${multiplier.toStringAsFixed(2)}',
+      if (multiplier == null && model.containsKey('multiplier')) '倍率未取到',
+      if (ctx is num && ctx > 0) '原生 ${(ctx / 1000).toStringAsFixed(0)}K',
+      if (ctxBudget is num && ctxBudget > 0)
+        '预算 ${(ctxBudget / 1000).toStringAsFixed(0)}K',
+      if (image) '多模态',
+      if (wire == 'responses') 'responses',
+      if (wire == 'messages') 'messages',
+      if (regionSensitive) '分区敏感',
+    ];
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+        Row(children: <Widget>[
+          Expanded(
+            flex: 6,
+            child: Row(children: <Widget>[
+              Flexible(
+                child: Text(name,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        color: disabled ? _hint : Colors.white, fontSize: 12)),
+              ),
+              if (promoFree) ...<Widget>[
+                const SizedBox(width: 6),
+                _pill('限时免费', _promo),
+              ],
+            ]),
+          ),
+          Expanded(
+            flex: 4,
+            child: Text(tags.join(' · '),
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: _hint, fontSize: 10)),
+          ),
+          SizedBox(
+            height: 26,
+            child: Switch(
+              value: !disabled,
+              activeThumbColor: _accent,
+              inactiveThumbColor: _hint,
+              activeTrackColor: _accent.withValues(alpha: 0.3),
+              inactiveTrackColor: _border,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              onChanged: _acting.isNotEmpty
+                  ? null
+                  : (value) => unawaited(_toggleModel(id, value)),
+            ),
+          ),
+        ]),
+        // 第二行：思考档 / 图片 / 上下文预算 / 拉起
+        Padding(
+          padding: const EdgeInsets.only(top: 3, left: 2),
+          child: Row(children: <Widget>[
+            _prefMenu<ThinkingChoice>(
+              icon: Icons.psychology_alt_outlined,
+              tooltip: '思考档位（reasoning_effort）',
+              label: thinking.isEmpty
+                  ? '思考:默认'
+                  : (thinking == 'off' ? '思考:关' : '思考:$thinking'),
+              items: <PopupMenuEntry<ThinkingChoice>>[
+                const PopupMenuItem<ThinkingChoice>(
+                    value: ThinkingChoice.dflt,
+                    child: Text('跟随上游默认',
+                        style: TextStyle(color: Colors.white, fontSize: 12))),
+                // off 只对「声明可关 + 不在实测硬墙表」的模型提供
+                if (reasoning && !_refusesOff.contains(id))
+                  const PopupMenuItem<ThinkingChoice>(
+                      value: ThinkingChoice.off,
+                      child: Text('关闭思考 (off)',
+                          style: TextStyle(color: Colors.white, fontSize: 12))),
+                for (final level in _thinkingLevels)
+                  PopupMenuItem<ThinkingChoice>(
+                      value: ThinkingChoice.level(level),
+                      child: Text('思考: $level',
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12))),
+              ],
+              onSelected: (ThinkingChoice choice) => unawaited(_setPref(
+                  id, <String, dynamic>{'thinking': choice.wireValue})),
+            ),
+            const SizedBox(width: 4),
+            // 图片开关：上游 supportsImages 为预填，用户可否决
+            _iconToggle(
+              icon: prefImage ? Icons.image_outlined : Icons.image_not_supported_outlined,
+              tooltip: prefImage ? '图片输入：开' : '图片输入：关（已否决）',
+              active: prefImage,
+              onTap: () => unawaited(_setPref(id, <String, dynamic>{'image': !prefImage})),
+            ),
+            const SizedBox(width: 4),
+            _prefMenu<int>(
+              icon: Icons.straighten,
+              tooltip: '上下文预算（上限，只能调低不能调高）',
+              label: ctxBudget is num && ctxBudget > 0
+                  ? 'ctx ${(ctxBudget / 1000).toStringAsFixed(0)}K'
+                  : 'ctx 原生',
+              items: <PopupMenuEntry<int>>[
+                const PopupMenuItem<int>(
+                    value: 0,
+                    child: Text('原生窗口（清除预算）',
+                        style: TextStyle(color: Colors.white, fontSize: 12))),
+                for (final k in const <int>[200000, 400000, 1000000])
+                  PopupMenuItem<int>(
+                      value: k,
+                      child: Text('${k ~/ 1000}K',
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12))),
+              ],
+              onSelected: (int value) => unawaited(
+                  _setPref(id, <String, dynamic>{'ctx_budget': value})),
+            ),
+            const SizedBox(width: 4),
+            _iconToggle(
+              icon: Icons.play_arrow_rounded,
+              tooltip: '拉起测试（单次真实调用）',
+              active: true,
+              onTap: () => unawaited(_invokeModel(id)),
+            ),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _prefMenu<T>({required IconData icon, required String tooltip,
+      required String label, required List<PopupMenuEntry<T>> items,
+      required void Function(T) onSelected}) =>
+      PopupMenuButton<T>(
+        tooltip: tooltip,
+        onSelected: _acting.isNotEmpty ? null : onSelected,
+        itemBuilder: (BuildContext context) => items,
+        color: _panel,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: _border.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+            Icon(icon, size: 12, color: _hint),
+            const SizedBox(width: 4),
+            Text(label, style: const TextStyle(color: _hint, fontSize: 10)),
+          ]),
+        ),
+      );
+
+  Widget _iconToggle({required IconData icon, required String tooltip,
+      required bool active, required VoidCallback onTap}) =>
+      IconButton(
+        tooltip: tooltip,
+        onPressed: _acting.isNotEmpty ? null : onTap,
+        icon: Icon(icon, size: 15,
+            color: active ? _accent : _hint),
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
+      );
+
+  Set<String> get _disabled =>
+      (( _catalog['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+          .map((e) => e.toString())
+          .toSet();
+
+  Map<String, dynamic> _prefs() {
+    final raw = _catalog['model_prefs'];
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return <String, dynamic>{};
+  }
+
+  Map<String, dynamic> _pref(String modelId) {
+    final pref = _prefs()[modelId];
+    if (pref is Map) return Map<String, dynamic>.from(pref);
+    return <String, dynamic>{};
+  }
+
+  Future<void> _setPref(String modelId, Map<String, dynamic> patch) async {
+    setState(() => _acting = 'pref-$modelId');
+    try {
+      final args = <String, dynamic>{'model_id': modelId};
+      args.addAll(patch);
+      final result = await widget.client.call('pool.model_pref', args);
+      if (!mounted) return;
+      if (result is Map && result['ok'] == true) {
+        final prefs = _prefs();
+        prefs[modelId] =
+            Map<String, dynamic>.from((result['pref'] as Map?) ?? <String, dynamic>{});
+        setState(() => _catalog['model_prefs'] = prefs);
+      } else {
+        setState(() => _message =
+            '设置失败：${result is Map ? (result['error'] ?? '未知原因') : '响应异常'}');
+      }
+    } catch (error) {
+      if (mounted) setState(() => _message = '设置失败：$error');
+    } finally {
+      if (mounted) setState(() => _acting = '');
+    }
+  }
+
+  /// 模型拉起：单次真实调用并在弹窗里回显。
+  Future<void> _invokeModel(String modelId) async {
+    final controller = TextEditingController(text: '你好，用一句话介绍你自己。');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: _panel,
+        title: Text('拉起 $modelId',
+            style: const TextStyle(color: Colors.white, fontSize: 14)),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLines: 3,
+          style: const TextStyle(color: Colors.white, fontSize: 12),
+          decoration: const InputDecoration(
+              hintText: '测试提示词…',
+              hintStyle: TextStyle(color: _hint, fontSize: 12)),
+        ),
+        actions: <Widget>[
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('取消', style: TextStyle(color: _hint))),
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('调用', style: TextStyle(color: _accent))),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (ok != true) return;
+    if (!mounted) return;
+    setState(() => _acting = 'invoke-$modelId');
+    try {
+      final result = await widget.client
+          .call('pool.invoke', <String, dynamic>{'model': modelId, 'prompt': controller.text});
+      if (!mounted) return;
+      final text = result is Map && result['ok'] == true
+          ? (result['text'] ?? '').toString()
+          : '调用失败：${result is Map ? (result['error'] ?? '未知原因') : '响应异常'}';
+      await showDialog<void>(
+        context: context,
+        builder: (BuildContext context) => AlertDialog(
+          backgroundColor: _panel,
+          title: Text('[$modelId] 回复',
+              style: const TextStyle(color: Colors.white, fontSize: 14)),
+          content: SingleChildScrollView(
+              child: Text(text,
+                  style: const TextStyle(color: Colors.white, fontSize: 12, height: 1.5))),
+          actions: <Widget>[
+            TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('关闭', style: TextStyle(color: _accent))),
+          ],
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _acting = '');
+    }
+  }
+
+  Widget _catalogCard() {
+    final wb = (_catalog['wb'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{});
+    final free = (_catalog['free'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{});
+    final wbModels = (wb['models'] as List<dynamic>? ?? <dynamic>[])
+        .whereType<Map>()
+        .map(Map<String, dynamic>.from)
+        .toList()
+      ..sort((a, b) {
+        final pa = (a['promo_free'] ?? false) == true ? 0 : 1;
+        final pb = (b['promo_free'] ?? false) == true ? 0 : 1;
+        if (pa != pb) return pa - pb;
+        return (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString());
+      });
+    final freeModels = (free['models'] as List<dynamic>? ?? <dynamic>[])
+        .whereType<Map>()
+        .map(Map<String, dynamic>.from)
+        .toList()
+      ..sort((a, b) => (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString()));
+    final freeLaneOn = (_data['free_lane'] ?? false) == true;
+    final live = (wb['live'] == true) || (free['live'] == true);
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _panel,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _border),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+        Row(children: <Widget>[
+          const Text('模型目录',
+              style: TextStyle(color: Colors.white, fontSize: 14,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(width: 8),
+          _pill(live ? '上游实时' : '静态兜底', live ? _ok : _hint),
+          const Spacer(),
+          // 原版「同步模型表」：强制重拉 /v3/config + 免密 listing
+          _actionButton('同步模型表', Icons.sync, 'catalog',
+              () => unawaited(_rpc('pool.catalog',
+                  <String, dynamic>{'force': true}, 'catalog',
+                  okMessage: '模型目录已刷新'))),
+        ]),
+        const SizedBox(height: 6),
+        const Row(children: <Widget>[
+          Expanded(flex: 4, child: Text('模型',
+              style: TextStyle(color: _hint, fontSize: 10))),
+          Expanded(flex: 4, child: Text('倍率 · 上下文 · 能力',
+              style: TextStyle(color: _hint, fontSize: 10))),
+          SizedBox(width: 40, child: Text('启用',
+              style: TextStyle(color: _hint, fontSize: 10))),
+        ]),
+        const Divider(color: _border, height: 12),
+        if (wbModels.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: Text('WorkBuddy 目录未取到（账号未入池或上游不可达）。',
+                style: TextStyle(color: _hint, fontSize: 12)),
+          )
+        else ...wbModels.map(_modelRow),
+        const Divider(color: _border, height: 14),
+        // 免密 lane：70+ 免费模型（实时 listing，静态兜底保底）
+        ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          childrenPadding: EdgeInsets.zero,
+          iconColor: _hint,
+          collapsedIconColor: _hint,
+          title: Row(children: <Widget>[
+            Text('免密免费模型 · ${freeModels.length} 个',
+                style: const TextStyle(color: Colors.white, fontSize: 13,
+                    fontWeight: FontWeight.w600)),
+            const SizedBox(width: 8),
+            _pill(freeLaneOn ? 'lane 开' : 'lane 关（配置 free_lane）',
+                freeLaneOn ? _ok : _warn),
+            if ((free['live'] ?? false) == true) ...<Widget>[
+              const SizedBox(width: 6),
+              _pill('实时', _ok),
+            ],
+          ]),
+          subtitle: const Text(
+              'opencode.ai 免密通道（Bearer public），无需账号；倍率恒为 0，'
+              '分区敏感模型需出口网络匹配。',
+              style: TextStyle(color: _hint, fontSize: 10)),
+          children: <Widget>[
+            if (freeModels.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('免费模型清单未取到。',
+                    style: TextStyle(color: _hint, fontSize: 12)),
+              )
+            else ...freeModels.map(_modelRow),
+          ],
+        ),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final enabled = (_data['enabled'] ?? false) == true;
@@ -201,9 +626,8 @@ class _PoolPageState extends State<PoolPage> {
     return Scaffold(
       backgroundColor: _bg,
       body: RefreshIndicator(
-        onRefresh: _load,
+        onRefresh: () => _load(),
         child: ListView(padding: const EdgeInsets.only(bottom: 16), children: <Widget>[
-          // 顶栏：标题 + 状态 pills + 刷新
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
             child: Row(children: <Widget>[
@@ -216,7 +640,7 @@ class _PoolPageState extends State<PoolPage> {
               const Spacer(),
               IconButton(
                 tooltip: '刷新',
-                onPressed: _busy ? null : _load,
+                onPressed: _busy ? null : () => unawaited(_load()),
                 icon: const Icon(Icons.refresh, color: _hint, size: 20),
               ),
             ]),
@@ -225,15 +649,16 @@ class _PoolPageState extends State<PoolPage> {
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
               child: Text(_message,
-                  style: const TextStyle(color: _dead, fontSize: 11)),
+                  style: const TextStyle(color: _accent, fontSize: 11)),
             ),
           if (!inRouter)
             const Padding(
               padding: EdgeInsets.fromLTRB(16, 4, 16, 4),
-              child: Text('号池未装配进模型路由（config.account_pool.enabled）——先在配置中启用。',
+              child: Text(
+                  '号池未装配进模型路由（.env 设 POOL_ENABLED=true 后重启后端）。',
                   style: TextStyle(color: _warn, fontSize: 12)),
             ),
-          // ── 账号池卡片（原版表格布局）────────────────────────────────
+          // ── 账号池卡片 ────────────────────────────────────────────────
           Container(
             margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             padding: const EdgeInsets.all(14),
@@ -252,54 +677,48 @@ class _PoolPageState extends State<PoolPage> {
                 Text('在池 $accountCount · 已移出 $ignoredCount · 默认模型 $defaultModel',
                     style: const TextStyle(color: _hint, fontSize: 11)),
                 const Spacer(),
-                // 原版「重新扫描凭证」
-                TextButton.icon(
-                  onPressed: _acting.isNotEmpty ? null : () =>
-                      unawaited(_rpc('pool.rescan', <String, dynamic>{}, 'rescan')),
-                  icon: _acting == 'rescan'
-                      ? const SizedBox(width: 12, height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: _accent))
-                      : const Icon(Icons.radar, size: 14, color: _accent),
-                  label: const Text('重新扫描凭证',
-                      style: TextStyle(color: _accent, fontSize: 12)),
-                  style: TextButton.styleFrom(
-                    backgroundColor: _accent.withValues(alpha: 0.1),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(6),
-                        side: BorderSide(color: _accent.withValues(alpha: 0.4))),
-                  ),
-                ),
+                _actionButton('重新扫描凭证', Icons.radar, 'rescan',
+                    () => unawaited(_rpc('pool.rescan', <String, dynamic>{}, 'rescan',
+                        okMessage: '重新扫描完成'))),
+                const SizedBox(width: 6),
+                // 原版「一键签到」：全部活跃账号领每日奖励
+                _actionButton('一键签到', Icons.verified, 'checkin',
+                    () => unawaited(_rpc('pool.checkin', <String, dynamic>{}, 'checkin',
+                        okMessage: '签到完成'))),
+                const SizedBox(width: 6),
+                // 浏览器/桌面端登录：拉起 WorkBuddy，登录态落盘后重扫入池
+                _actionButton('拉起登录', Icons.open_in_new, 'login',
+                    () => unawaited(_rpc('pool.login_start', <String, dynamic>{}, 'login',
+                        okMessage: 'WorkBuddy 已启动'))),
               ]),
               const SizedBox(height: 6),
-              // 表头（对齐原版：账号/区域/状态/操作）
-              const Padding(
-                padding: EdgeInsets.only(left: 16),
-                child: Row(children: <Widget>[
-                  Expanded(flex: 4, child: Text('账号',
-                      style: TextStyle(color: _hint, fontSize: 10))),
-                  Expanded(flex: 2, child: Text('区域',
-                      style: TextStyle(color: _hint, fontSize: 10))),
-                  Expanded(flex: 4, child: Text('状态',
-                      style: TextStyle(color: _hint, fontSize: 10))),
-                  SizedBox(width: 84, child: Text('操作',
-                      style: TextStyle(color: _hint, fontSize: 10))),
-                ]),
-              ),
+              const Row(children: <Widget>[
+                Expanded(flex: 4, child: Text('账号',
+                    style: TextStyle(color: _hint, fontSize: 10))),
+                Expanded(flex: 2, child: Text('区域',
+                    style: TextStyle(color: _hint, fontSize: 10))),
+                Expanded(flex: 4, child: Text('状态',
+                    style: TextStyle(color: _hint, fontSize: 10))),
+                Expanded(flex: 2, child: Text('已服务',
+                    style: TextStyle(color: _hint, fontSize: 10))),
+                SizedBox(width: 84, child: Text('操作',
+                    style: TextStyle(color: _hint, fontSize: 10))),
+              ]),
               const Divider(color: _border, height: 12),
               if (accounts.isEmpty)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 14),
                   child: Text(
-                      '账号池为空。凭证来源：xdpool accounts.json 与 WorkBuddy 登录态'
-                      '（自动发现）；点「重新扫描凭证」重扫。',
+                      '账号池为空。点「拉起登录」打开 WorkBuddy 桌面端登录，'
+                      '登录态（含加密态自动解密）落盘后点「重新扫描凭证」自动入池；'
+                      '已有 xdpool accounts.json 的机器重扫即入。',
                       style: TextStyle(color: _hint, fontSize: 12)),
                 )
-              else
-                ...accounts.map(_accountRow),
+              else ...accounts.map(_accountRow),
             ]),
           ),
-          // ── 能力边界说明（诚实：哪些是外部 xdpool 能力）────────────────
+          _catalogCard(),
+          // ── 能力说明 ──────────────────────────────────────────────────
           Container(
             margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
             padding: const EdgeInsets.all(14),
@@ -310,16 +729,18 @@ class _PoolPageState extends State<PoolPage> {
             ),
             child: const Column(crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
-              Text('与原版 xdpool 面板的差异',
+              Text('说明',
                   style: TextStyle(color: Colors.white, fontSize: 13,
                       fontWeight: FontWeight.w600)),
               SizedBox(height: 6),
               Text(
-                  '· 模型目录（倍率/存ctx/禁用/限时免费）与「当前 agents 模型」是外部 '
-                  'dsh-xdpool 面板概念，超级大脑后端无对应数据结构，未做假界面。\n'
-                  '· 「一键签到」「浏览器登录」依赖 xdpool 的桌面自动化，未内置；'
-                  '新账号走 WorkBuddy 桌面端登录后，点「重新扫描凭证」自动入池。\n'
-                  '· 「退出登录」＝移出号池：凭证保留在 accounts.json，随时可恢复。',
+                  '· 倍率/限时免费来自上游实时目录，绝不硬编码（价格是"现在的事实"）；'
+                  '静态兜底只保证有 roster，不标价格。\n'
+                  '· 「一键签到」走 billing 端点逐账号领取，已签到/无活动按幂等成功处理。\n'
+                  '· 加密登录态（\$wbEncrypted）经 WorkBuddy 桌面端原生密钥解密，'
+                  '密钥不落盘、不日志。\n'
+                  '· 「退出登录」＝移出号池：凭证保留在 accounts.json，随时可恢复。\n'
+                  '· 免密 lane 是共享第三方端点，有封号风险（默认关，本次按你的要求开启）。',
                   style: TextStyle(color: _hint, fontSize: 11, height: 1.6)),
             ]),
           ),
@@ -327,4 +748,35 @@ class _PoolPageState extends State<PoolPage> {
       ),
     );
   }
+
+  Future<void> _confirm(String title, String content, Future<void> Function() act) async {
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: _panel,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 15)),
+        content: Text(content, style: const TextStyle(color: _hint, fontSize: 12)),
+        actions: <Widget>[
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('取消', style: TextStyle(color: _hint))),
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('确定', style: TextStyle(color: _accent))),
+        ],
+      ),
+    );
+    if (yes == true) await act();
+  }
+}
+
+/// 思考档位选择项（"" = 跟随上游默认）。
+class ThinkingChoice {
+  const ThinkingChoice(this.wireValue);
+
+  final String wireValue;
+
+  static const ThinkingChoice dflt = ThinkingChoice('');
+  static const ThinkingChoice off = ThinkingChoice('off');
+  static ThinkingChoice level(String level) => ThinkingChoice(level);
 }

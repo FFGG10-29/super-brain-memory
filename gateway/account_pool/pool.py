@@ -214,6 +214,13 @@ class AccountPool:
         self.accounts: list[WorkBuddyCredential] = []
         # 「移出号池」清单：账号凭证保留在 accounts.json，但不再参与 failover
         self.ignored: set[str] = set()
+        # 已服务计数（每账号成功 chat 次数，xdpool 面板「已服务」列）
+        self.served: dict[str, int] = {}
+        # 用户禁用的模型 id（目录里不展示、不参与 default）
+        self.disabled_models: set[str] = set()
+        # per-model 偏好：{id: {enabled, ctx_budget, image, thinking}}
+        # thinking ∈ off/minimal/low/medium/high/xhigh/max（None=上游默认）
+        self.model_prefs: dict[str, dict[str, Any]] = {}
         self._timeout = float(getattr(config, "request_timeout_sec", 20.0))
         self._max_attempts = int(getattr(config, "max_attempts", 3))
         self._credential_dead_sec = float(getattr(config, "credential_dead_sec", 3600.0))
@@ -238,16 +245,24 @@ class AccountPool:
 
     def _load_ignored(self) -> None:
         try:
-            self.ignored = store.load_ignored(self._accounts_path())
-        except Exception:  # noqa: BLE001  忽略清单读失败不阻断号池
+            meta = store.load_meta(self._accounts_path())
+            self.ignored = {str(item) for item in meta.get("ignored", [])}
+            self.disabled_models = {str(item) for item in meta.get("disabled_models", [])}
+            prefs = meta.get("model_prefs")
+            self.model_prefs = dict(prefs) if isinstance(prefs, dict) else {}
+        except Exception:  # noqa: BLE001  元数据读失败不阻断号池
             self.ignored = set()
+            self.disabled_models = set()
+            self.model_prefs = {}
 
     def _request(self, method: str, url: str, headers: dict[str, str], body: bytes):
         return self._transport(method, url, headers, body)
 
     def _persist(self) -> None:
         store.save_accounts_atomic(self._accounts_path(), self.accounts,
-                                   ignored=self.ignored)
+                                   ignored=self.ignored,
+                                   disabled_models=self.disabled_models,
+                                   model_prefs=self.model_prefs)
 
     # -- 号池管理（前端号池页 RPC 的后端实现）------------------------------
 
@@ -274,6 +289,148 @@ class AccountPool:
         self.ignored.discard(account_id)
         self._persist()
         self.discover()
+
+    def set_model_enabled(self, model_id: str, enabled: bool) -> None:
+        """目录开关：禁用的模型不展示、不作为默认。"""
+        model_id = str(model_id or "")
+        if not model_id:
+            raise AccountPoolError("缺少 model_id")
+        if enabled:
+            self.disabled_models.discard(model_id)
+        else:
+            self.disabled_models.add(model_id)
+        self._persist()
+
+    # -- per-model 偏好（xdpool「上下文/图片/思考」开关移植）---------------
+
+    # 实测拒绝 reasoning_effort:"off" 的模型（off-thinking.ts issue #34，
+    # 3.4.4 双网关实测）：声明 canDisableThinking 也对它们隐藏 off——硬墙。
+    REFUSES_OFF_MODEL_IDS = {
+        "deepseek-v4.1-flash", "deepseek-v4.1-flash-sg", "deepseek-v4-pro",
+        "primary-model", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra",
+        "gpt-5.6-luna", "gemini-3.5-flash",
+    }
+    THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def set_model_pref(self, model_id: str, *, enabled: bool | None = None,
+                       ctx_budget: int | None = None,
+                       image: bool | None = None,
+                       thinking: str | None = None) -> dict[str, Any]:
+        """更新单模型偏好并持久化；None = 不动该维度。"""
+        model_id = str(model_id or "")
+        if not model_id:
+            raise AccountPoolError("缺少 model_id")
+        pref = dict(self.model_prefs.get(model_id) or {})
+        if enabled is not None:
+            pref["enabled"] = bool(enabled)
+            if enabled:
+                self.disabled_models.discard(model_id)
+            else:
+                self.disabled_models.add(model_id)
+        if ctx_budget is not None:
+            pref["ctx_budget"] = max(0, int(ctx_budget))
+        if image is not None:
+            pref["image"] = bool(image)
+        if thinking is not None:
+            thinking = str(thinking)
+            if thinking not in ("", *self.THINKING_LEVELS):
+                raise AccountPoolError(f"非法思考档位：{thinking}")
+            if thinking == "off" and model_id in self.REFUSES_OFF_MODEL_IDS:
+                raise AccountPoolError(
+                    f"{model_id}: 上游拒绝 reasoning_effort=off（实测硬墙），不提供该档")
+            # "" = 清除，回到上游默认
+            pref["thinking"] = "" if thinking == "" else thinking
+        self.model_prefs[model_id] = pref
+        self._persist()
+        return dict(pref)
+
+    def _reasoning_effort_for(self, model: str) -> str:
+        """思考档位落线值：偏好优先；off 撞硬墙时退回上游默认（不发字段）。"""
+        pref = self.model_prefs.get(model) or {}
+        effort = str(pref.get("thinking") or "")
+        if effort == "off":
+            if model in self.REFUSES_OFF_MODEL_IDS:
+                return ""
+            return "off"
+        return effort
+
+    def invoke(self, prompt: str, *, model: str) -> str:
+        """模型拉起：free:* 走免密 lane，其余走账号池 failover。"""
+        from gateway.account_pool.catalog import is_free_lane
+
+        model = str(model or "").strip()
+        if not model:
+            raise AccountPoolError("缺少 model")
+        if model.startswith("free:") or is_free_lane(model):
+            base = model.split(":", 1)[1] if model.startswith("free:") else model
+            return self.free_chat(prompt, model=base)
+        return self.complete(prompt, model=model)
+
+    # -- 签到（billing 端点，xdpool scheduler 同款）------------------------
+
+    _ALREADY_CHECKIN_MARKERS = ("已签到", "already")
+    _NO_OFFER_MARKERS = ("没有可领取", "暂无可领取", "无可领取",
+                         "不可领取", "未开启", "没有活动")
+
+    def _billing_base(self, account: WorkBuddyCredential) -> str:
+        domain = (account.domain or "").lower()
+        if account.region == "global" or domain.endswith(("workbuddy.ai", "codebuddy.ai")):
+            if domain.endswith("codebuddy.ai"):
+                return "https://www.codebuddy.ai"
+            return "https://www.workbuddy.ai"
+        return "https://www.codebuddy.cn"
+
+    def _billing_headers(self, account: WorkBuddyCredential) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {account.access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if account.uid:
+            headers["X-User-Id"] = account.uid
+        if account.enterprise_id:
+            headers["X-Enterprise-Id"] = account.enterprise_id
+            headers["X-Tenant-Id"] = account.enterprise_id
+        if account.domain:
+            headers["X-Domain"] = account.domain
+        return headers
+
+    def _billing_post(self, account: WorkBuddyCredential, path: str) -> dict[str, Any]:
+        self._ensure_token(account)
+        status, _headers, body = self._request(
+            "POST", self._billing_base(account) + path,
+            self._billing_headers(account), b"{}")
+        try:
+            envelope = json.loads(body.decode("utf-8") or "{}")
+        except ValueError as exc:
+            raise AccountPoolError(f"{account.label()}: 签到响应非 JSON") from exc
+        message = str(envelope.get("msg") or envelope.get("message") or "")
+        if status != 200 or (envelope.get("code") not in (0, None)):
+            raise AccountPoolError(f"{account.label()}: HTTP {status} {message}".strip())
+        data = envelope.get("data")
+        return data if isinstance(data, dict) else {}
+
+    def checkin(self, account: WorkBuddyCredential) -> dict[str, Any]:
+        """单账号一键签到；「已签到」「无可领取」按幂等成功处理。"""
+        result: dict[str, Any] = {"label": account.label(), "ok": False}
+        try:
+            data = self._billing_post(account, "/v2/billing/meter/daily-checkin")
+        except AccountPoolError as exc:
+            message = str(exc)
+            if any(marker in message for marker in self._ALREADY_CHECKIN_MARKERS):
+                result.update(ok=True, already=True, message="今日已签到")
+            elif any(marker in message for marker in self._NO_OFFER_MARKERS):
+                result.update(ok=True, noop=True, message=message or "无可领取")
+            else:
+                result["error"] = message
+            return result
+        except Exception as exc:  # noqa: BLE001  网络/协议错误不打断批量签到
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+        result.update(ok=True, credit=data.get("credit"),
+                      streak_days=data.get("streakDays"),
+                      is_streak_day=bool(data.get("isStreakDay")))
+        return result
 
     # -- token ------------------------------------------------------------
 
@@ -329,7 +486,7 @@ class AccountPool:
              *, conversation_key: str = "") -> str:
         self._ensure_token(account)
         try:
-            return self._chat_request(account, model, messages, conversation_key)
+            reply = self._chat_request(account, model, messages, conversation_key)
         except _SessionDead:
             # 401/403：dead_until 已写；尝试刷新一次再重试
             try:
@@ -338,7 +495,9 @@ class AccountPool:
                 account.dead_until = time.time() + self._credential_dead_sec
                 raise _SessionDead(str(refresh_exc)) from refresh_exc
             account.dead_until = 0.0  # 刷新成功，解除死亡标记
-            return self._chat_request(account, model, messages, conversation_key)
+            reply = self._chat_request(account, model, messages, conversation_key)
+        self.served[account.account_id()] = self.served.get(account.account_id(), 0) + 1
+        return reply
 
     def _chat_request(self, account: WorkBuddyCredential, model: str,
                       messages: list[dict], conversation_key: str) -> str:
@@ -376,6 +535,13 @@ class AccountPool:
             headers["X-No-Department-Info"] = "1"
         payload = json.dumps({"model": model, "messages": messages,
                               "stream": False}).encode("utf-8")
+        # 思考档位落线（xdpool off-thinking/default-effort 移植）：
+        # 声明过的档位随体注入；off 撞硬墙（REFUSES_OFF_MODEL_IDS）已在上游剔除。
+        effort = self._reasoning_effort_for(model)
+        if effort:
+            body = json.loads(payload.decode("utf-8"))
+            body["reasoning_effort"] = effort
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         status, resp_headers, body = self._request(
             "POST", base + "/v2/chat/completions", headers, payload)
         if status == 429:

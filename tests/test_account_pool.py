@@ -95,7 +95,7 @@ def test_workbuddy_auth_flat_form(tmp_path, monkeypatch):
     assert discover_accounts()[0].access_token == "tok-f"
 
 
-# ── 2. 加密登录态：明确拒绝 ──────────────────────────────────────────────────
+# ── 2. 加密登录态：尝试经 WorkBuddy 桌面端密钥解密，失败明确报错 ─────────────
 
 def test_encrypted_auth_rejected_with_xdpool_hint(tmp_path, monkeypatch):
     path = _write_auth(tmp_path, {
@@ -105,7 +105,10 @@ def test_encrypted_auth_rejected_with_xdpool_hint(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKBUDDY_AUTH_FILE", path)
     with pytest.raises(AccountPoolError) as excinfo:
         load_workbuddy_auth(path)
-    assert "xdpool" in str(excinfo.value)
+    # 契约（xdpool 移植后变更）：不再无条件拒绝——先尝试经桌面端原生密钥
+    # 解密（测试环境无真 envelope，必失败）；报错含解密失败说明与 xdpool 备选。
+    message = str(excinfo.value)
+    assert "解密失败" in message and "xdpool" in message
 
 
 # ── 3. account_id_of：稳定 + 16 hex ─────────────────────────────────────────

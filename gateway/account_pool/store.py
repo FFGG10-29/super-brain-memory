@@ -83,17 +83,29 @@ def _to_ms(value: Any) -> int:
     return number
 
 
-def _reject_encrypted(node: Any, source: str) -> None:
-    """任何层级的字段值是含 "$wbEncrypted" 键的 dict -> 明确报错。"""
-    if isinstance(node, dict):
-        if "$wbEncrypted" in node:
-            raise AccountPoolError(
-                f"{source}: WorkBuddy 登录态已加密（$wbEncrypted），请用 xdpool 导入")
-        for value in node.values():
-            _reject_encrypted(value, source)
-    elif isinstance(node, list):
-        for item in node:
-            _reject_encrypted(item, source)
+def _decrypt_if_encrypted(data: dict, source: str) -> dict:
+    """含 $wbEncrypted 字段时经 WorkBuddy 桌面端密钥解密（atrest）；失败明确报错。"""
+
+    def has_wrapper(node: Any) -> bool:
+        if isinstance(node, dict):
+            return "$wbEncrypted" in node or any(has_wrapper(v) for v in node.values())
+        if isinstance(node, list):
+            return any(has_wrapper(item) for item in node)
+        return False
+
+    if not has_wrapper(data):
+        return data
+    from gateway.account_pool import atrest
+
+    try:
+        decrypted = atrest.decrypt_json_tree(data)
+    except atrest.AtRestError as exc:
+        raise AccountPoolError(
+            f"{source}: 登录态已加密且解密失败——{exc}。"
+            "备选：用 xdpool 导出明文 accounts.json 后导入。") from exc
+    if not isinstance(decrypted, dict):
+        raise AccountPoolError(f"{source}: 解密结果不是对象")
+    return decrypted
 
 
 def load_workbuddy_auth(path: Path) -> WorkBuddyCredential:
@@ -102,7 +114,7 @@ def load_workbuddy_auth(path: Path) -> WorkBuddyCredential:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise AccountPoolError(f"{path}: 登录态 JSON 顶层不是对象")
-    _reject_encrypted(data, str(path))
+    data = _decrypt_if_encrypted(data, str(path))
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
     account = data.get("account") if isinstance(data.get("account"), dict) else {}
     flat = data if not auth else {}
@@ -203,23 +215,41 @@ def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[W
     return found
 
 
-def load_ignored(path: Path) -> set[str]:
-    """accounts.json 顶层 ignored 列表（「移出号池」的账号 id；缺失视为空）。"""
+def load_meta(path: Path) -> dict[str, Any]:
+    """accounts.json 顶层元数据（ignored / disabled_models / default_model）。"""
     path = Path(path)
     if not path.is_file():
-        return set()
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
-        return set()
-    raw = data.get("ignored")
-    if not isinstance(raw, list):
-        return set()
-    return {str(item) for item in raw if item}
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    if isinstance(data.get("ignored"), list):
+        meta["ignored"] = [str(item) for item in data["ignored"] if item]
+    if isinstance(data.get("disabled_models"), list):
+        meta["disabled_models"] = [str(item) for item in data["disabled_models"] if item]
+    if isinstance(data.get("default_model"), str):
+        meta["default_model"] = data["default_model"]
+    if isinstance(data.get("model_prefs"), dict):
+        meta["model_prefs"] = {
+            str(k): dict(v) for k, v in data["model_prefs"].items()
+            if isinstance(v, dict)}
+    return meta
+
+
+def load_ignored(path: Path) -> set[str]:
+    """accounts.json 顶层 ignored 列表（「移出号池」的账号 id；缺失视为空）。"""
+    return {str(item) for item in load_meta(path).get("ignored", [])}
 
 
 def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential],
-                         ignored: Iterable[str] | None = None) -> None:
+                         ignored: Iterable[str] | None = None,
+                         disabled_models: Iterable[str] | None = None,
+                         default_model: str = "",
+                         model_prefs: dict[str, dict] | None = None) -> None:
     """tmp 写 + os.replace + 0600（xdpool accounts.json 结构）。"""
     path = Path(path)
     now_ms = int(time.time() * 1000)
@@ -246,6 +276,13 @@ def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential],
     payload: dict[str, Any] = {"version": 1, "savedAtMs": now_ms, "accounts": entries}
     if ignored is not None:
         payload["ignored"] = sorted({str(item) for item in ignored if item})
+    if disabled_models is not None:
+        payload["disabled_models"] = sorted({str(item) for item in disabled_models if item})
+    if default_model:
+        payload["default_model"] = str(default_model)
+    if model_prefs is not None:
+        payload["model_prefs"] = {
+            str(k): dict(v) for k, v in model_prefs.items() if isinstance(v, dict)}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as handle:

@@ -663,6 +663,7 @@ class RpcExtension:
         pool_cfg = getattr(cfg, "account_pool", None) if cfg is not None else None
         now = time.time()
         ignored = set(getattr(pool, "ignored", None) or ())
+        served = getattr(pool, "served", None) or {}
         accounts = []
         for account in (getattr(pool, "accounts", None) or []):
             account_id = account.account_id()
@@ -673,6 +674,7 @@ class RpcExtension:
                 "dead": now < account.dead_until,
                 "dead_remaining_sec": max(0, round(account.dead_until - now)),
                 "ignored": account_id in ignored,
+                "served": int(served.get(account_id, 0)),
                 "model_cooldowns": {key: max(0, round(value - now))
                                     for key, value in account.cooldowns.items()
                                     if value > now},
@@ -727,6 +729,112 @@ class RpcExtension:
             return getattr(get_model_router(), "_account_pool", None)
         except Exception:  # noqa: BLE001  路由未装配
             return None
+
+    # ── 号池目录 / 签到 / 登录（xdpool 功能移植）──────────────────────────
+    def _pool_catalog(self, force: bool = False, **_: Any) -> dict[str, Any]:
+        """模型目录：WorkBuddy 实时（倍率/上下文/限时免费）+ 免密 lane 全量。
+
+        缓存 1 小时；force=True 立即重拉（「同步模型表」按钮）。
+        """
+        import time as _time
+
+        from gateway.account_pool import catalog
+
+        cached = None if force else catalog.load_cached_catalog()
+        fresh_enough = (cached is not None
+                        and _time.time() * 1000 - (cached.get("saved_at_ms") or 0) < 3_600_000)
+        if cached is not None and fresh_enough:
+            cached["cached"] = True
+            return cached
+        pool = self._account_pool()
+        account = next((a for a in (getattr(pool, "accounts", None) or [])
+                        if a.account_id() not in (getattr(pool, "ignored", None) or ())),
+                       None)
+        region = getattr(account, "region", "cn")
+        wb = catalog.fetch_workbuddy_models(
+            region=region,
+            access_token=getattr(account, "access_token", "") or "",
+            domain=getattr(account, "domain", "") or "")
+        free = catalog.fetch_free_models()
+        data = {"ok": True, "wb": wb, "free": free,
+                "saved_at_ms": int(_time.time() * 1000),
+                "disabled_models": sorted(getattr(pool, "disabled_models", None) or ()),
+                "model_prefs": dict(getattr(pool, "model_prefs", None) or {})}
+        try:
+            catalog.save_cached_catalog(data)
+        except (OSError, TypeError, ValueError):
+            pass
+        return data
+
+    def _pool_model_toggle(self, model_id: str = "", enabled: bool = True, **_: Any) -> dict[str, Any]:
+        """目录模型开关（禁用持久化进 accounts.json）。"""
+        return self._pool_model_pref(model_id=model_id, enabled=enabled)
+
+    def _pool_model_pref(self, model_id: str = "", enabled: bool | None = None,
+                         ctx_budget: int | None = None, image: bool | None = None,
+                         thinking: str | None = None, **_: Any) -> dict[str, Any]:
+        """per-model 偏好：启用 / 上下文预算 / 图片 / 思考档位（一体持久化）。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配"}
+        try:
+            pref = pool.set_model_pref(
+                model_id,
+                enabled=None if enabled is None else bool(enabled),
+                ctx_budget=None if ctx_budget in (None, 0) else int(ctx_budget),
+                image=None if image is None else bool(image),
+                thinking=thinking)
+            return {"ok": True, "model_id": model_id, "pref": pref}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _pool_invoke(self, model: str = "", prompt: str = "", **_: Any) -> dict[str, Any]:
+        """模型拉起：单次真实调用（free:* 走免密 lane，其余走账号池 failover）。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配"}
+        try:
+            text = pool.invoke(str(prompt or ""), model=str(model or ""))
+            return {"ok": True, "model": model, "text": text}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _pool_checkin(self, account_id: str = "", **_: Any) -> dict[str, Any]:
+        """一键签到：全部活跃账号（或指定账号）逐个领取每日奖励。"""
+        pool = self._account_pool()
+        if pool is None:
+            return {"ok": False, "error": "号池未装配"}
+        accounts = [a for a in (getattr(pool, "accounts", None) or [])
+                    if a.account_id() not in (getattr(pool, "ignored", None) or ())]
+        if account_id:
+            accounts = [a for a in accounts if a.account_id() == str(account_id)]
+            if not accounts:
+                return {"ok": False, "error": f"账号不在池中：{account_id}"}
+        if not accounts:
+            return {"ok": False, "error": "账号池为空，无法签到"}
+        results = [pool.checkin(a) for a in accounts]
+        ok_count = sum(1 for r in results if r.get("ok"))
+        return {"ok": ok_count > 0, "results": results,
+                "ok_count": ok_count, "total": len(results)}
+
+    def _pool_login_start(self, **_: Any) -> dict[str, Any]:
+        """拉起 WorkBuddy 桌面端完成登录；登录态落盘后「重新扫描凭证」入池。"""
+        import subprocess as _subprocess
+
+        from gateway.account_pool import atrest
+
+        executable = atrest.find_workbuddy_executable()
+        if executable is None:
+            return {"ok": False,
+                    "error": "未找到 WorkBuddy 桌面端（WorkBuddy.exe / WorkBuddyAI.exe），"
+                             "可设 WORKBUDDY_APP_EXECUTABLE"}
+        try:
+            _subprocess.Popen([executable], creationflags=_subprocess.DETACHED_PROCESS
+                              if hasattr(_subprocess, "DETACHED_PROCESS") else 0)
+            return {"ok": True, "executable": executable,
+                    "hint": "桌面端登录完成后回到本页点「重新扫描凭证」"}
+        except OSError as exc:
+            return {"ok": False, "error": f"启动失败：{exc}"}
 
     def _cache_metrics(self, **_: Any) -> dict[str, Any]:
         from core.cache_manager import get_cache_manager
