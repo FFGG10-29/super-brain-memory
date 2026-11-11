@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from brain.write_gate import WriteGate
+from chat.engine import ChatEngine
+from chat.session_registry import SessionRegistry
 from config import BrainConfig, get_config
+from core.desktop_features import default_secret_store
+from gateway.model_router import get_model_router
 from core.runtime_paths import (
     clear_local_bridge,
     read_local_token,
@@ -111,11 +115,21 @@ class HeadlessServer:
         self.shutdown_event = threading.Event()
         self.daemon.shutdown_callback = self.request_shutdown
         self._wal_thread: threading.Thread | None = None
-        # A2 / W2：8769 聊天端口骨架（ChatEngine 本体在 W3 接入）
+        # W3 / P2 + P3：chat 专用令牌、专用 Agent、模型路由与 8769 引擎
         self.chat_token = ensure_chat_token(self.config.chat.token_file or None)
         if str(self.config.chat.host) not in ("127.0.0.1", "localhost", ""):
             print(f"[警告] 8769 已暴露到局域网（{self.config.chat.host}），传输为明文；"
                   "仅使用 chat 专用令牌，不复用 Bridge 令牌")
+        _, chat_agent_token = self.registry.register("chat-engine")
+        self.chat_agent = self.registry.verify(chat_agent_token)
+        self.model_router = get_model_router(
+            self.config, secret_store=default_secret_store(),
+        )
+        self.chat_engine = ChatEngine(
+            config=self.config, toolkit=self.toolkit, router=self.model_router,
+            write_gate=self.write_gate, agent=self.chat_agent, token=self.chat_token,
+            sessions=SessionRegistry(),
+        )
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
         """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""
@@ -175,6 +189,8 @@ class HeadlessServer:
             token=str(self.bridge_token), agent_id=agent_id,
         )
         launcher = ensure_launcher()
+        if self.config.chat.enabled:
+            self.chat_engine.start()
         if self._circadian:
             self.app.circadian.start()
         self._start_wal_maintenance()
@@ -219,6 +235,7 @@ class HeadlessServer:
         self.daemon.app = fresh
         self.daemon.write_gate = new_gate
         self.adapter.rebind_write_gate(new_gate)
+        self.chat_engine.rebind(new_gate)  # W3：聊天写入也要切到新闸门
         self.daemon._memory_service = None
         self.registry._kv = fresh.storage.kv
         self.registry._timeseries = fresh.storage.timeseries
@@ -251,6 +268,8 @@ class HeadlessServer:
             self._mcp_server.server_close()
         if self._mcp_thread is not None:
             self._mcp_thread.join(timeout=2.0)
+        if self.config.chat.enabled:
+            self.chat_engine.stop()
         # W1（停机顺序）：先停 Worker 循环 → 排空 WriteGate → 之后才允许 daemon.stop() 关引擎。
         # 反过来写会让队列里残留的写入打到已关闭的六引擎。
         if self.daemon.worker is not None:

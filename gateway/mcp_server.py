@@ -64,6 +64,32 @@ class MCPToolkit:
             self._registry.audit("anonymous", tool, ok=False, latency_ms=(time.perf_counter() - started) * 1000)
             return {"error": type(exc).__name__, "message": str(exc)}
 
+    def recall_for_agent(self, agent: Agent, args: dict) -> dict[str, Any]:
+        """Q19 / A5：ChatEngine 等进程内模块复用「带人格注入的召回」。
+
+        不走 HTTP 鉴权（调用方已是服务端注册的 Agent），但保留参数校验、分派与审计；
+        `channel="bot"` 会由 `_dispatch` 注入 L0 人格层，与 MCP 客户端语义完全一致。
+        """
+        started = time.perf_counter()
+        try:
+            result = self._dispatch("recall_memory", dict(args or {}), agent)
+            self._registry.audit(agent.agent_id, "recall_memory", ok=True,
+                                 latency_ms=(time.perf_counter() - started) * 1000)
+            return result
+        except (GatewayAuthError, ValueError, KeyError) as exc:
+            return {"error": type(exc).__name__, "message": str(exc)}
+
+    def save_for_agent(self, agent: Agent, args: dict) -> dict[str, Any]:
+        """Q19：ChatEngine 写入长期记忆的进程内入口（外层由 WriteGate 串行化）。"""
+        started = time.perf_counter()
+        try:
+            result = self._dispatch("save_memory", dict(args or {}), agent)
+            self._registry.audit(agent.agent_id, "save_memory", ok=True,
+                                 latency_ms=(time.perf_counter() - started) * 1000)
+            return result
+        except (GatewayAuthError, ValueError, KeyError) as exc:
+            return {"error": type(exc).__name__, "message": str(exc)}
+
     def _dispatch(self, tool: str, args: dict, agent: Agent) -> dict[str, Any]:
         # 超级大脑是**统一记忆中枢**：所有 Agent 默认写进同一个共享库、读同一份记忆。
         # agent_id 只用于审计与限流，绝不参与隔离——否则每个 Agent 会看到不同的「自己」。

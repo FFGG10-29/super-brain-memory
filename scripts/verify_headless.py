@@ -35,7 +35,7 @@ os.environ.update({
 from config import BrainConfig  # noqa: E402
 from headless_server import HeadlessServer  # noqa: E402
 
-MCP_PORT, HTTP_PORT, WS_PORT = 18766, 18768, 18767
+MCP_PORT, HTTP_PORT, WS_PORT, CHAT_PORT = 18766, 18768, 18767, 18769
 
 
 def _request(url: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict]:
@@ -64,6 +64,11 @@ async def _rpc(ws, method: str, args: dict | None = None) -> dict:
 def main() -> int:
     config = BrainConfig()
     config.gateway.http_port = MCP_PORT
+    # W3：8769 聊天服务也用隔离端口，避免和用户机器上真实后端抢 8769
+    config.chat.enabled = True
+    config.chat.host = "127.0.0.1"
+    config.chat.port = CHAT_PORT
+    config.model_router.request_timeout_sec = 3
     server = HeadlessServer(
         config, http_port=HTTP_PORT, ws_port=WS_PORT, mcp_port=MCP_PORT,
         use_llm=False, circadian=False,
@@ -241,6 +246,32 @@ def main() -> int:
                       and "result" in mcp_after[1], str(mcp_after[1])[:100])
 
         asyncio.run(ws_checks())
+
+        # W3 / P2：8769 纯消息流（chat 专用令牌 + session 分配 + 回复）
+        async def chat_checks() -> None:
+            import websockets
+
+            async with websockets.connect(f"ws://127.0.0.1:{CHAT_PORT}") as ws:
+                await ws.send(json.dumps({
+                    "type": "hello", "token": server.chat_token, "device_id": "verify",
+                }, ensure_ascii=False))
+                ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                check("W3 8769 hello 鉴权 + session 分配",
+                      ack.get("type") == "hello_ack" and bool(ack.get("session_id")),
+                      str(ack)[:100])
+                await ws.send(json.dumps(
+                    {"type": "message", "text": "你好，验收聊天链路"}, ensure_ascii=False))
+                frames: list[dict] = []
+                for _ in range(8):
+                    frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                    frames.append(frame)
+                    if frame.get("type") == "reply":
+                        break
+                check("W3 8769 纯消息流回复",
+                      any(item.get("type") == "reply" for item in frames),
+                      str(frames[-1] if frames else "无帧")[:120])
+
+        asyncio.run(chat_checks())
     finally:
         server.stop()
 

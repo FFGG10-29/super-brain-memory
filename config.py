@@ -9,7 +9,7 @@ import os
 import re
 import socket
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -288,15 +288,35 @@ class MemoryTypeRoutingConfig(BaseSettings):
     working_context_max_bytes: int = 8000       # P1.4：代码原文不进长期记忆
 
 
+class ModelRouterConfig(BaseSettings):
+    """W3 / P3：模型路由层。`enabled=false` 时路由层仍可用，只是不把云供应商放进候选池。"""
+    model_config = SettingsConfigDict(env_prefix="MODEL_ROUTER_")
+
+    enabled: bool = False                        # B1/Q15：默认关闭，数据不出本机
+    sticky_ttl_sec: int = 1800                  # 同 intent 内会话粘性 30min
+    request_timeout_sec: int = 20
+    privacy_policy: str = "local_only"          # sensitive=true 的记忆只允许 local / paid
+    local_endpoint: str = "http://127.0.0.1:11434"
+    local_model: str = "qwen2.5:0.5b"
+    providers: list[dict[str, Any]] = Field(default_factory=lambda: [])
+    intent_map: dict[str, str] = Field(default_factory=lambda: {
+        "chat": "fast", "deep_recall": "strong", "emotion": "persona",
+        "tool_call": "tools", "consolidation": "strong", "code": "fast",
+    })
+
+
 class ChatConfig(BaseSettings):
-    """W2 / A2：8769 聊天端口骨架（ChatEngine 本体在 W3 接入）。"""
+    """W2 / A2 + W3 / P2：8769 纯消息流。"""
     model_config = SettingsConfigDict(env_prefix="CHAT_")
 
-    enabled: bool = False
-    host: str = "127.0.0.1"                     # 默认仅本机；0.0.0.0 需显式开启
+    enabled: bool = True                         # 本机默认起服务；对外绑定仍需显式 --chat-host 0.0.0.0
+    host: str = "127.0.0.1"
     port: int = 8769
     token_file: str = ""                        # chat 专用令牌，空则落 %APPDATA%/super-brain/chat_token.txt
     session_ttl_sec: int = 86400
+    max_history_turns: int = 20                 # 会话缓冲只留最近 N 轮原文
+    deep_async: bool = True                     # deep 结果从 8769 异步推，不阻塞回复
+    persona_channel: str = "bot"                # A5/Q19：聊天必须注入 L0 人格层
 
 
 class BrainConfig(BaseSettings):
@@ -323,6 +343,7 @@ class BrainConfig(BaseSettings):
     ui: UiConfig = Field(default_factory=UiConfig)
     memory_type_routing: MemoryTypeRoutingConfig = Field(default_factory=MemoryTypeRoutingConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
+    model_router: ModelRouterConfig = Field(default_factory=ModelRouterConfig)
 
 
 # 单例配置（懒加载于 main.py）

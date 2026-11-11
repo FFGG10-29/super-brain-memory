@@ -25,10 +25,29 @@ __all__ = [
     "clear_overrides",
     "config_dir",
     "load_overrides",
+    "on_change",
     "preset_names",
     "preset_patch",
     "save_overrides",
 ]
+
+# C8 / R9：不用文件 mtime 轮询，配置变更由 apply_overrides / save_overrides 主动通知订阅者。
+# 订阅者回调签名 (patches: dict) -> None，必须幂等（同一补丁可能被通知两次）。
+_LISTENERS: list[Any] = []
+
+
+def on_change(callback: Any) -> None:
+    """注册配置变更回调；model_router 用它热重载供应商池与 intent_map。"""
+    if callable(callback) and callback not in _LISTENERS:
+        _LISTENERS.append(callback)
+
+
+def _notify(patches: dict[str, Any]) -> None:
+    for callback in list(_LISTENERS):
+        try:
+            callback(patches)
+        except Exception:  # noqa: BLE001  单个订阅者失败不影响配置生效
+            pass
 
 
 def config_dir() -> Path:
@@ -61,6 +80,7 @@ def save_overrides(patches: dict[str, Any]) -> dict[str, Any]:
         json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True, default=str),
         encoding="utf-8",
     )
+    _notify(patches)
     return merged
 
 
@@ -107,6 +127,8 @@ def apply_overrides(config: BrainConfig, patches: dict[str, Any]) -> list[str]:
                 continue
             setattr(section, field_name, _coerce(section, field_name, value))
             changed.append(f"{section_name}.{field_name}")
+    if changed:
+        _notify(patches)
     return changed
 
 

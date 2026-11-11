@@ -19,12 +19,30 @@ from config import BrainConfig, ThalamusConfig, get_config
 from core.interfaces import KVRepository
 from models.neuron import PAD, Neuron
 
-__all__ = ["Admission", "Thalamus", "hamming_distance", "simhash64"]
+__all__ = ["Admission", "Thalamus", "classify_intent", "hamming_distance", "simhash64"]
 
 _RATE_BUCKET = "ratelimit"
 _DEDUPE_BUCKET = "dedupe"
 _RECENT_KEY = "recent"
 _EXACT_BUCKET = "dedupe_exact"
+
+# W3 / Q20：同一个 intent 既用于模型路由，也用于召回深度决策，不引入第二套意图分类
+_INTENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("deep_recall", ("三个月前", "上次", "之前", "记得那", "回忆", "当时", "那件事")),
+    ("media", ("画一张", "发张", "生成图", "来张图", "语音", "配图")),
+    ("tool_call", ("调用工具", "执行任务", "运行脚本", "查数据库")),
+    ("code", ("def ", "class ", "function ", "代码", "函数", "报错", "traceback")),
+    ("emotion", ("难过", "生气", "开心", "焦虑", "心情", "吵架", "委屈")),
+)
+
+
+def classify_intent(text: str) -> str:
+    """轻量规则意图判定（聊天热路径 <1ms，不调 LLM）。返回 chat 等 6 类之一。"""
+    content = str(text or "").lower()
+    for intent, keywords in _INTENT_RULES:
+        if any(keyword in content for keyword in keywords):
+            return intent
+    return "chat"
 
 
 def _now_ms() -> int:
