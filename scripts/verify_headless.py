@@ -69,6 +69,7 @@ def main() -> int:
     config.chat.host = "127.0.0.1"
     config.chat.port = CHAT_PORT
     config.model_router.request_timeout_sec = 3
+    config.media_service.request_timeout_sec = 1
     server = HeadlessServer(
         config, http_port=HTTP_PORT, ws_port=WS_PORT, mcp_port=MCP_PORT,
         use_llm=False, circadian=False,
@@ -181,6 +182,8 @@ def main() -> int:
                     ("graph", "graph", None),
                     ("graph.density", "graph.density", None),
                     ("graph.backfill", "graph.backfill", {"limit": 100}),
+                    ("recall.projected", "recall",
+                     {"q": "项目", "namespaces": ["topic:proj"], "limit": 5}),
                     ("narrative.reconstruct", "narrative.reconstruct", {"incremental": True}),
                     ("narrative.list", "narrative.list", {"limit": 20}),
                     ("narrative.retry_status", "narrative.retry_status", None),
@@ -275,6 +278,20 @@ def main() -> int:
                 check("W3 8769 纯消息流回复",
                       any(item.get("type") == "reply" for item in frames),
                       str(frames[-1] if frames else "无帧")[:120])
+
+                # W8 / P6：媒体意图先回文本，异步从 8769 推 media_ready（桩模式降级）
+                await ws.send(json.dumps({"type": "message", "text": "发张猫的图"},
+                                         ensure_ascii=False))
+                media_frames: list[dict] = []
+                for _ in range(10):
+                    media_frames.append(json.loads(await asyncio.wait_for(ws.recv(), timeout=15)))
+                    if media_frames[-1].get("type") == "media_ready":
+                        break
+                check("W8 8769 媒体异步降级",
+                      any(item.get("type") == "reply" for item in media_frames)
+                      and any(item.get("type") == "media_ready" and item.get("ok") is False
+                              for item in media_frames),
+                      str(media_frames[-1] if media_frames else "无帧")[:120])
 
         asyncio.run(chat_checks())
     finally:

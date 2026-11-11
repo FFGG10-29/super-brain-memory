@@ -29,6 +29,8 @@ from chat.engine import ChatEngine
 from chat.session_registry import SessionRegistry
 from config import BrainConfig, get_config
 from core.desktop_features import default_secret_store
+from core.fast_recall import fast_recall_projected
+from gateway.media_service import MediaService
 from gateway.model_router import get_model_router
 from core.runtime_paths import (
     clear_local_bridge,
@@ -131,10 +133,18 @@ class HeadlessServer:
         # W5：聊天与 IDE 查询共用同一份「当前会话 PAD」；换核时追踪器不重建
         self.pad_tracker = CurrentPadTracker(self.config)
         self.app.prefrontal.pad_tracker = self.pad_tracker
+        # W8 / A4：单 topic 的只读投影走叙事缓存（钩子闭包动态读 self.app，换核后自动生效）
+        self.daemon.projection_hook = lambda topic, query, limit: fast_recall_projected(
+            topic, query, relational=self.app.storage.relational,
+            kv=self.app.storage.kv, limit=limit,
+        )
+        self.media_service = MediaService(self.config)
         self.chat_engine = ChatEngine(
             config=self.config, toolkit=self.toolkit, router=self.model_router,
             write_gate=self.write_gate, agent=self.chat_agent, token=self.chat_token,
             sessions=SessionRegistry(), pad_tracker=self.pad_tracker,
+            media_service=self.media_service,
+            event_sink=lambda content, **kw: self.daemon.handle_event(content, **kw),
         )
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:

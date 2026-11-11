@@ -227,6 +227,10 @@ class Neocortex:
                     **hedge, "narrative_id": neuron_id,
                     "narrative_pending": generated_by == "template",
                 })
+            # A4 / R26：叙事新增后主动让该 topic 的投影缓存失效
+            from core.fast_recall import invalidate
+
+            invalidate(topic)
             produced.append({
                 "id": neuron_id, "topic": topic, "generated_by": generated_by,
                 "text": text, "pyramid_subtype": "narrative", "owner": "ai_narrative",

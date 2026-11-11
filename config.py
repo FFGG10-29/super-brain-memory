@@ -331,6 +331,18 @@ class PadGatingConfig(BaseSettings):
     warmup_turns: int = 5                    # 冷启动前 w6=0
 
 
+class MediaServiceConfig(BaseSettings):
+    """W8 / P6：媒体生成异步旁路（B3：ComfyUI 未验证，首发交付降级路径 + 桩）。"""
+    model_config = SettingsConfigDict(env_prefix="MEDIA_")
+
+    enabled: bool = True
+    comfyui_url: str = "http://127.0.0.1:8188"
+    request_timeout_sec: int = 3
+    session_ttl_sec: int = 86400
+    max_media_size_mb: int = 2048
+    stub_mode: bool = True                    # 真实生成验收放第二阶段
+
+
 class NarrativeReconstructConfig(BaseSettings):
     """W6 / P5：第一人称叙事重构（白天增量 + 夜间主窗口）。"""
     model_config = SettingsConfigDict(env_prefix="NARRATIVE_")
@@ -400,6 +412,7 @@ class BrainConfig(BaseSettings):
     spreading_activation: SpreadingActivationConfig = Field(default_factory=SpreadingActivationConfig)
     pad_gating: PadGatingConfig = Field(default_factory=PadGatingConfig)
     narrative_reconstruct: NarrativeReconstructConfig = Field(default_factory=NarrativeReconstructConfig)
+    media_service: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
 
 
 # 单例配置（懒加载于 main.py）

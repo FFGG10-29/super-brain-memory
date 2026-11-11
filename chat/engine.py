@@ -44,6 +44,8 @@ class ChatEngine:
         host: str | None = None,
         port: int | None = None,
         pad_tracker: Any | None = None,
+        media_service: Any | None = None,
+        event_sink: Any | None = None,
     ) -> None:
         self._config = config
         self._toolkit = toolkit
@@ -54,6 +56,8 @@ class ChatEngine:
         self._sessions = sessions or SessionRegistry()
         self._bus = bus or EventBus()
         self._pad_tracker = pad_tracker
+        self._media_service = media_service
+        self._event_sink = event_sink
         self._host = host or config.chat.host
         self._port = int(port if port is not None else config.chat.port)
         self._queues: dict[str, asyncio.Queue] = {}
@@ -172,6 +176,19 @@ class ChatEngine:
         sensitive = self._is_sensitive(text)
         channel = cfg.persona_channel
 
+        # W8 / P6.1：媒体意图先回文本 + typing，后台异步生成，不阻塞对话流
+        if intent == "media":
+            await self._push(session_id, "typing",
+                             {"state": True, "stage": "media", "intent": intent})
+            await self._push(session_id, "reply", {
+                "text": "好的，正在生成…", "intent": intent, "model": "",
+                "provider_kind": "local", "fallback": False,
+            })
+            task = asyncio.create_task(self._media_task(session_id, text))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return
+
         # ① 先给毫秒级 fast_recall（channel=bot 注入 L0 大肥鱼人格层）
         recall = await asyncio.to_thread(
             self._toolkit.recall_for_agent, self._agent,
@@ -232,6 +249,35 @@ class ChatEngine:
         await self._push(session_id, "deep_recall_ready", {
             "hits": deep.get("hits", []) if isinstance(deep, dict) else [],
             "injection": deep.get("injection", "") if isinstance(deep, dict) else "",
+        })
+        await self._push(session_id, "typing", {"state": False})
+
+    # ── W8 / P6：媒体异步任务 ────────────────────────────────────────────
+    async def _media_task(self, session_id: str, text: str) -> None:
+        result: dict[str, Any] | None = None
+        try:
+            if self._media_service is not None:
+                result = await asyncio.to_thread(
+                    self._media_service.generate, "image", {"prompt": text},
+                    session_id=session_id,
+                )
+        except Exception as exc:  # noqa: BLE001  媒体失败只降级，不影响对话
+            self.last_error = f"media failed: {type(exc).__name__}: {exc}"
+        # P6.4：只记 meta 事件，媒体本体不进六引擎（worker 的 media 分支不产生 neuron）
+        if self._event_sink is not None:
+            try:
+                await asyncio.to_thread(
+                    lambda: self._event_sink(
+                        f"媒体请求：{text[:60]}", agent_id="chat",
+                        namespace="topic:chat", event_type="media_interaction",
+                    )
+                )
+            except Exception:  # noqa: BLE001  审计失败不阻断媒体回复
+                pass
+        await self._push(session_id, "media_ready", {
+            "ok": result is not None,
+            "message": "媒体已生成" if result else "暂时无法生成图片",
+            "path": (result or {}).get("path", ""), "media_type": "image",
         })
         await self._push(session_id, "typing", {"state": False})
 

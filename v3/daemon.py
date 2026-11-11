@@ -456,6 +456,15 @@ class V3Daemon:
         扫描/打分开销按类数成比例下降（7 类下约 7 倍）。空元组 = Bot 全量可读。
         """
         ns = {str(x) for x in namespaces}
+        # W8 / A4：单 topic 查询优先走叙事投影缓存（骨架索引 + 命中注入全文）
+        hook = getattr(self, "projection_hook", None)
+        if hook is not None and len(ns) == 1:
+            try:
+                projected = hook(next(iter(ns)), query, limit=int(limit))
+                if projected is not None:
+                    return projected
+            except Exception:  # noqa: BLE001  投影失败退回原有 2-gram，不阻断召回
+                pass
         # 按类召回时取全量再先过滤：旧版固定 LIMIT 500（无 ORDER BY，实际是最早 500 行），
         # 新写入的记忆永远进不了候选。先按 namespace 收窄，2-gram 只算同类，开销反而更低。
         rows = self._rows(limit=0 if ns else 500)

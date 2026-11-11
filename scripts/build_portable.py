@@ -116,6 +116,7 @@ a = Analysis(
         "brain.hyperedge_backfill", "storage.hypergraph_db",
         "brain.pad_lexicon", "brain.current_pad_tracker", "brain.neocortex",
         "workers.consolidation_retry", "engine.local_llm",
+        "core.fast_recall", "gateway.media_service",
         "chat.engine", "chat.protocol", "chat.event_bus", "chat.session_registry",
         "gateway.model_router",
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",
