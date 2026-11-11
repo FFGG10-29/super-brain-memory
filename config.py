@@ -411,6 +411,22 @@ class ChatConfig(BaseSettings):
     persona_channel: str = "bot"                # A5/Q19：聊天必须注入 L0 人格层
 
 
+class AccountPoolConfig(BaseSettings):
+    """§16.14 号池网关：WorkBuddy 多账号聚合为模型候选池（免密 lane 默认关，Q36 封号风险）。"""
+    model_config = SettingsConfigDict(env_prefix="POOL_")
+
+    enabled: bool = False                    # 总开关，默认关闭
+    free_lane: bool = False                  # 免密 lane（opencode）默认关：封号风险，用户显式开
+    accounts_file: str = ""                  # xdpool accounts.json，空则用 ~/.dsh/.xdpool/accounts.json
+    auth_file: str = ""                      # WorkBuddy 登录态文件，空则自动探测
+    request_timeout_sec: int = 60
+    model_cooldown_sec: int = 60             # (account, model) 429 冷却
+    credential_dead_sec: int = 1800          # 401/403 长冷却
+    auto_refresh: bool = True                # token 过期自动刷新
+    max_attempts: int = 8                    # failover 顺序尝试上限
+    default_model: str = "deepseek-v4.1-flash"
+
+
 class BrainConfig(BaseSettings):
     """全局组合根配置。"""
     # extra=ignore：.env 里的 MODEL_/SYNC_/GW_ 键由子模型消费，不应被顶层判为多余字段
@@ -442,6 +458,7 @@ class BrainConfig(BaseSettings):
     narrative_reconstruct: NarrativeReconstructConfig = Field(default_factory=NarrativeReconstructConfig)
     media_service: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    account_pool: AccountPoolConfig = Field(default_factory=AccountPoolConfig)
 
 
 # 单例配置（懒加载于 main.py）

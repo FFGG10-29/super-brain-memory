@@ -110,6 +110,8 @@ class ModelRouter:
         self._injected = clients
         self._on_fallback = on_fallback
         self._pool: list[ModelClient] = []
+        # §16.14 号池实例（非 ModelClient 列表）：避免与供应商列表 self._pool 撞名
+        self._account_pool: Any | None = None
         # session_id -> (client_name, intent, expires_at)；intent 变化允许突破粘性
         self._sticky: dict[str, tuple[str, str, float]] = {}
         self.fallback_events: list[dict[str, Any]] = []
@@ -136,6 +138,20 @@ class ModelRouter:
         if self._local_llm is not None and hasattr(self._local_llm, "complete_text"):
             self._pool.append(LocalGGUFClient(
                 self._local_llm, timeout_sec=float(cfg.request_timeout_sec)))
+        # §16.14 号池网关：enabled 时在本地 GGUF 之后追加号池 provider
+        #（PoolClient.complete() 走号池内部 lane 而非 HTTP）。模块缺失/初始化失败
+        # 一律忽略，不进候选池（号池是可选能力）。
+        self._account_pool = None
+        if self._config.account_pool.enabled:
+            try:
+                from gateway.account_pool.pool import AccountPool, PoolClient
+                pool = AccountPool(self._config)
+                pool.discover()
+                if pool.accounts:
+                    self._account_pool = pool
+                    self._pool.append(PoolClient(pool, self._config))
+            except Exception:  # noqa: BLE001  号池不可用不影响路由层
+                self._account_pool = None
         if not cfg.enabled:
             return  # B1/Q15：默认不把云供应商放进候选池
         for item in cfg.providers or []:

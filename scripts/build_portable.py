@@ -119,6 +119,8 @@ a = Analysis(
         "core.fast_recall", "gateway.media_service",
         "chat.engine", "chat.protocol", "chat.event_bus", "chat.session_registry",
         "gateway.model_router",
+        # 号池网关由 model_router 函数内延迟导入，静态分析抓不到
+        "gateway.account_pool.store", "gateway.account_pool.pool",
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",
         "gateway.mcp_stdio", "gateway.http_adapter", "gateway.mcp_server",
         "gateway.tool_catalog", "gateway.bridge_launcher",
