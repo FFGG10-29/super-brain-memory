@@ -632,6 +632,23 @@ class RpcExtension:
             return {"ok": True, "pending": []}
         return {"ok": True, "pending": retry.pending()}
 
+    # ── W5 / W9：当前会话 PAD 状态（管理端可视化）───────────────────────
+    def _pad_current(self, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        tracker = getattr(getattr(app, "prefrontal", None), "pad_tracker", None)
+        if tracker is None:
+            return {"ok": True, "available": False, "turns": 0,
+                    "warmup_done": False, "suppress_negative": False,
+                    "weight_multiplier": 0.0, "pad": None}
+        state = tracker.current()
+        return {
+            "ok": True, "available": True, "turns": tracker.turns,
+            "warmup_done": tracker.warmup_done,
+            "suppress_negative": tracker.suppress_negative,
+            "weight_multiplier": tracker.weight_multiplier(),
+            "pad": list(state.as_tuple()) if state is not None else None,
+        }
+
     # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
     def _mirror_persona(self, params: dict[str, Any]) -> None:
         """镜像到 LMDB kv persona/fish/params，供 AstrBot 侧读取生成提示词。"""

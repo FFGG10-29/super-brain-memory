@@ -25,6 +25,8 @@ from typing import Any
 
 from brain.current_pad_tracker import CurrentPadTracker
 from brain.write_gate import WriteGate
+from core.cache_invalidation import CacheInvalidationBus, write_result_to_event
+from core.cache_manager import CacheManager
 from chat.engine import ChatEngine
 from chat.session_registry import SessionRegistry
 from config import BrainConfig, get_config
@@ -79,8 +81,15 @@ class HeadlessServer:
         self.config = config or get_config()
         apply_overrides(self.config, load_overrides())
         # W1（Q17/A1）：先建统一闸门，再装配内核 —— build_app 内部的两条后台写入路径要接线
-        self.write_gate = WriteGate()
+        # C0 / Q33：闸门成功完成回调即失效事件发布点；总线与缓存管理器在 build_app 后装配
+        self.write_gate = WriteGate(on_completed=self._on_write_completed)
+        self.cache_bus = CacheInvalidationBus()
+        self.cache_manager: CacheManager | None = None
         self.app = build_app(self.config, write_gate=self.write_gate)
+        self.cache_manager = CacheManager(
+            config=self.config, kv=self.app.storage.kv,
+            timeseries=self.app.storage.timeseries, bus=self.cache_bus,
+        )
 
         # 唯一真源：v2 主库路径的兄弟目录放 v3 的 journal/inbox（不另开六引擎）
         sqlite_path = Path(self.config.storage.sqlite_path)
@@ -220,6 +229,18 @@ class HeadlessServer:
             "chat_port": int(self.config.chat.port),
         }
 
+    def _on_write_completed(self, request: Any, result: Any) -> None:
+        """C0 / Q33：闸门成功写入 → `memory_updated` 失效事件。
+
+        build_app 装配期间总线尚未就绪（后台蒸馏可能提前触发），直接跳过。
+        """
+        bus = getattr(self, "cache_bus", None)
+        if bus is None:
+            return
+        event = write_result_to_event(request, result)
+        if event is not None:
+            bus.publish(event)
+
     def restart_kernel(self) -> dict[str, Any]:
         """按最新配置重建内核；闸门、Worker 线程、MCP toolkit、registry 一起切核。
 
@@ -240,13 +261,21 @@ class HeadlessServer:
         # Kùzu 同路径只允许一个 Database：必须先关旧内核再开新内核
         old.close()
         # 新闸门必须先于 build_app 建立：组合根内两条后台写入路径要接线
-        new_gate = WriteGate()
+        new_gate = WriteGate(on_completed=self._on_write_completed)
         try:
             fresh = build_app(self.config, write_gate=new_gate)
         except Exception as exc:  # noqa: BLE001
             new_gate.shutdown(timeout=1)
             return {"ok": False, "message": f"内核重启失败，请重启后端进程：{type(exc).__name__}: {exc}"}
         self.write_gate = new_gate
+        # C0：缓存管理器绑定到新内核的 kv/timeseries；旧订阅随重建移除
+        old_manager = self.cache_manager
+        if old_manager is not None:
+            self.cache_bus.unsubscribe(old_manager.invalidate_by_event)
+        self.cache_manager = CacheManager(
+            config=self.config, kv=fresh.storage.kv,
+            timeseries=fresh.storage.timeseries, bus=self.cache_bus,
+        )
         self.app = fresh
         self.daemon.app = fresh
         self.daemon.write_gate = new_gate
@@ -296,6 +325,13 @@ class HeadlessServer:
         if worker_thread is not None:
             worker_thread.join(timeout=2.0)
         self.write_gate.shutdown(timeout=5)
+        # C0：停机前把攒批的缓存指标落盘（在 app.close() 之前，DuckDB 还活着）
+        manager = getattr(self, "cache_manager", None)
+        if manager is not None:
+            try:
+                manager.flush_metrics()
+            except Exception:  # noqa: BLE001
+                pass
         # 停机前收缩 WAL，避免被强杀/重启后留下巨大 -wal 与锁
         try:
             self.checkpoint_wal()

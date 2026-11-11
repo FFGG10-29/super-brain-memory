@@ -74,6 +74,20 @@ TABLE_COLUMNS: dict[TimeSeriesTable, tuple[dict[str, str], str]] = {
         },
         "task_id",
     ),
+    # C0 / v4.1-C：缓存指标（命中率/延迟/失效，按命名空间聚合，攒批写入）
+    "cache_metrics": (
+        {
+            "ts_ms": "BIGINT",
+            "namespace": "VARCHAR",
+            "hits": "INTEGER",
+            "misses": "INTEGER",
+            "evictions": "INTEGER",
+            "invalidations": "INTEGER",
+            "hit_rate": "DOUBLE",
+            "avg_latency_us": "DOUBLE",
+        },
+        "namespace",
+    ),
 }
 
 _FORBIDDEN_KEYWORDS = ("insert", "update", "delete", "drop", "alter", "create", "copy", "attach", "vacuum")

@@ -343,6 +343,34 @@ class MediaServiceConfig(BaseSettings):
     stub_mode: bool = True                    # 真实生成验收放第二阶段
 
 
+class CacheConfig(BaseSettings):
+    """v4.1-C / C0：缓存专项。默认开启但容量保守；输出缓存默认关（语义风险，Q34）。"""
+    model_config = SettingsConfigDict(env_prefix="CACHE_")
+
+    enabled: bool = True                       # 总开关；false 时全部回退无缓存路径
+    flush_every_ops: int = 500                 # 指标攒批写 DuckDB 的阈值
+    namespaces: dict[str, dict[str, Any]] = Field(default_factory=lambda: {
+        # media: memory（LRU）| lmdb；ttl_sec<=0 = 永不过期（靠精确失效）
+        "recall": {"enabled": True, "capacity": 512, "ttl_sec": 600, "media": "memory"},
+        "embedding": {"enabled": True, "capacity": 5000, "ttl_sec": 2592000, "media": "lmdb"},
+        "salience": {"enabled": True, "capacity": 2000, "ttl_sec": 600, "media": "memory"},
+        "episodic": {"enabled": True, "capacity": 256, "ttl_sec": 3600, "media": "memory"},
+        "prompt_prefix": {"enabled": True, "capacity": 16, "ttl_sec": 0, "media": "memory"},
+        "path": {"enabled": True, "capacity": 256, "ttl_sec": 300, "media": "memory"},
+        "persona": {"enabled": True, "capacity": 8, "ttl_sec": 0, "media": "memory"},
+        "route": {"enabled": True, "capacity": 256, "ttl_sec": 1800, "media": "memory"},
+        "doc_distill": {"enabled": True, "capacity": 1000, "ttl_sec": 0, "media": "lmdb"},
+        # 语义风险最高，默认关（Q34）；C16 先做、C17 缓一档
+        "output": {"enabled": False, "capacity": 1000, "ttl_sec": 86400, "media": "lmdb"},
+        # 以下为预留位（Q28/Q31 裁决：narrative 由 W8 投影缓存承担、thalamus/safety 砍）
+        "thalamus": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},
+        "safety": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},
+        "narrative": {"enabled": False, "capacity": 256, "ttl_sec": 0, "media": "memory"},
+        "tool": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "lmdb"},
+        "conflict": {"enabled": False, "capacity": 1000, "ttl_sec": 0, "media": "memory"},
+    })
+
+
 class NarrativeReconstructConfig(BaseSettings):
     """W6 / P5：第一人称叙事重构（白天增量 + 夜间主窗口）。"""
     model_config = SettingsConfigDict(env_prefix="NARRATIVE_")
@@ -413,6 +441,7 @@ class BrainConfig(BaseSettings):
     pad_gating: PadGatingConfig = Field(default_factory=PadGatingConfig)
     narrative_reconstruct: NarrativeReconstructConfig = Field(default_factory=NarrativeReconstructConfig)
     media_service: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
 
 
 # 单例配置（懒加载于 main.py）

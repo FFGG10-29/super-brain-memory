@@ -10,9 +10,9 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flutter](https://img.shields.io/badge/Flutter-Windows%20Desktop-02569B?logo=flutter&logoColor=white)](https://flutter.dev/)
-[![MCP](https://img.shields.io/badge/MCP-53%20tools%20%C2%B7%206%20resources-8A2BE2)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-66%20tools%20%C2%B7%206%20resources-8A2BE2)](https://modelcontextprotocol.io/)
 [![CUDA](https://img.shields.io/badge/CUDA-GPU%20accelerated-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
-[![Tests](https://img.shields.io/badge/tests-141%20passed-brightgreen)](#-测试)
+[![Tests](https://img.shields.io/badge/tests-145%20passed-brightgreen)](#-测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#-license)
 
 [快速开始](#-60-秒接入你的-agent) · [功能](#-它能做什么) · [界面](#-界面) · [架构](#-架构) · [参与贡献](#-参与贡献)
@@ -272,13 +272,32 @@ GPU 验证（最权威的一条）：
 - [x] v3 事件驱动内核（journal 组提交 + 租约收件箱 + 守护进程/Worker）
 - [x] 无头后端单进程统一内核 + Flutter 全功能客户端 + 后端自动拉起
 - [x] 分层上下文四层 + 技能层（版本化 + 反馈自迭代）
-- [x] MCP 能力面统一到 `tool_catalog.py`（53 工具 / 6 resources）
+- [x] MCP 能力面统一到 `tool_catalog.py`（66 工具 / 6 resources）
 - [x] Flutter 真机验收（analyze 0 issues / build windows 通过）并出安装包
 - [x] Flutter 为唯一前端
+- [x] v4.1：统一 WriteGate、事务性覆盖写入、8769 聊天通道、模型路由、联想式召回、第一人称叙事、媒体异步旁路
 - [ ] 记忆图谱自动补全与关系推理（三元组抽取已就绪，待更强模型）
 - [ ] 跨设备增量同步可视化（落后游标 / 冲突预览）
 - [ ] Linux / macOS 发行包
 - [ ] 插件市场：Obsidian / VSCode / 浏览器剪藏
+
+---
+
+## 🧩 v4.1 增量（默认全本地）
+
+v4.1 是**方案迭代**，产品发行版本仍是 3.1.0。新增能力都不改变「数据不出本机」：
+
+| 能力 | 说明 |
+|---|---|
+| 统一写入闸门 | `brain/write_gate.py` 串行化 6 条写入路径；事务性内容（代码 / 草稿 / 配置）覆盖式写入，认知性事实保留多版本可追溯 |
+| 8769 聊天通道 | `python -m headless_server` 额外提供纯消息流 WS，`hello` 帧用 **chat 专用令牌**（`%APPDATA%\super-brain\chat_token.txt`）；默认只绑 `127.0.0.1`，`--chat-host 0.0.0.0` 必须同时指定 `--chat-token-file` 并接受明文传输 |
+| 模型路由 | `gateway/model_router.py` 是进程内路由函数，**默认 `enabled=false`、云供应商不进候选池**，只走本地 Ollama（不可达再退本地 0.6B GGUF）。显式开启前请在 SecretStore 写 `model_router.<name>` 的 API Key；敏感记忆永不上免费云模型 |
+| 联想式召回 | 激活扩散（稀疏图自动降 1 跳）、hyperedge 事件骨架整体注入、当前会话 PAD 分段门控；deep 端到端预算 P95 ≤ 15s（精排 8s 硬超时） |
+| 第一人称叙事 | 巩固窗口把事件骨架重构成「我与你之间发生过什么」的叙事 neuron（`owner=ai_narrative`），失败进独立重试队列并记 DuckDB |
+| 媒体旁路 | 8769 说「发张猫的图」先回文本，就绪后异步推 `media_ready`；ComfyUI 未启动时优雅降级，六引擎零污染 |
+
+验收与全部裁决见 [`.memory/架构设计总章.md` §十五~§十六](.memory/架构设计总章.md)；
+端到端脚本 `scripts/verify_headless.py` 覆盖 MCP、v3 RPC、8769 消息流与上述新能力。
 
 ---
 

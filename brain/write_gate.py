@@ -43,11 +43,18 @@ class WriteRequest:
 class WriteGate:
     """单线程 FIFO 写入执行器。"""
 
-    def __init__(self, *, executor: Callable[[WriteRequest], Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        executor: Callable[[WriteRequest], Any] | None = None,
+        on_completed: Callable[[WriteRequest, Any], None] | None = None,
+    ) -> None:
         self._queue: queue.Queue = queue.Queue()
         self._lock = threading.RLock()
         self._closed = False
         self._executor = executor
+        # C0：写入成功后的领域事件发布点（失效总线挂这里；失败写入不改状态，不发布）
+        self._on_completed = on_completed
         self._thread = threading.Thread(
             target=self._consume, name="brain-write-gate", daemon=True
         )
@@ -92,7 +99,14 @@ class WriteGate:
                 return
             request, future = item
             try:
-                future.set_result(self._run(request))
+                result = self._run(request)
+                future.set_result(result)
+                # C0 / Q33：只对成功写入发布领域事件；发布失败绝不影响写入本身
+                if self._on_completed is not None:
+                    try:
+                        self._on_completed(request, result)
+                    except Exception:  # noqa: BLE001
+                        pass
             except BaseException as exc:  # noqa: BLE001  异常必须回传，不能让 Future 悬空
                 future.set_exception(exc)
             finally:

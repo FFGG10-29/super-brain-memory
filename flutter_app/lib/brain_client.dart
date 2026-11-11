@@ -503,6 +503,29 @@ class BrainClient {
   Future<Map<String, dynamic>> resetConfig() async => _asMap(await call('config.reset'));
   Future<Map<String, dynamic>> gatewayStatus() async => _asMap(await call('gateway.status'));
 
+  // ── W9 / C4：叙事 / 扩散 / 当前 PAD 可视化 ────────────────────────────
+  Future<Map<String, dynamic>> narrativeList({int limit = 50}) async =>
+      _asMap(await call('narrative.list', <String, dynamic>{'limit': limit}));
+
+  Future<Map<String, dynamic>> narrativeReconstruct({bool incremental = true}) async =>
+      _asMap(await call('narrative.reconstruct',
+          <String, dynamic>{'incremental': incremental}));
+
+  Future<List<Map<String, dynamic>>> narrativeRetryStatus() async {
+    final data = await call('narrative.retry_status');
+    // 兼容 WS 裸数组 / HTTP {result: ...} 包装 / {pending: [...]} 三种形态
+    final pending = data is Map<String, dynamic>
+        ? (data['pending'] ?? data['result'])
+        : data;
+    return _asList(pending).map(_asMap).toList();
+  }
+
+  Future<Map<String, dynamic>> graphDensity() async =>
+      _asMap(await call('graph.density'));
+
+  Future<Map<String, dynamic>> currentPad() async =>
+      _asMap(await call('pad.current'));
+
   Future<Map<String, dynamic>> importMemories(String text, String suffix,
           {bool fast = true}) async =>
       _asMap(await call('import_memories', <String, dynamic>{

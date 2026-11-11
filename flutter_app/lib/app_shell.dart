@@ -6,6 +6,7 @@ import 'analytics.dart';
 import 'backend_launcher.dart';
 import 'brain_client.dart';
 import 'context_pages.dart';
+import 'narrative_page.dart';
 import 'nebula_page.dart';
 import 'pages.dart';
 import 'pages_extra.dart';
@@ -15,7 +16,7 @@ import 'system_features.dart';
 import 'system_gauges.dart';
 import 'win32.dart';
 
-/// LivingMemory 风格外壳：左侧十八页导航 + 顶栏（空间/搜索/实时仪表/导出/全屏）+ 底部状态栏。
+/// LivingMemory 风格外壳：七组主导航（25 页）+ 顶栏（空间/搜索/实时仪表/导出/全屏）+ 底部状态栏。
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -70,6 +71,7 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '记忆空间', 'icon': Icons.workspaces_outline},
     <String, Object>{'name': '技能管理', 'icon': Icons.auto_awesome_outlined},
     <String, Object>{'name': '人格设定', 'icon': Icons.pets_outlined},
+    <String, Object>{'name': '叙事洞察', 'icon': Icons.auto_stories},
   ];
 
   /// 主导航分组：左栏只显示 7 个入口，组内子页放到顶栏下方的子导航条。
@@ -77,7 +79,7 @@ class _AppShellState extends State<AppShell> {
   static const List<Map<String, Object>> _groups = <Map<String, Object>>[
     <String, Object>{'name': '星云视图', 'icon': Icons.blur_on, 'pages': <int>[0]},
     <String, Object>{'name': '记忆工作台', 'icon': Icons.memory, 'pages': <int>[1, 2, 14]},
-    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 23]},
+    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 23, 24]},
     <String, Object>{'name': 'Agent 上下文', 'icon': Icons.psychology_outlined, 'pages': <int>[18, 19, 20, 21, 22]},
     <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9]},
     <String, Object>{'name': '系统设置', 'icon': Icons.tune, 'pages': <int>[11, 15, 16, 10]},
@@ -241,6 +243,7 @@ class _AppShellState extends State<AppShell> {
       MemorySpacesPage(client: _client),
       SkillsPage(client: _client),
       PersonaPage(client: _client),
+      NarrativeInsightPage(client: _client),
     ];
     return <Widget>[
       for (var i = 0; i < pages.length; i++)
