@@ -31,7 +31,7 @@ from brain.synaptic_plasticity import SynapticPlasticity
 from brain.thalamus import Thalamus
 from config import BrainConfig, get_config
 from core.ids import HybridLogicalClock
-from core.structured_log import configure_logging
+from core.structured_log import configure_logging, log_event
 from core.interfaces import (
     Embedder,
     GraphRepository,
@@ -349,7 +349,14 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
     tier_manager = MemoryTierManager(
         storage.relational, plasticity, event_log=journal, config=config
     )
-    neocortex = Neocortex(storage.relational, event_log=journal, config=config)
+    # W6 / P5：叙事重构需要写入口与独立重试队列；模型路由由无头后端随后绑定
+    from workers.consolidation_retry import ConsolidationRetry
+
+    neocortex = Neocortex(
+        storage.relational, event_log=journal, config=config,
+        hippocampus=hippocampus,
+        retry=ConsolidationRetry(timeseries=storage.timeseries, config=config),
+    )
 
     # 项目档案实时提炼：agent 写入即异步进六引擎（事件驱动后台线程），夜间只兜底
     from workers.document_distiller import (
@@ -390,6 +397,11 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
                 text, **{"agent_id": "consolidator", **kw}
             ),
         )
+        # W6 / P5：夜间主窗口做全量叙事重构（含 narrative_pending 重试）
+        narrative = neocortex.narrative_reconstruct(incremental=False)
+        log_event("narrative_reconstruct", agent_id="consolidator",
+                  count=narrative.get("reconstructed", 0),
+                  degraded=narrative.get("degraded", 0))
         sweep_report = tier_manager.sweep()
         scanned = int(getattr(sweep_report, "scanned", 0) or 0)
         return len(consolidations), len(summaries), scanned
@@ -401,6 +413,14 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
         snapshot=lambda: None,       # git_worker/snapshot 接线在阶段 5
         morning_brief=life_loop.morning_brief,
     )
+    # W6 / P5.4：白天每 4h 低频窗口，只处理新增 hyperedge，不全量重跑
+    if config.narrative_reconstruct.enabled:
+        interval = max(1, int(config.narrative_reconstruct.daytime_interval_hours))
+        for hour in range(0, 24, interval):
+            circadian.register(
+                f"narrative_4h_{hour:02d}", hour=hour, minute=15,
+                callback=lambda: neocortex.narrative_reconstruct(incremental=True),
+            )
 
     return BrainApp(
         config=config,

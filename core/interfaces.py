@@ -66,7 +66,7 @@ EventType = Literal[
     "overwrite",          # W2：事务性内容覆盖式更新（只记最终态，带新 payload）
     "media_interaction",  # W2：媒体交互 meta（不产生 neuron）
 ]
-TimeSeriesTable = Literal["pad_track", "access_log", "decay_event"]
+TimeSeriesTable = Literal["pad_track", "access_log", "decay_event", "consolidation_failures"]
 
 
 # ── 通用值对象 ─────────────────────────────────────────────────────────────
@@ -208,6 +208,15 @@ class LocalLLM(ABC):
         max_retries: int = 2,
     ) -> Mapping[str, Any]:
         """返回已通过 JSON 解析（与 required_keys 校验）的对象；失败抛 EngineUnavailable。"""
+
+    def complete_text(self, system_prompt: str, user_prompt: str) -> str:
+        """W6 / Q15：自由文本生成（叙事重构、Ollama 不可达时的 GGUF 兜底）。
+
+        非抽象方法：现有 FakeLLM / DisabledLLM 不实现也能正常工作，只是显式抛不可用。
+        """
+        from core.errors import EngineUnavailable
+
+        raise EngineUnavailable("当前 LocalLLM 未实现自由文本生成")
 
 
 # ── 六引擎仓储 ─────────────────────────────────────────────────────────────

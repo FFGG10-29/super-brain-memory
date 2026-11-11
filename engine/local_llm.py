@@ -135,6 +135,19 @@ class QwenLocalLLM(LocalLLM):
                 _ = attempt
         raise EngineUnavailable(f"LLM 输出在 {max_retries + 1} 次尝试后仍非法: {last_error}")
 
+    def complete_text(self, system_prompt: str, user_prompt: str) -> str:
+        """W6 / Q15：自由文本生成，供叙事重构与「Ollama 不可达再退 GGUF」使用。"""
+        llm = self._ensure_loaded()
+        completion = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
+        return str(completion["choices"][0]["message"]["content"] or "")
+
 
 class DisabledLLM(LocalLLM):
     """本地 LLM 总开关关闭时的可选占位实现（低配/无 GPU 机器的降级逃生口）。

@@ -61,6 +61,19 @@ TABLE_COLUMNS: dict[TimeSeriesTable, tuple[dict[str, str], str]] = {
         },
         "neuron_id",
     ),
+    # W6 / R40：巩固失败任务（内存队列 + DuckDB 持久化，进程重启可恢复）
+    "consolidation_failures": (
+        {
+            "ts_ms": "BIGINT",
+            "task_id": "VARCHAR",
+            "hyperedge_id": "VARCHAR",
+            "topic": "VARCHAR",
+            "attempts": "INTEGER",
+            "error": "VARCHAR",
+            "status": "VARCHAR",
+        },
+        "task_id",
+    ),
 }
 
 _FORBIDDEN_KEYWORDS = ("insert", "update", "delete", "drop", "alter", "create", "copy", "attach", "vacuum")

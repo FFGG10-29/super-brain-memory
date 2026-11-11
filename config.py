@@ -331,6 +331,19 @@ class PadGatingConfig(BaseSettings):
     warmup_turns: int = 5                    # 冷启动前 w6=0
 
 
+class NarrativeReconstructConfig(BaseSettings):
+    """W6 / P5：第一人称叙事重构（白天增量 + 夜间主窗口）。"""
+    model_config = SettingsConfigDict(env_prefix="NARRATIVE_")
+
+    enabled: bool = True
+    daytime_interval_hours: int = 4         # 白天低频窗口，只处理新增 hyperedge
+    max_hyperedges_per_window: int = 50
+    min_members: int = 2
+    max_retries: int = 3                     # 3 次后标 narrative_pending
+    retry_backoff_sec: float = 2.0           # 指数退避基数
+    skeleton_chars: int = 200                # A4：叙事故事骨架前缀长度
+
+
 class HyperedgeBackfillConfig(BaseSettings):
     """W4 / P4.0：从既有记忆补 hyperedge + MEMBER 边，给 W5 的激活扩散铺图。"""
     model_config = SettingsConfigDict(env_prefix="BACKFILL_")
@@ -386,6 +399,7 @@ class BrainConfig(BaseSettings):
     hyperedge_backfill: HyperedgeBackfillConfig = Field(default_factory=HyperedgeBackfillConfig)
     spreading_activation: SpreadingActivationConfig = Field(default_factory=SpreadingActivationConfig)
     pad_gating: PadGatingConfig = Field(default_factory=PadGatingConfig)
+    narrative_reconstruct: NarrativeReconstructConfig = Field(default_factory=NarrativeReconstructConfig)
 
 
 # 单例配置（懒加载于 main.py）

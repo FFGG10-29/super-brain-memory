@@ -220,6 +220,10 @@ class Hippocampus:
                     "valence": max(-1.0, min(1.0, valence)),
                     "sensitive": bool(cognition.get("sensitive", False)),
                     "category": str(cognition.get("category") or ""),
+                    # W6 / A6：AI 叙事私有区与 pyramid 子类（不给 neurons 表加列）
+                    "owner": str(cognition.get("owner") or ""),
+                    "pyramid_subtype": str(cognition.get("pyramid_subtype") or ""),
+                    "narrative_skeleton": cognition.get("narrative_skeleton"),
                     "namespace": neuron.namespace,
                     "ts_ms": neuron.created_at_ms,
                 }

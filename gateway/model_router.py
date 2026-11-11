@@ -77,6 +77,23 @@ class ModelClient:
         return str(data["choices"][0]["message"]["content"])
 
 
+class LocalGGUFClient(ModelClient):
+    """Q15 / R3：Ollama 不可达时退本地 0.6B GGUF（不联网、不出本机）。"""
+
+    def __init__(self, llm: Any, *, timeout_sec: float = 20.0) -> None:
+        super().__init__(name="local-gguf", kind=LOCAL,
+                         caps=("chat", "tools", "json_mode"),
+                         weight=0.5, timeout_sec=timeout_sec)
+        self._llm = llm
+
+    def complete(self, prompt: str) -> str:
+        text = self._llm.complete_text(
+            "你是本地记忆助手，只依据给定上下文简洁作答，不要编造。", prompt)
+        if not text.strip():
+            raise RuntimeError("GGUF 返回空文本")
+        return text
+
+
 class ModelRouter:
     def __init__(
         self,
@@ -85,9 +102,11 @@ class ModelRouter:
         secret_store: Any | None = None,
         clients: list[ModelClient] | None = None,
         on_fallback: Callable[[dict[str, Any]], None] | None = None,
+        local_llm: Any | None = None,
     ) -> None:
         self._config = config or get_config()
         self._secret_store = secret_store
+        self._local_llm = local_llm
         self._injected = clients
         self._on_fallback = on_fallback
         self._pool: list[ModelClient] = []
@@ -113,8 +132,12 @@ class ModelRouter:
             model=cfg.local_model, caps=("chat", "tools", "json_mode"),
             timeout_sec=float(cfg.request_timeout_sec),
         )]
+        # Q15：Ollama 不可达时再退本地 0.6B GGUF（complete() 按 pool 顺序 fallback）
+        if self._local_llm is not None and hasattr(self._local_llm, "complete_text"):
+            self._pool.append(LocalGGUFClient(
+                self._local_llm, timeout_sec=float(cfg.request_timeout_sec)))
         if not cfg.enabled:
-            return  # B1/Q15：默认只有本地 Ollama，云供应商不进候选池
+            return  # B1/Q15：默认不把云供应商放进候选池
         for item in cfg.providers or []:
             if not isinstance(item, dict) or not item.get("name"):
                 continue

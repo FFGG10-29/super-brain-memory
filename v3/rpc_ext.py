@@ -583,6 +583,55 @@ class RpcExtension:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    # ── W6 / P5：叙事重构与 AI 私有叙事区 ───────────────────────────────
+    def _narrative_reconstruct(self, incremental: bool = True,
+                               limit: int | None = None, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪", "narratives": []}
+        try:
+            return app.neocortex.narrative_reconstruct(
+                incremental=bool(incremental), limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "narratives": []}
+
+    def _narrative_list(self, limit: int = 50, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪", "rows": []}
+        import json as _json
+
+        rows: list[dict[str, Any]] = []
+        try:
+            for key, raw in app.storage.kv.scan_prefix("meta", "", limit=max(200, int(limit) * 5)):
+                try:
+                    meta = _json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if meta.get("owner") != "ai_narrative":
+                    continue
+                record = app.storage.relational.get("neuron", key)
+                if record is None:
+                    continue
+                rows.append({
+                    "id": key, "content": str(record.get("content") or ""),
+                    "memory_type": record.get("memory_type", "scenario"),
+                    "pyramid_subtype": meta.get("pyramid_subtype", ""),
+                    "namespace": record.get("namespace", ""),
+                })
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "rows": []}
+        return {"ok": True, "count": len(rows), "rows": rows[:int(limit)]}
+
+    def _narrative_retry_status(self, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪", "pending": []}
+        retry = getattr(app.neocortex, "_retry", None)
+        if retry is None:
+            return {"ok": True, "pending": []}
+        return {"ok": True, "pending": retry.pending()}
+
     # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
     def _mirror_persona(self, params: dict[str, Any]) -> None:
         """镜像到 LMDB kv persona/fish/params，供 AstrBot 侧读取生成提示词。"""

@@ -124,8 +124,10 @@ class HeadlessServer:
         _, chat_agent_token = self.registry.register("chat-engine")
         self.chat_agent = self.registry.verify(chat_agent_token)
         self.model_router = get_model_router(
-            self.config, secret_store=default_secret_store(),
+            self.config, secret_store=default_secret_store(), local_llm=self.app.llm,
         )
+        # W6 / C12：巩固代理复用同一模型路由；叙事重构由昼夜节律窗口触发
+        self.app.neocortex._router = self.model_router
         # W5：聊天与 IDE 查询共用同一份「当前会话 PAD」；换核时追踪器不重建
         self.pad_tracker = CurrentPadTracker(self.config)
         self.app.prefrontal.pad_tracker = self.pad_tracker
@@ -241,6 +243,7 @@ class HeadlessServer:
         self.adapter.rebind_write_gate(new_gate)
         self.chat_engine.rebind(new_gate)  # W3：聊天写入也要切到新闸门
         fresh.prefrontal.pad_tracker = self.pad_tracker  # W5：换核后追踪器继续生效
+        fresh.neocortex._router = self.model_router      # W6：巩固代理继续复用
         self.daemon._memory_service = None
         self.registry._kv = fresh.storage.kv
         self.registry._timeseries = fresh.storage.timeseries
