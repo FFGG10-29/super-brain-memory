@@ -142,6 +142,17 @@ class MemoryEditor:
         self._relational.deactivate("neuron", memory_id, valid_to_ms=now, tx_to=stamp)
         self._relational.upsert("neuron", new_record)
 
+        # R11：supersede 同步 LMDB 旁路索引 —— 新版本继承旧分区元数据，旧版本移除，
+        # 避免召回侧按 category/layer 过滤时读到已封存版本的元数据。
+        try:
+            kv = self._app.storage.kv
+            raw_meta = kv.get("meta", memory_id)
+            if raw_meta:
+                kv.put("meta", neuron.uuid7_id, bytes(raw_meta))
+            kv.delete("meta", memory_id)
+        except Exception:  # noqa: BLE001  KV 不可用时由投影重建兜底
+            pass
+
         # 3) 派生库：旧向量立即移出召回，新向量走 outbox 投影
         try:
             self._vector.delete([memory_id])

@@ -23,7 +23,8 @@ __all__ = ["MemoryService", "parse_memory_text", "EVENT_TYPES"]
 
 _CORE_BLOCKS = ("human", "persona", "preferences", "constraints")
 EVENT_TYPES = ["ingest", "supersede", "reinforce", "tier_change",
-               "consolidate", "policy", "tombstone"]
+               "consolidate", "policy", "tombstone",
+               "overwrite", "media_interaction"]
 
 
 def parse_memory_text(text: str, suffix: str = ".txt") -> list[str]:

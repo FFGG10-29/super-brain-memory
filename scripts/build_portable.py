@@ -112,6 +112,7 @@ a = Analysis(
         "mcp", "dotenv", "pydantic_settings", "websockets", "honker",
         "main", "headless_server", "v3.daemon", "v3.worker", "v3.rpc", "v3.rpc_ext",
         "brain.memory_service", "brain.memory_editor", "brain.memory_consolidator", "brain.activation",
+        "brain.write_gate", "brain.write_router",
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",
         "gateway.mcp_stdio", "gateway.http_adapter", "gateway.mcp_server",
         "gateway.tool_catalog", "gateway.bridge_launcher",

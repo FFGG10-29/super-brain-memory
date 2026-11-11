@@ -265,6 +265,7 @@ class _TimelinePageState extends State<TimelinePage> {
   static const List<String> _types = <String>[
     '全部', 'ingest', 'supersede', 'reinforce', 'tier_change',
     'consolidate', 'policy', 'tombstone', 'recall',
+    'overwrite', 'media_interaction',
   ];
   List<Map<String, dynamic>> _rows = <Map<String, dynamic>>[];
   String _type = '全部';

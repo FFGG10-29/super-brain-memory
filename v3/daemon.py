@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from brain.write_router import route_write
 from config import BrainConfig, get_config
 from main import build_app
 from v3.inbox import Inbox
@@ -157,12 +158,30 @@ class V3Daemon:
         self._worker_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # W2：同一 entity 的 overwrite 单调递增版本号（崩溃后由 journal 重建）
+        self._seq_lock = threading.Lock()
+        self._entity_seq: dict[str, int] = {}
         if auto_start:
             self.start()
 
     # ── 在线受理（不等待任何计算）────────────────────────────────────────
+    def _next_seq(self, entity_id: str) -> int:
+        with self._seq_lock:
+            if not self._entity_seq:
+                for item in self.journal.iter_events():
+                    if item.get("type") == "overwrite" and item.get("entity_id"):
+                        try:
+                            seq = int(item.get("seq") or 0)
+                        except (TypeError, ValueError):
+                            seq = 0
+                        key = str(item["entity_id"])
+                        self._entity_seq[key] = max(self._entity_seq.get(key, 0), seq)
+            self._entity_seq[entity_id] = self._entity_seq.get(entity_id, 0) + 1
+            return self._entity_seq[entity_id]
+
     def handle_event(self, content: str, *, agent_id: str = "default",
-                     namespace: str = "topic:default") -> dict[str, Any]:
+                     namespace: str = "topic:default", cognition: dict[str, Any] | None = None,
+                     event_type: str | None = None) -> dict[str, Any]:
         content = str(content).strip()
         if len(content) < 4:
             return {"accepted": False, "error": "content too short"}
@@ -172,11 +191,27 @@ class V3Daemon:
         ns = str(namespace or "topic:default")
         if not ns.startswith("topic:"):
             ns = "topic:default"
-        event = self.journal.append(content, agent_id=agent_id, namespace=ns)
+        decision = route_write(content=content, cognition=cognition, namespace=ns, config=self._config)
+        kind = event_type or ("overwrite" if decision["path"] == "overwrite" else "ingest")
+        # W2 / A3：overwrite 只带新 payload（content + cognition），不记旧 payload
+        extra: dict[str, Any] = {"cognition": dict(cognition or {})}
+        if kind == "overwrite":
+            entity_id = decision["entity_id"]
+            extra.update({
+                "entity_id": entity_id,
+                "seq": self._next_seq(entity_id),
+                "routing": decision,
+                "payload": {"content": content, "cognition": dict(cognition or {})},
+            })
+        elif kind == "media_interaction":
+            extra["payload"] = {"content": content, "agent_id": agent_id}
+        event = self.journal.append(content, agent_id=agent_id, namespace=ns,
+                                    event_type=kind, extra=extra)
         self.inbox.enqueue(event)
         self.alarm.ring(str(event["event_id"]))
         cost_ms = (time.perf_counter() - started) * 1000
-        return {"accepted": True, "event_id": event["event_id"], "ack_ms": round(cost_ms, 2)}
+        return {"accepted": True, "event_id": event["event_id"],
+                "event_type": kind, "ack_ms": round(cost_ms, 2)}
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
     def start(self, *, serve_http: bool = True, serve_ws: bool = True) -> None:
@@ -237,6 +272,8 @@ class V3Daemon:
                         str(body.get("content", "")),
                         agent_id=str(body.get("agent_id", "default")),
                         namespace=str(body.get("namespace", "topic:default")),
+                        cognition=(body.get("cognition")
+                                   if isinstance(body.get("cognition"), dict) else None),
                     )
                     self._send(202 if result.get("accepted") else 400, result)
                 elif path == "/v1/config":

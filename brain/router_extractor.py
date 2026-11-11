@@ -99,6 +99,12 @@ class RouterExtractor:
             payload["hyperedge"]["members"] = []
         # 外部 Agent 已完成理解，缺省置信度高于 LLM 抽取的 0.6
         payload.setdefault("confidence", 0.9)
+        # C6 / Q13：Agent 自报的 confidence 只作参考存 agent_confidence，
+        # 门控用 write_router 服务端重算后的值（由 hippocampus 注入 routing 决策）。
+        routing = payload.get("routing")
+        if isinstance(routing, dict):
+            payload["agent_confidence"] = payload.get("confidence", 0.9)
+            payload["confidence"] = float(routing.get("confidence", payload["confidence"]))
         extraction = self._from_payload(payload)
         # ★ 零 PAD 兜底已统一下沉到 _from_payload（覆盖 llm/rule/agent 全部来源），
         #   这里只负责把来源如实标为 "agent"。

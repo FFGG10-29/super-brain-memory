@@ -272,6 +272,33 @@ class UiConfig(BaseSettings):
     window_height: int = 900
 
 
+class MemoryTypeRoutingConfig(BaseSettings):
+    """W2 / P1：事务性内容覆盖式写入 vs 认知性内容可追溯写入。"""
+    model_config = SettingsConfigDict(env_prefix="ROUTING_")
+
+    enabled: bool = True                         # 总开关，false 时全部走现有 ingest+supersede
+    confidence_threshold: float = 0.8           # 低于阈值回退 fact（保留事件溯源）
+    transactional_types: list[str] = Field(
+        default_factory=lambda: ["code", "draft", "config", "artifact"]
+    )
+    logical_categories: list[str] = Field(
+        default_factory=lambda: ["draft", "config", "artifact"]
+    )                                            # 只写 payload.category，不改 MemoryType 枚举
+    confirm_user_chat_code_hours: int = 24      # R13：source=user_chat 且 24h 内覆盖需确认
+    working_context_max_bytes: int = 8000       # P1.4：代码原文不进长期记忆
+
+
+class ChatConfig(BaseSettings):
+    """W2 / A2：8769 聊天端口骨架（ChatEngine 本体在 W3 接入）。"""
+    model_config = SettingsConfigDict(env_prefix="CHAT_")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"                     # 默认仅本机；0.0.0.0 需显式开启
+    port: int = 8769
+    token_file: str = ""                        # chat 专用令牌，空则落 %APPDATA%/super-brain/chat_token.txt
+    session_ttl_sec: int = 86400
+
+
 class BrainConfig(BaseSettings):
     """全局组合根配置。"""
     # extra=ignore：.env 里的 MODEL_/SYNC_/GW_ 键由子模型消费，不应被顶层判为多余字段
@@ -294,6 +321,8 @@ class BrainConfig(BaseSettings):
     merge: MergeConfig = Field(default_factory=MergeConfig)
     activation: ActivationConfig = Field(default_factory=ActivationConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
+    memory_type_routing: MemoryTypeRoutingConfig = Field(default_factory=MemoryTypeRoutingConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
 
 
 # 单例配置（懒加载于 main.py）

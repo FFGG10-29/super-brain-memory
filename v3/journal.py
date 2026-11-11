@@ -40,11 +40,15 @@ class V3Journal:
         self._thread.start()
 
     def append(self, content: str, *, agent_id: str, namespace: str = "private",
-               extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        """阻塞直到本批 fsync 完成；返回事件（含 event_id）。"""
+               event_type: str = "ingest", extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """阻塞直到本批 fsync 完成；返回事件（含 event_id）。
+
+        W2：`event_type="overwrite"` 时，`extra` 应带 `entity_id / seq / cognition`，
+        且 payload 只含新内容（不带旧 payload）——状态 = 同一 entity 最后一条 overwrite。
+        """
         event = {
             "event_id": new_uuid7(),
-            "type": "ingest",
+            "type": event_type,
             "hlc": f"{int(time.time() * 1000)}:0:{self.device_id}",
             "agent_id": agent_id,
             "namespace": namespace,
@@ -112,9 +116,32 @@ class V3Journal:
         return str(events[-1]["event_id"]) if events else None
 
     def reconcile(self, inbox: Any) -> int:
-        """崩溃补齐：把 journal 里有、inbox 没有的事件重新入队（幂等）。"""
+        """崩溃补齐：把 journal 里有、inbox 没有的事件重新入队（幂等）。
+
+        W2 / A3：同一 `entity_id` 的多条 `overwrite` 只保留 **seq 最大** 的那条，
+        重放时"最后一个 overwrite 决定当前状态"，不依赖 HLC 跨设备全序；
+        事务性内容不跨设备同步，中间版本无需重放。
+        """
+        events = self.iter_events()
+        latest_seq: dict[str, int] = {}
+        for event in events:
+            if event.get("type") == "overwrite" and event.get("entity_id"):
+                key = str(event["entity_id"])
+                try:
+                    seq = int(event.get("seq") or 0)
+                except (TypeError, ValueError):
+                    seq = 0
+                latest_seq[key] = max(latest_seq.get(key, -1), seq)
         restored = 0
-        for event in self.iter_events():
+        for event in events:
+            if event.get("type") == "overwrite" and event.get("entity_id"):
+                key = str(event["entity_id"])
+                try:
+                    seq = int(event.get("seq") or 0)
+                except (TypeError, ValueError):
+                    seq = 0
+                if seq < latest_seq[key]:
+                    continue  # 中间版本，跳过
             if inbox.enqueue(event):
                 restored += 1
         return restored

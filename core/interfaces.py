@@ -56,13 +56,15 @@ Namespace = str
 Tier = Literal["buffer", "core", "recall", "archive"]
 Pyramid = Literal["raw", "fact", "topic", "worldview"]
 EventType = Literal[
-    "ingest",       # 写入
-    "supersede",    # 冲突失效
-    "reinforce",    # 召回强化
-    "tier_change",  # 晋升/降级
-    "consolidate",  # 金字塔升维 / 画像更新
-    "policy",       # 策略变更
-    "tombstone",    # 合规级删除标记
+    "ingest",             # 写入
+    "supersede",          # 冲突失效
+    "reinforce",          # 召回强化
+    "tier_change",        # 晋升/降级
+    "consolidate",        # 金字塔升维 / 画像更新
+    "policy",             # 策略变更
+    "tombstone",          # 合规级删除标记
+    "overwrite",          # W2：事务性内容覆盖式更新（只记最终态，带新 payload）
+    "media_interaction",  # W2：媒体交互 meta（不产生 neuron）
 ]
 TimeSeriesTable = Literal["pad_track", "access_log", "decay_event"]
 

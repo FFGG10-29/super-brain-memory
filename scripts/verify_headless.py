@@ -126,6 +126,36 @@ def main() -> int:
             time.sleep(0.5)
         check("Worker 消费后主库投影可见", bool(rows), f"{len(rows)} 条")
 
+        # W2 / P1：事务性代码连写 10 轮 → 10 条 overwrite 事件，最终只有 1 条 active
+        overwrite_count = 0
+        for revision in range(10):
+            status, ack = _request(
+                f"http://127.0.0.1:{HTTP_PORT}/v1/events",
+                {"content": f"def deploy_pipeline():\n    # revision {revision}\n    return {revision}",
+                 "agent_id": "verify", "namespace": "topic:proj",
+                 "cognition": {"memory_type": "code", "topic": "proj", "source": "agent"}},
+            )
+            overwrite_count += int(status == 202 and ack.get("event_type") == "overwrite")
+        check("P1 事务性写入分流到 overwrite 事件",
+              overwrite_count == 10, f"{overwrite_count}/10 条")
+        # 等 Worker 消费完（最多 15s）：连续 3 次都是 1 条 active 才算稳定
+        code_rows: list[dict] = []
+        stable = 0
+        for _ in range(30):
+            _, data = _request(f"http://127.0.0.1:{HTTP_PORT}/v1/memories?limit=100")
+            rows_now = [row for row in data.get("memories", [])
+                        if str(row.get("content", "")).startswith("def deploy_pipeline")]
+            if len(rows_now) == 1 and rows_now == code_rows:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+            code_rows = rows_now
+            time.sleep(0.5)
+        check("P1 十轮代码只留最新 active", len(code_rows) == 1,
+              f"active={len(code_rows)} 版本={code_rows[0].get('content', '')[-12:] if code_rows else '—'}")
+
         async def ws_checks() -> None:
             import websockets
 

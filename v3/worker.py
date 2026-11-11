@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import uuid
@@ -13,6 +14,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
 from brain.write_gate import WriteGate, WriteRequest
+from brain.write_router import normalized_signature
 
 __all__ = ["V3Worker"]
 
@@ -49,6 +51,14 @@ class V3Worker:
         event_id = str(row["event_id"])
         try:
             payload = json.loads(str(row.get("payload") or "{}"))
+            kind = str(payload.get("type") or "ingest")
+            # R15：媒体交互只记 meta、直接完成，绝不产生 neuron
+            if kind == "media_interaction":
+                self._inbox.finish(event_id, self.worker_id, ok=True)
+                return
+            # R19：覆盖式事件必须走专用分支，不能落到通用 remember() 的合并裁决
+            if kind == "overwrite":
+                return self._handle_overwrite(payload, row, event_id)
             legacy = payload.get("legacy_neuron")
             if isinstance(legacy, dict) and legacy.get("id"):
                 # v2 迁移事件：原样落投影并保留双时态/PAD，再让 outbox 重建派生库
@@ -108,6 +118,61 @@ class V3Worker:
             self._inbox.finish(event_id, self.worker_id, ok=False, error=f"{type(exc).__name__}: {exc}")
             if self._hub is not None:
                 self._hub.broadcast({"type": "node_failed", "event_id": event_id, "error": str(exc)[:200]})
+
+    def _handle_overwrite(self, event: dict[str, Any], row: dict[str, Any],
+                          event_id: str) -> None:
+        """W2 / A8+R19：覆盖式事件重放 —— 直接调 overwrite_remember，跳过通用路径。"""
+        try:
+            inner = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            content = str(inner.get("content") or row.get("content") or "")
+            cognition = inner.get("cognition") if isinstance(inner.get("cognition"), dict) else {}
+            routing = event.get("routing") if isinstance(event.get("routing"), dict) else None
+            if not isinstance(routing, dict) or routing.get("path") != "overwrite":
+                # 旧事件 / 崩溃窗口里缺 routing：按 entity_id 或签名补一个最小决策，
+                # 保证「同一 entity 最后一条 overwrite 决定当前状态」仍成立。
+                signature, fuzzy = normalized_signature(content)
+                entity_id = str(event.get("entity_id") or "") or hashlib.sha1(
+                    f"{row.get('namespace')}|{signature}".encode("utf-8", "replace")
+                ).hexdigest()
+                routing = {
+                    "path": "overwrite", "entity_id": entity_id, "confidence": 0.9,
+                    "agent_confidence": 0.9, "category": "", "signature": signature,
+                    "entity_fuzzy": fuzzy, "routing_fallback": False,
+                }
+            result = self._execute(lambda: self._app.hippocampus.overwrite_remember(
+                content,
+                agent_id=str(row.get("agent_id") or "default"),
+                namespace=str(row.get("namespace") or "topic:default"),
+                cognition=cognition, routing=routing, skip_consolidator=True,
+            ))
+            ok = self._inbox.finish(event_id, self.worker_id, ok=True)
+            if not ok:
+                return  # 租约被抢，防双花
+            self.processed += 1
+            if self._hub is not None:
+                self._hub.broadcast({
+                    "type": "node_created" if result.applied else "node_rejected",
+                    "event_id": event_id,
+                    "event_type": "overwrite",
+                    "id": result.neuron.uuid7_id,
+                    "content": result.neuron.content,
+                    "memory_type": result.neuron.memory_type,
+                    "tier": result.neuron.tier,
+                    "pad": result.neuron.pad.as_tuple(),
+                    "entity_id": routing.get("entity_id", ""),
+                    "seq": event.get("seq", 0),
+                    "superseded": result.superseded,
+                    "merge": "overwrite",
+                })
+        except FutureTimeout:
+            return  # Q26：靠 lease 回收，不 mark failed
+        except Exception as exc:  # noqa: BLE001
+            self.failed += 1
+            self._inbox.finish(event_id, self.worker_id, ok=False,
+                               error=f"{type(exc).__name__}: {exc}")
+            if self._hub is not None:
+                self._hub.broadcast({"type": "node_failed", "event_id": event_id,
+                                     "error": str(exc)[:200]})
 
     # ── 常驻循环 ──────────────────────────────────────────────────────────
     def run(self) -> None:

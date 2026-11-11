@@ -39,7 +39,22 @@ from gateway.registry import AgentRegistry
 from main import build_app
 from v3.daemon import V3Daemon
 
-__all__ = ["HeadlessServer", "create_server", "serve"]
+__all__ = ["HeadlessServer", "create_server", "ensure_chat_token", "serve"]
+
+
+def ensure_chat_token(path: str | None = None) -> str:
+    """A2 / Q22：chat 专用令牌，持久在文件里，绝不复用 MCP 的 Bridge 令牌。"""
+    from core.runtime_paths import user_dir
+
+    token_path = Path(path) if path else user_dir() / "chat_token.txt"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    if token_path.exists():
+        existing = token_path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    token = secrets.token_urlsafe(24)
+    token_path.write_text(token, encoding="utf-8")
+    return token
 
 
 class HeadlessServer:
@@ -96,6 +111,11 @@ class HeadlessServer:
         self.shutdown_event = threading.Event()
         self.daemon.shutdown_callback = self.request_shutdown
         self._wal_thread: threading.Thread | None = None
+        # A2 / W2：8769 聊天端口骨架（ChatEngine 本体在 W3 接入）
+        self.chat_token = ensure_chat_token(self.config.chat.token_file or None)
+        if str(self.config.chat.host) not in ("127.0.0.1", "localhost", ""):
+            print(f"[警告] 8769 已暴露到局域网（{self.config.chat.host}），传输为明文；"
+                  "仅使用 chat 专用令牌，不复用 Bridge 令牌")
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
         """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""
@@ -164,6 +184,8 @@ class HeadlessServer:
             "ws_url": f"ws://127.0.0.1:{self.daemon.hub.port}/ws",
             "root": str(self.root),
             "stdio_launcher": str(launcher) if launcher else "",
+            "chat_host": str(self.config.chat.host),
+            "chat_port": int(self.config.chat.port),
         }
 
     def restart_kernel(self) -> dict[str, Any]:
@@ -274,7 +296,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mcp-port", type=int, default=None, help="默认取 config.gateway.http_port（8766）")
     parser.add_argument("--fast", action="store_true", help="v3 Worker 跳过 LLM 抽取（批量导入更快）")
     parser.add_argument("--no-circadian", action="store_true", help="不启动昼夜巩固调度")
+    parser.add_argument("--chat-host", default=None,
+                        help="8769 绑定地址（默认 127.0.0.1；0.0.0.0 显式开启局域网）")
+    parser.add_argument("--chat-port", type=int, default=None, help="8769 聊天端口")
+    parser.add_argument("--chat-token-file", default=None,
+                        help="chat 专用令牌文件；暴露到局域网时必须显式指定")
     args = parser.parse_args(argv)
+    from config import get_config
+
+    cfg = get_config()
+    chat_host = args.chat_host or cfg.chat.host
+    if chat_host not in ("127.0.0.1", "localhost") and not args.chat_token_file:
+        parser.error("暴露到局域网（--chat-host 0.0.0.0）时必须同时指定 --chat-token-file")
+    cfg.chat.host = chat_host
+    if args.chat_port is not None:
+        cfg.chat.port = args.chat_port
+    if args.chat_token_file:
+        cfg.chat.token_file = args.chat_token_file
     server = HeadlessServer(
         root=args.root, http_port=args.http_port, ws_port=args.ws_port,
         mcp_port=args.mcp_port, use_llm=not args.fast, circadian=not args.no_circadian,

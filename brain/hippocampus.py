@@ -34,6 +34,7 @@ from brain.amygdala import Amygdala
 from brain.router_extractor import ExtractedRelation, Extraction, RouterExtractor
 from brain.synaptic_plasticity import SynapticPlasticity
 from brain.thalamus import Admission, Thalamus
+from brain.write_router import route_write
 
 __all__ = ["Hippocampus", "WriteResult"]
 
@@ -118,6 +119,18 @@ class Hippocampus:
             namespace = _topic if _topic.startswith("topic:") else f"topic:{_topic}"
         elif not str(namespace or "").startswith("topic:"):
             namespace = "topic:default"
+        # ★ W2 / P1：事务性内容（code / draft / config / artifact）自动走覆盖式写入。
+        #   同步返回 WriteResult 的语义不变（Q1③ 否掉了改 202 的方案），
+        #   只是内部转调独立的 overwrite_remember()，不污染既有认知性写入路径。
+        decision = route_write(
+            content=content, cognition=cognition, namespace=namespace, config=self._config,
+        )
+        if decision["path"] == "overwrite":
+            return self.overwrite_remember(
+                content, agent_id=agent_id, namespace=namespace,
+                cognition=cognition, routing=decision,
+                device_id=device_id, now_ms=now_ms,
+            )
         # ★ 认知契约：调用方（WorkBuddy 等）已给出结构化抽取结果时直接采信，
         #   不再调用 Qwen3-0.6B 做分类 / PAD / 实体抽取。
         #   cognition 缺省时行为与旧版完全一致。
@@ -217,6 +230,122 @@ class Hippocampus:
         if emit_event:
             self._emit_event(neuron, extraction, result)
         return result
+
+    def overwrite_remember(
+        self,
+        content: str,
+        *,
+        agent_id: str,
+        namespace: str = "private",
+        cognition: dict | None = None,
+        routing: dict | None = None,
+        device_id: str | None = None,
+        now_ms: int | None = None,
+        skip_consolidator: bool = True,
+    ) -> WriteResult:
+        """W2 / A8：事务性内容覆盖式写入（独立方法，绝不经过 `_consolidator.decide()`）。
+
+        单向安全顺序（P1.3）：主库旧记录 `is_active=0` → 派生库物理删除 → 写新记录。
+        中途崩溃最多留下「旧已封存、派生残留」，`is_active` 预过滤会挡住残留，
+        下次投影重建时清理；反过来先删派生库会留下「主库有旧、派生已删」的不一致。
+
+        A3：这里**不写任何 journal**。v3 事件日志由受理链路（`V3Daemon.handle_event`）
+        负责，且事务性内容不投影到 sync 平面（覆盖式语义不该跨设备重放）。
+        """
+        _ = skip_consolidator  # A8/R19：独立方法天然不经过合并裁决，参数仅显式标记调用意图
+        cog = dict(cognition or {})
+        decision = routing or route_write(
+            content=content, cognition=cog, namespace=namespace, config=self._config,
+        )
+        entity_id = str(decision.get("entity_id") or "")
+        if decision.get("path") != "overwrite" or not entity_id:
+            raise ValueError("overwrite_remember 需要有效的 overwrite 路由决策")
+
+        # 构造 neuron 的流程与 remember 一致，但完全跳过语义合并裁决
+        extraction = self._extractor.from_agent({**cog, "routing": decision})
+        affect = self._amygdala.ingest(agent_id, extraction.pad, now_ms=now_ms)
+        neuron = self._extractor.to_neuron(
+            content, extraction,
+            device_id=device_id or self._config.sync.device_id,
+            agent_id=agent_id,
+            namespace=namespace,
+            transaction_from=self._clock.tick().to_token(),
+        )
+        neuron = neuron.model_copy(update={
+            "pad": self._amygdala.refine(extraction.pad),
+            "affinity": affect.affinity,
+            "valid_from_ms": int(now_ms) if now_ms is not None else neuron.valid_from_ms,
+        })
+        admission = self._thalamus.admit(neuron, now_ms=now_ms)
+        if not admission.accepted:
+            return WriteResult(neuron=neuron, admission=admission, applied=False)
+
+        # ① 旧记录：主库封存（双时态打点）
+        old_id: str | None = None
+        try:
+            raw = self._kv.get("entity", entity_id)
+            if raw:
+                old_id = bytes(raw).decode("utf-8", "replace")
+        except (OSError, TypeError, ValueError):
+            old_id = None
+        superseded: list[str] = []
+        if old_id:
+            # deactivate 内部会调 tx_to.to_token()，这里必须传 HLCStamp 对象而非字符串
+            self._relational.deactivate(
+                "neuron", old_id,
+                valid_to_ms=neuron.valid_from_ms,
+                tx_to=self._clock.tick(),
+            )
+            superseded.append(old_id)
+            # ② 派生库物理删除（向量 / 旁路索引）；FTS5 由主库 deactivate 联动
+            try:
+                self._vector.delete([old_id])
+            except Exception:  # noqa: BLE001  向量库不可用时由投影重建兜底
+                pass
+            try:
+                self._kv.delete("meta", old_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ③ 写新记录 + 派生投影
+        self._relational.upsert("neuron", neuron.to_record())
+        self._append_pad_track(neuron, source=extraction.source, now_ms=now_ms)
+        warnings: list[str] = []
+        for target in _TARGETS:
+            self._relational.outbox_enqueue(
+                event_id=neuron.uuid7_id,
+                target=target,
+                payload={"neuron": neuron.to_record(), "extraction": _extraction_record(extraction)},
+            )
+        self.dispatch_outbox(warnings=warnings)
+
+        # ④ entity 索引 + seq（A3 定序用）+ 分区元数据
+        try:
+            import json as _json
+
+            seq = int(self._kv.get("entity_seq", entity_id) or b"0") + 1
+            self._kv.put("entity_seq", entity_id, str(seq).encode("utf-8"))
+            self._kv.put("entity", entity_id, neuron.uuid7_id.encode("utf-8"))
+            meta = {
+                "topic": str(cog.get("topic") or ""),
+                "layer": str(cog.get("layer") or "fact"),
+                "source": str(cog.get("source") or "agent"),
+                "category": decision.get("category", ""),
+                "entity_id": entity_id,
+                "entity_seq": seq,
+                "entity_fuzzy": bool(decision.get("entity_fuzzy")),
+                "agent_confidence": decision.get("agent_confidence"),
+                "routing_fallback": bool(decision.get("routing_fallback")),
+                "namespace": neuron.namespace,
+                "ts_ms": neuron.created_at_ms,
+            }
+            self._kv.put("meta", neuron.uuid7_id, _json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+        except (OSError, TypeError, ValueError) as exc:
+            warnings.append(f"entity 索引写入失败（不影响主记忆）：{exc}")
+        return WriteResult(
+            neuron=neuron, admission=admission, applied=True,
+            superseded=superseded, warnings=warnings, merge=None,
+        )
 
     def _emit_event(self, neuron: Neuron, extraction: Extraction, result: WriteResult) -> None:
         """写入事件日志：只有"跨设备值得同步"的写入才发事件（缓冲层不同步）。
