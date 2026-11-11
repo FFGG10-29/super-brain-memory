@@ -468,6 +468,33 @@ class CacheManager:
     def size(self, ns: str) -> int:
         return self._store(ns).size()
 
+    def snapshot_metrics(self) -> dict[str, Any]:
+        """前端缓存监控页：不清空地读当前 per-ns 聚合 + 条目数 + 配置开关。"""
+        with self._lock:
+            counters = {ns: dict(row) for ns, row in self._counters.items()}
+        block = getattr(self._config, "cache", None)
+        namespaces_cfg = dict(getattr(block, "namespaces", None) or {})
+        result: dict[str, Any] = {}
+        seen = set(counters) | set(namespaces_cfg) | set(self._stores)
+        for ns in sorted(seen):
+            cfg_ns = namespaces_cfg.get(ns) or {}
+            row = counters.get(ns, {"hits": 0, "misses": 0, "evictions": 0,
+                                    "invalidations": 0, "latency_us": 0.0})
+            lookups = row["hits"] + row["misses"]
+            result[ns] = {
+                "enabled": bool(self._enabled(ns)),
+                "media": cfg_ns.get("media", "memory"),
+                "capacity": int(cfg_ns.get("capacity", 512)),
+                "entries": self._store(ns).size() if self._enabled(ns) else 0,
+                "hits": int(row["hits"]),
+                "misses": int(row["misses"]),
+                "hit_rate": round(row["hits"] / lookups, 4) if lookups else 0.0,
+                "evictions": int(row["evictions"]),
+                "invalidations": int(row["invalidations"]),
+                "avg_latency_us": round(row["latency_us"] / lookups, 1) if lookups else 0.0,
+            }
+        return {"enabled": bool(getattr(block, "enabled", True)), "namespaces": result}
+
     # ── 指标（C0.3：命中率/延迟进 DuckDB cache_metrics）──────────────────
     def _count(self, ns: str) -> dict[str, float]:
         with self._lock:

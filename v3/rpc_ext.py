@@ -649,6 +649,57 @@ class RpcExtension:
             "pad": list(state.as_tuple()) if state is not None else None,
         }
 
+    # ── 前端监控页：号池状态与缓存使用情况（全真数据，无桩）──────────────
+    def _pool_status(self, **_: Any) -> dict[str, Any]:
+        try:
+            from gateway.model_router import get_model_router
+
+            router = get_model_router()
+        except Exception:  # noqa: BLE001  路由未装配时按未启用展示
+            router = None
+        pool = getattr(router, "_account_pool", None)
+        cfg = getattr(self._daemon, "_config", None)
+        pool_cfg = getattr(cfg, "account_pool", None) if cfg is not None else None
+        now = time.time()
+        accounts = []
+        for account in (getattr(pool, "accounts", None) or []):
+            accounts.append({
+                "id": account.account_id(),
+                "label": account.label(),
+                "region": account.region,
+                "dead": now < account.dead_until,
+                "dead_remaining_sec": max(0, round(account.dead_until - now)),
+                "model_cooldowns": {key: max(0, round(value - now))
+                                    for key, value in account.cooldowns.items()
+                                    if value > now},
+            })
+        return {
+            "ok": True,
+            "enabled": bool(getattr(pool_cfg, "enabled", False)),
+            "free_lane": bool(getattr(pool_cfg, "free_lane", False)),
+            "default_model": str(getattr(pool_cfg, "default_model", "") or ""),
+            "account_count": len(accounts),
+            "accounts": accounts,
+            "in_router": pool is not None,
+        }
+
+    def _cache_metrics(self, **_: Any) -> dict[str, Any]:
+        from core.cache_manager import get_cache_manager
+
+        manager = get_cache_manager()
+        if manager is None:
+            return {"ok": True, "available": False}
+        return {"ok": True, "available": True, **manager.snapshot_metrics()}
+
+    def _chat_token(self, **_: Any) -> dict[str, Any]:
+        """前端聊天入口测试页取 chat 专用令牌（8767 管理端同机可信）。"""
+        try:
+            from headless_server import ensure_chat_token
+
+            return {"ok": True, "token": ensure_chat_token()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
     def _mirror_persona(self, params: dict[str, Any]) -> None:
         """镜像到 LMDB kv persona/fish/params，供 AstrBot 侧读取生成提示词。"""
