@@ -1,0 +1,311 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import 'brain_client.dart';
+import 'chat_service.dart';
+
+/// 聊天入口测试页 —— 微信风格（浅色、绿/白气泡、顶栏"大肥鱼"）。
+/// 数据全部来自 8769 真实通道：hello 鉴权、typing、reply、error 帧。
+class ChatPage extends StatefulWidget {
+  const ChatPage({super.key, required this.client});
+
+  final BrainClient client;
+
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  final TextEditingController _input = TextEditingController();
+  final ScrollController _scroll = ScrollController();
+  final List<_Msg> _messages = <_Msg>[];
+  ChatService? _service;
+  ChatLinkState _link = ChatLinkState.disconnected;
+  String _tokenError = '';
+  bool _typing = false;
+  StreamSubscription<Map<String, dynamic>>? _framesSub;
+  StreamSubscription<ChatLinkState>? _stateSub;
+
+  static const Color _bg = Color(0xFFEDEDED);
+  static const Color _bar = Color(0xFFEDEDED);
+  static const Color _mine = Color(0xFF95EC69);
+  static const Color _other = Color(0xFFFFFFFF);
+  static const Color _text = Color(0xFF191919);
+  static const Color _hint = Color(0xFF9B9B9B);
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_boot());
+  }
+
+  Future<void> _boot() async {
+    try {
+      final data = await widget.client.call('chat.token', <String, dynamic>{});
+      final token = (data is Map && data['ok'] == true)
+          ? (data['token'] ?? '').toString()
+          : '';
+      if (token.isEmpty) {
+        setState(() => _tokenError =
+            'chat 令牌获取失败：${data is Map ? (data['error'] ?? '令牌为空') : '响应异常'}');
+        return;
+      }
+      final service = ChatService();
+      _service = service;
+      _framesSub = service.frames.listen(_onFrame);
+      _stateSub = service.states.listen((state) {
+        if (mounted) setState(() => _link = state);
+      });
+      await service.connect(token);
+    } catch (error) {
+      if (mounted) setState(() => _tokenError = '连接失败：$error');
+    }
+  }
+
+  void _onFrame(Map<String, dynamic> frame) {
+    final type = frame['type'];
+    if (type == 'typing') {
+      final state = frame['state'];
+      if (mounted) setState(() => _typing = state != false);
+    } else if (type == 'reply') {
+      if (mounted) {
+        setState(() {
+          _typing = false;
+          _messages.add(_Msg(
+              text: (frame['text'] ?? '').toString(),
+              mine: false,
+              model: (frame['model'] ?? '').toString(),
+              kind: (frame['provider_kind'] ?? '').toString(),
+              fallback: frame['fallback']));
+        });
+        unawaited(_scrollDown());
+      }
+    } else if (type == 'error') {
+      if (mounted) {
+        setState(() {
+          _typing = false;
+          _messages.add(_Msg(text: (frame['message'] ?? '出错了').toString(),
+              mine: false, model: '', kind: 'error', fallback: null));
+        });
+        unawaited(_scrollDown());
+      }
+    }
+  }
+
+  Future<void> _scrollDown() async {
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+    if (_scroll.hasClients) {
+      await _scroll.animateTo(_scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+    }
+  }
+
+  void _send() {
+    final text = _input.text.trim();
+    if (text.isEmpty || _service == null) return;
+    _service!.sendMessage(text);
+    setState(() {
+      _messages.add(_Msg(text: text, mine: true, model: '', kind: '', fallback: null));
+      _typing = true;
+      _input.clear();
+    });
+    unawaited(_scrollDown());
+  }
+
+  String _linkText() {
+    switch (_link) {
+      case ChatLinkState.connected:
+        return '已连接';
+      case ChatLinkState.connecting:
+      case ChatLinkState.reconnecting:
+        return '连接中…';
+      case ChatLinkState.disconnected:
+        return _tokenError.isEmpty ? '已断开' : _tokenError;
+    }
+  }
+
+  Color _linkColor() {
+    switch (_link) {
+      case ChatLinkState.connected:
+        return const Color(0xFF07C160);
+      case ChatLinkState.connecting:
+      case ChatLinkState.reconnecting:
+        return _hint;
+      case ChatLinkState.disconnected:
+        return const Color(0xFFE64340);
+    }
+  }
+
+  // 微信风格气泡：自己绿色靠右、对方白色靠左，圆角 8 带小尖角感。
+  Widget _bubble(_Msg msg) {
+    final mine = msg.mine;
+    final tags = <String>[
+      if (!mine && msg.model.isNotEmpty) msg.model,
+      if (!mine && msg.kind.isNotEmpty) msg.kind,
+      if (msg.fallback != null && msg.fallback != false) '兜底回复',
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+      child: Row(
+        mainAxisAlignment:
+            mine ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          if (!mine) _avatar(mine),
+          if (!mine) const SizedBox(width: 8),
+          Flexible(
+            child: Container(
+              constraints: const BoxConstraints(maxWidth: 280),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+              decoration: BoxDecoration(
+                color: msg.kind == 'error'
+                    ? const Color(0xFFFDE7E7)
+                    : (mine ? _mine : _other),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                Text(msg.text,
+                    style: const TextStyle(color: _text, fontSize: 15, height: 1.35)),
+                if (tags.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(tags.join(' · '),
+                        style: const TextStyle(color: _hint, fontSize: 10)),
+                  ),
+              ]),
+            ),
+          ),
+          if (mine) const SizedBox(width: 8),
+          if (mine) _avatar(mine),
+        ],
+      ),
+    );
+  }
+
+  Widget _avatar(bool mine) => CircleAvatar(
+        radius: 18,
+        backgroundColor: mine ? const Color(0xFF07C160) : const Color(0xFF4A90D9),
+        child: Text(mine ? '我' : '🐟',
+            style: const TextStyle(color: Colors.white, fontSize: 13)),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _bg,
+      appBar: AppBar(
+        backgroundColor: _bar,
+        elevation: 0.5,
+        centerTitle: true,
+        title: Column(children: <Widget>[
+          const Text('大肥鱼',
+              style: TextStyle(color: _text, fontSize: 17)),
+          Text(_linkText(),
+              style: TextStyle(color: _linkColor(), fontSize: 10)),
+        ]),
+        iconTheme: const IconThemeData(color: _text),
+      ),
+      body: Column(children: <Widget>[
+        Expanded(
+          child: ListView(
+            controller: _scroll,
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            children: <Widget>[
+              ..._messages.map(_bubble),
+              if (_typing)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+                  child: Row(children: <Widget>[
+                    _avatar(false),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: _other,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Text('大肥鱼思考中…',
+                          style: TextStyle(color: _hint, fontSize: 14)),
+                    ),
+                  ]),
+                ),
+            ],
+          ),
+        ),
+        // 底部输入栏（微信风：白底 + 绿色发送按钮）
+        Container(
+          color: const Color(0xFFF7F7F7),
+          padding: EdgeInsets.only(
+              left: 10, right: 10, top: 6,
+              bottom: 6 + MediaQuery.of(context).padding.bottom),
+          child: Row(children: <Widget>[
+            Expanded(
+              child: TextField(
+                controller: _input,
+                style: const TextStyle(color: _text, fontSize: 15),
+                decoration: InputDecoration(
+                  hintText: '说点什么…',
+                  hintStyle: const TextStyle(color: _hint, fontSize: 14),
+                  filled: true,
+                  fillColor: Colors.white,
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      borderSide: const BorderSide(color: Color(0xFFDDDDDD))),
+                  focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(6),
+                      borderSide: const BorderSide(color: Color(0xFF07C160))),
+                ),
+                onSubmitted: (_) => _send(),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Material(
+              color: const Color(0xFF07C160),
+              borderRadius: BorderRadius.circular(6),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: _send,
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Text('发送',
+                      style: TextStyle(color: Colors.white, fontSize: 14)),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  @override
+  void dispose() {
+    _framesSub?.cancel();
+    _stateSub?.cancel();
+    _service?.dispose();
+    _input.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+}
+
+class _Msg {
+  const _Msg({
+    required this.text,
+    required this.mine,
+    required this.model,
+    required this.kind,
+    required this.fallback,
+  });
+
+  final String text;
+  final bool mine;
+  final String model;
+  final String kind;
+  final Object? fallback;
+}

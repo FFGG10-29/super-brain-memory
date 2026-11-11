@@ -503,6 +503,13 @@ class BrainClient {
   Future<Map<String, dynamic>> resetConfig() async => _asMap(await call('config.reset'));
   Future<Map<String, dynamic>> gatewayStatus() async => _asMap(await call('gateway.status'));
 
+  // ── 前端监控页：号池状态与缓存使用情况（后端 pool.status / cache.metrics）──
+  Future<Map<String, dynamic>> poolStatus() async =>
+      _asMap(await call('pool.status'));
+
+  Future<Map<String, dynamic>> cacheMetrics() async =>
+      _asMap(await call('cache.metrics'));
+
   // ── W9 / C4：叙事 / 扩散 / 当前 PAD 可视化 ────────────────────────────
   Future<Map<String, dynamic>> narrativeList({int limit = 50}) async =>
       _asMap(await call('narrative.list', <String, dynamic>{'limit': limit}));

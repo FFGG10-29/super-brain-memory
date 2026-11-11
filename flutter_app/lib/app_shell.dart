@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 import 'analytics.dart';
 import 'backend_launcher.dart';
 import 'brain_client.dart';
+import 'ai_space_page.dart';
+import 'cache_page.dart';
+import 'chat_page.dart';
 import 'context_pages.dart';
 import 'narrative_page.dart';
+import 'pool_page.dart';
 import 'nebula_page.dart';
 import 'pages.dart';
 import 'pages_extra.dart';
@@ -72,6 +76,10 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '技能管理', 'icon': Icons.auto_awesome_outlined},
     <String, Object>{'name': '人格设定', 'icon': Icons.pets_outlined},
     <String, Object>{'name': '叙事洞察', 'icon': Icons.auto_stories},
+    <String, Object>{'name': '大肥鱼聊天', 'icon': Icons.chat_bubble_outline},
+    <String, Object>{'name': '号池网关', 'icon': Icons.dns_outlined},
+    <String, Object>{'name': '缓存监控', 'icon': Icons.speed_outlined},
+    <String, Object>{'name': 'AI 空间', 'icon': Icons.person_outline},
   ];
 
   /// 主导航分组：左栏只显示 7 个入口，组内子页放到顶栏下方的子导航条。
@@ -79,9 +87,9 @@ class _AppShellState extends State<AppShell> {
   static const List<Map<String, Object>> _groups = <Map<String, Object>>[
     <String, Object>{'name': '星云视图', 'icon': Icons.blur_on, 'pages': <int>[0]},
     <String, Object>{'name': '记忆工作台', 'icon': Icons.memory, 'pages': <int>[1, 2, 14]},
-    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 23, 24]},
+    <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 23, 24, 28]},
     <String, Object>{'name': 'Agent 上下文', 'icon': Icons.psychology_outlined, 'pages': <int>[18, 19, 20, 21, 22]},
-    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9]},
+    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9, 25, 26, 27]},
     <String, Object>{'name': '系统设置', 'icon': Icons.tune, 'pages': <int>[11, 15, 16, 10]},
     <String, Object>{'name': '关于', 'icon': Icons.info_outline, 'pages': <int>[17]},
   ];
@@ -244,6 +252,10 @@ class _AppShellState extends State<AppShell> {
       SkillsPage(client: _client),
       PersonaPage(client: _client),
       NarrativeInsightPage(client: _client),
+      ChatPage(client: _client),
+      PoolPage(client: _client),
+      CachePage(client: _client),
+      AiSpacePage(client: _client),
     ];
     return <Widget>[
       for (var i = 0; i < pages.length; i++)

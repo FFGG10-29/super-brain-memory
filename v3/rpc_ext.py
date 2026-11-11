@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 __all__ = ["RpcExtension"]
@@ -699,6 +700,94 @@ class RpcExtension:
             return {"ok": True, "token": ensure_chat_token()}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # ── AI 空间（QQ 风格个人主页：资料/签名/动态/日记，数据源=超大脑本体）──
+    def _ai_narratives(self, limit: int = 30, **_: Any) -> list[dict[str, Any]]:
+        """owner=ai_narrative 的叙事 neuron（AI 的日记与动态数据源）。"""
+        app = self._daemon.app
+        out: list[dict[str, Any]] = []
+        if app is None:
+            return out
+        import json as _json
+
+        try:
+            for key, raw in app.storage.kv.scan_prefix("meta", "", limit=3000):
+                try:
+                    meta = _json.loads(bytes(raw).decode("utf-8"))
+                except (ValueError, TypeError):
+                    continue
+                if meta.get("owner") != "ai_narrative":
+                    continue
+                record = app.storage.relational.get("neuron", key)
+                if record is None:
+                    continue
+                out.append({
+                    "id": str(key),
+                    "text": str(record.get("content") or ""),
+                    "ts_ms": int(meta.get("ts_ms") or 0),
+                    "topic": str(meta.get("topic") or ""),
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        out.sort(key=lambda item: item["ts_ms"], reverse=True)
+        return out[: max(1, int(limit))]
+
+    def _ai_profile(self, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        signature = ""
+        if app is not None:
+            try:
+                raw = app.storage.kv.get("ai_space", "signature")
+                signature = bytes(raw).decode("utf-8", "replace") if raw else ""
+            except (OSError, TypeError, ValueError):
+                signature = ""
+        entries = self._ai_narratives(limit=200)
+        return {
+            "ok": True,
+            "nickname": "大肥鱼",
+            "avatar_emoji": "🐟",
+            "signature": signature,
+            "diary_count": len(entries),
+        }
+
+    def _ai_diary(self, limit: int = 30, **_: Any) -> dict[str, Any]:
+        """日记 = AI 第一人称叙事 neuron（巩固窗口产出，真实记忆）。"""
+        return {"ok": True, "entries": self._ai_narratives(limit=limit)}
+
+    def _ai_moments(self, limit: int = 10, **_: Any) -> dict[str, Any]:
+        """动态 = 最近的事件骨架时间线（hyperedge 真实事件）。"""
+        app = self._daemon.app
+        rows: list[dict[str, Any]] = []
+        if app is not None:
+            try:
+                from storage.hypergraph_db import GraphHypergraph
+
+                view = GraphHypergraph(app.storage.graph,
+                                       relational=app.storage.relational)
+                for row in app.storage.relational.query(
+                        "hyperedge", limit=int(limit), since_ms=0):
+                    hid = str(row.get("id") or "")
+                    rows.append({
+                        "id": hid,
+                        "label": str(row.get("label") or "一件事"),
+                        "ts_ms": int(row.get("occurred_at_ms") or 0),
+                        "text": view.get_event_skeleton(hid),
+                    })
+            except Exception:  # noqa: BLE001
+                pass
+        rows.sort(key=lambda item: item["ts_ms"], reverse=True)
+        return {"ok": True, "moments": rows[: max(1, int(limit))]}
+
+    def _ai_signature_write(self, signature: str = "", **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪"}
+        try:
+            app.storage.kv.put("ai_space", "signature",
+                               str(signature)[:120].encode("utf-8"))
+            return {"ok": True, "signature": str(signature)[:120]}
+        except (OSError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
     def _mirror_persona(self, params: dict[str, Any]) -> None:
