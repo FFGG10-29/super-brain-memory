@@ -82,7 +82,9 @@ def test_neocortex_consolidation_is_traceable(brain_factory, brain_config, tmp_p
     second = brain.hippocampus.remember("本周架构评审确认了缓存方案", agent_id="agent-a")
 
     cortex = Neocortex(brain.storage.relational, config=brain_config)
-    topics = cortex.consolidate(namespace="private")
+    # A 包后 hippocampus 强制 topic:<id> 命名空间（无显式 topic 时落 topic:default），
+    # 旧断言里的 "private" 已不是实际落库值；此处只验证聚簇可追溯，不改变 neocortex 行为。
+    topics = cortex.consolidate(namespace="topic:default")
     assert topics, "同类型≥2 条应聚合出主题"
     assert {first.neuron.uuid7_id, second.neuron.uuid7_id}.issubset(set(topics[0].members))
     assert brain.storage.relational.get("hyperedge", topics[0].id) is not None  # 主题节点可追溯

@@ -100,7 +100,13 @@ def main() -> int:
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, headers,
         )
         tool_names = [item.get("name") for item in (tools.get("result") or {}).get("tools", [])]
-        check("MCP tools/list 六工具", status == 200 and len(tool_names) == 6, str(tool_names))
+        # 工具面由 gateway/tool_catalog.py 单一真源提供（v3.1.0 起 > 6 个），
+        # 这里只断言端点可用且核心 6 工具仍在，不锁死总数。
+        core_tools = {"save_memory", "recall_memory", "timeline_query",
+                      "profile_read", "conflict_report", "health_check"}
+        check("MCP tools/list（核心 6 工具齐备）",
+              status == 200 and core_tools.issubset(set(tool_names)),
+              f"{len(tool_names)} 个工具")
 
         status, accepted = _request(
             f"http://127.0.0.1:{HTTP_PORT}/v1/events",

@@ -27,6 +27,7 @@ stdio 是本机信任通道：agent_id 由客户端传入（用于区分 WorkBud
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sys
@@ -38,6 +39,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from brain.write_gate import WriteGate, WriteRequest
 from config import get_config
 from core.runtime_paths import local_bridge_path
 from core.structured_log import configure_logging
@@ -46,6 +48,23 @@ from main import build_app
 __all__ = ["build_server", "main"]
 
 _APP: Any = None
+# W1（Q17）：stdio 独占进程自建闸门单例（同进程单写者），常驻期间复用，退出前排空
+_WRITE_GATE: WriteGate | None = None
+
+
+def _get_write_gate() -> WriteGate:
+    global _WRITE_GATE
+    if _WRITE_GATE is None:
+        _WRITE_GATE = WriteGate()
+        atexit.register(_shutdown_write_gate)
+    return _WRITE_GATE
+
+
+def _shutdown_write_gate() -> None:
+    global _WRITE_GATE
+    if _WRITE_GATE is not None:
+        _WRITE_GATE.shutdown(timeout=5)
+        _WRITE_GATE = None
 
 
 def _get_app():
@@ -137,10 +156,12 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
         namespace = str(arguments.get("namespace") or "topic:default")
         cognition = arguments.get("cognition")
         cognition = cognition if isinstance(cognition, dict) else None
-        result = app.hippocampus.remember(
-            str(arguments["content"]), agent_id=agent_id,
-            namespace=namespace, cognition=cognition,
-        )
+        result = _get_write_gate().submit(WriteRequest(
+            fn=lambda: app.hippocampus.remember(
+                str(arguments["content"]), agent_id=agent_id,
+                namespace=namespace, cognition=cognition,
+            )
+        )).result(timeout=30)
         return {
             "applied": result.applied,
             "id": result.neuron.uuid7_id,

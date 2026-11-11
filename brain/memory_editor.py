@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from brain.write_gate import WriteGate, WriteRequest
 from core.errors import StorageError
 from core.ids import new_uuid7
 from models.neuron import Neuron
@@ -37,8 +38,12 @@ def _now() -> int:
 
 
 class MemoryEditor:
-    def __init__(self, *, app: Any) -> None:
-        """app 是 BrainApp；显式持有，避免模块级单例。"""
+    def __init__(self, *, app: Any, write_gate: WriteGate | None = None) -> None:
+        """app 是 BrainApp；显式持有，避免模块级单例。
+
+        W1（Q25）：传入共享 WriteGate 时，用户纠正/遗忘的写主库部分也经闸门串行化；
+        不传（测试 / 独立脚本）保持原直调语义。
+        """
         self._app = app
         self._relational = app.storage.relational
         self._vector = app.storage.vector
@@ -46,6 +51,7 @@ class MemoryEditor:
         self._journal = app.journal
         self._clock = app.clock
         self._hippocampus = app.hippocampus
+        self._write_gate = write_gate
 
     # ── 事件 ──────────────────────────────────────────────────────────────
     def _emit(self, kind: str, payload: dict[str, Any], *, agent_id: str = "user") -> str:
@@ -61,6 +67,22 @@ class MemoryEditor:
 
     # ── 纠正 ──────────────────────────────────────────────────────────────
     def correct(
+        self,
+        memory_id: str,
+        *,
+        changes: dict[str, Any],
+        actor: str = "user",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """闸门包装：写主库部分串行执行，实现体保持原样。"""
+        if self._write_gate is None:
+            return self._correct_impl(memory_id, changes=changes, actor=actor, reason=reason)
+        return self._write_gate.submit(WriteRequest(
+            fn=lambda: self._correct_impl(memory_id, changes=changes, actor=actor, reason=reason),
+            event_type="ingest",
+        )).result(timeout=30)
+
+    def _correct_impl(
         self,
         memory_id: str,
         *,
@@ -147,6 +169,22 @@ class MemoryEditor:
 
     # ── 封存 / 遗忘 ───────────────────────────────────────────────────────
     def forget(
+        self,
+        memory_id: str,
+        *,
+        actor: str = "user",
+        reason: str = "",
+        action: str = "forget",
+    ) -> dict[str, Any]:
+        """闸门包装：写主库部分串行执行，实现体保持原样。"""
+        if self._write_gate is None:
+            return self._forget_impl(memory_id, actor=actor, reason=reason, action=action)
+        return self._write_gate.submit(WriteRequest(
+            fn=lambda: self._forget_impl(memory_id, actor=actor, reason=reason, action=action),
+            event_type="tombstone",
+        )).result(timeout=30)
+
+    def _forget_impl(
         self,
         memory_id: str,
         *,

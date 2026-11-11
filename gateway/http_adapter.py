@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import hmac
 import json
-import queue
 import secrets
 import threading
 import time
-from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from brain.write_gate import WriteGate, WriteRequest
 from config import BrainConfig, get_config
 from gateway.mcp_server import MCPToolkit
 from gateway.registry import AgentRegistry
@@ -37,6 +36,7 @@ class HTTPAdapter:
         toolkit: MCPToolkit,
         config: BrainConfig | None = None,
         bridge_token: str = "",
+        write_gate: WriteGate | None = None,
     ) -> None:
         self._registry = registry
         self._toolkit = toolkit
@@ -46,34 +46,19 @@ class HTTPAdapter:
         self._bridge_token = bridge_token or secrets.token_urlsafe(24)
         self._bridge_agent_token: str | None = None
         self._mcp_sessions: dict[str, float] = {}
-        # 入口即闸门：所有 Agent 的工具调用先入队，再由**唯一的工作线程**逐个执行。
-        # 六引擎与 ONNX 会话都不是并发安全的；更重要是语义——记忆必须由中枢统一裁决
-        # （丘脑准入、去重、冲突消解），不能被多个请求穿插着直写存储。
-        self._jobs: queue.Queue = queue.Queue()
-        self._worker = threading.Thread(
-            target=self._consume, name="brain-tool-queue", daemon=True
-        )
-        self._worker.start()
+        # W1（Q17）：不再自建第二级队列，所有工具调用统一投递到 WriteGate 的唯一线程。
+        # 无头后端会注入共享实例；独立测试/stdio 场景缺省自建，串行语义不变。
+        self._write_gate = write_gate or WriteGate()
 
     # ── 入口队列（统一由中枢串行处理）──────────────────────────────────────
     @property
     def queue_depth(self) -> int:
-        """排队中的请求数（桌面状态栏可显示，便于观察多 Agent 争用）。"""
-        return self._jobs.qsize()
+        """排队中的请求数（状态栏可显示，便于观察多 Agent 争用）。"""
+        return self._write_gate.pending()
 
-    def _consume(self) -> None:
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                self._jobs.task_done()
-                return
-            tool, args, headers, future = job
-            try:
-                future.set_result(self._toolkit.call(tool, args, headers=headers))
-            except BaseException as exc:  # noqa: BLE001  异常必须回传给调用方，不能让请求悬空
-                future.set_exception(exc)
-            finally:
-                self._jobs.task_done()
+    def rebind_write_gate(self, write_gate: WriteGate) -> None:
+        """换核时替换闸门（W1：restart_kernel 用，避免跨类改私有属性）。"""
+        self._write_gate = write_gate
 
     # ── 本机桥接 ──────────────────────────────────────────────────────────
     @property
@@ -136,16 +121,30 @@ class HTTPAdapter:
             return self._chat_completions(body, headers)
         return 404, {"error": "not_found", "path": path}
 
+    # 写类工具 30s（正常写入 <1s，30s 只兜卡死）；读类含 recall_deep 30-45s，保留 300s
+    _WRITE_HINTS = (
+        "save", "set", "create", "update", "delete", "remove", "mutate", "write",
+        "forget", "correct", "import", "apply", "migrate", "trigger", "restart",
+        "shutdown", "enqueue", "archive", "restore", "feedback", "proposal",
+        "baseline", "autostart", "tray", "secrets", "topics_", "spaces_",
+        "memory_reclassify", "graph_real_edges", "persona_", "refine_",
+        "sync_once", "run_task", "client_config", "core_memory", "context_",
+    )
+
     def _call_tool(self, tool: str, args: dict, *, headers: dict) -> dict:
-        """入队并等待结果：并发请求自动排队，中枢按 FIFO 逐条处理。
+        """投递到 WriteGate 并等待结果：并发请求自动排队，中枢按 FIFO 逐条处理。
 
         工具里的异常必须转成结构化错误返回 —— 一旦抛出，BaseHTTPRequestHandler 会直接断开
         连接，客户端只能看到 WinError 10054 / RemoteDisconnected，连原因都拿不到。
+        这段 wrap 是既有修复，W1 只换队列、不简化它。
         """
-        future: Future = Future()
-        self._jobs.put((tool, args, headers, future))
+        timeout = 30 if tool.startswith(self._WRITE_HINTS) else 300
+        future = self._write_gate.submit(WriteRequest(
+            fn=lambda: self._toolkit.call(tool, args, headers=headers),
+            event_type="ingest" if timeout == 30 else "",  # 读类只借闸门串行化，不产生事件
+        ))
         try:
-            return future.result(timeout=300)
+            return future.result(timeout=timeout)
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__, "message": str(exc)[:500], "tool": tool}
 

@@ -143,6 +143,12 @@ class V3Daemon:
         # 保证 Kùzu 单写者 + 同一 SQLite 主库（数据目录天然统一）。
         self.app = app
         self.worker: V3Worker | None = None
+        # W1：由 HeadlessServer 注入共享 WriteGate；独立运行/stdio 时为 None，Worker 缺省自建
+        self.write_gate: Any | None = None
+        # 由 HeadlessServer 注入的钩子 / 由 RpcExtension 缓存的业务服务（显式声明，避免动态属性）
+        self.restart_kernel: Any | None = None
+        self.shutdown_callback: Any | None = None
+        self._memory_service: Any | None = None
         self.supervisor: ProcessSupervisor | None = None
         self._use_llm = use_llm
         self._http_port = http_port
@@ -178,9 +184,9 @@ class V3Daemon:
         if restored:
             self.hub.broadcast({"type": "reconciled", "count": restored})
         if self.worker_mode == "thread":
-            self.app = self.app or build_app(self._config)
+            self.app = self.app or build_app(self._config, write_gate=self.write_gate)
             self.worker = V3Worker(self.inbox, self.alarm, self.app, hub=self.hub,
-                                   use_llm=self._use_llm)
+                                   use_llm=self._use_llm, write_gate=self.write_gate)
             self._worker_thread = threading.Thread(target=self.worker.run, name="v3-worker", daemon=True)
             self._worker_thread.start()
         else:

@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
+
+from brain.write_gate import WriteGate, WriteRequest
 
 __all__ = ["V3Worker"]
 
@@ -17,7 +20,7 @@ __all__ = ["V3Worker"]
 class V3Worker:
     def __init__(self, inbox, alarm, app, *, hub: Any | None = None,
                  worker_id: str | None = None, lease_s: float = 60.0,
-                 use_llm: bool = True) -> None:
+                 use_llm: bool = True, write_gate: WriteGate | None = None) -> None:
         self._inbox = inbox
         self._alarm = alarm
         self._app = app
@@ -25,9 +28,15 @@ class V3Worker:
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self._lease_s = lease_s
         self._use_llm = use_llm
+        # W1（Q17 / W1-补3）：inbox 只负责受理/持久化/幂等，执行串行化交给 WriteGate。
+        self._write_gate = write_gate or WriteGate()
         self._stop = threading.Event()
         self.processed = 0
         self.failed = 0
+
+    def _execute(self, fn) -> Any:
+        """所有主库写都经闸门；30s 超时交给 lease 回收，不在这里 mark failed。"""
+        return self._write_gate.submit(WriteRequest(fn=fn)).result(timeout=30)
 
     # ── 单轮 ──────────────────────────────────────────────────────────────
     def run_once(self, *, limit: int = 20) -> int:
@@ -43,13 +52,16 @@ class V3Worker:
             legacy = payload.get("legacy_neuron")
             if isinstance(legacy, dict) and legacy.get("id"):
                 # v2 迁移事件：原样落投影并保留双时态/PAD，再让 outbox 重建派生库
-                self._app.storage.relational.upsert("neuron", legacy)
-                for target in ("vector", "graph", "timeseries", "hypergraph"):
-                    self._app.storage.relational.outbox_enqueue(
-                        event_id=str(legacy["id"]), target=target,
-                        payload={"neuron": legacy, "extraction": {}},
-                    )
-                self._app.hippocampus.dispatch_outbox()
+                def apply_legacy() -> None:
+                    self._app.storage.relational.upsert("neuron", legacy)
+                    for target in ("vector", "graph", "timeseries", "hypergraph"):
+                        self._app.storage.relational.outbox_enqueue(
+                            event_id=str(legacy["id"]), target=target,
+                            payload={"neuron": legacy, "extraction": {}},
+                        )
+                    self._app.hippocampus.dispatch_outbox()
+
+                self._execute(apply_legacy)
                 ok = self._inbox.finish(event_id, self.worker_id, ok=True)
                 if ok and self._hub is not None:
                     self._hub.broadcast({
@@ -65,10 +77,10 @@ class V3Worker:
             # ★ A 包：把 journal 里的 namespace 一路带到落库，
             #   否则 handle_event 收到的 topic:<id> 会在 worker 丢失、全落 private。
             _ns = str(payload.get("namespace") or row.get("namespace") or "topic:default")
-            result = self._app.hippocampus.remember(
+            result = self._execute(lambda: self._app.hippocampus.remember(
                 str(row["content"]), agent_id=str(row["agent_id"]),
                 namespace=_ns, emit_event=False, use_llm=self._use_llm,
-            )
+            ))
             ok = self._inbox.finish(event_id, self.worker_id, ok=True)
             if not ok:
                 return  # 租约被抢，丢弃结果，防双花
@@ -87,6 +99,10 @@ class V3Worker:
                     "merge": (result.merge.action if result.merge else "add"),
                 }
                 self._hub.broadcast(payload)
+        except FutureTimeout:
+            # Q26：WriteGate 30s 超时后**不调 finish**，让 lease 到期自动回 pending，
+            # 由下一个 drain 重领（inbox 现有机制，零改动）。finish(failed) 会永久丢事件。
+            return
         except Exception as exc:  # noqa: BLE001  单条失败不拖垮 Worker
             self.failed += 1
             self._inbox.finish(event_id, self.worker_id, ok=False, error=f"{type(exc).__name__}: {exc}")

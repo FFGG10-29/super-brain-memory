@@ -288,8 +288,12 @@ def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
     return embedder, reranker, llm
 
 
-def build_app(config: BrainConfig | None = None) -> BrainApp:
-    """组合根入口。三模型只构造不预热（懒加载），冷启动不碰磁盘上的大文件。"""
+def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = None) -> BrainApp:
+    """组合根入口。三模型只构造不预热（懒加载），冷启动不碰磁盘上的大文件。
+
+    W1（Q25）：传入共享 WriteGate 时，后台蒸馏与夜间巩固的写入也经闸门串行化；
+    不传（测试 / 独立脚本）保持原来的直调语义。
+    """
     config = config or get_config()
     storage = build_storage(config)
     embedder, reranker, llm = _build_models(config)
@@ -352,8 +356,17 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
         start_distill_worker, enqueue_document,
     )
     from core.context_layers import set_distill_trigger
+    from brain.write_gate import WriteRequest
+
+    def _remember_via_gate(text: str, **kwargs: Any):
+        if write_gate is None:
+            return hippocampus.remember(text, **kwargs)
+        return write_gate.submit(WriteRequest(
+            fn=lambda: hippocampus.remember(text, **kwargs)
+        )).result(timeout=30)
+
     _distill_save = lambda text, *, agent_id="distiller", namespace="document": (
-        hippocampus.remember(text, agent_id=agent_id, namespace=namespace)
+        _remember_via_gate(text, agent_id=agent_id, namespace=namespace)
     )
     start_distill_worker(_distill_save)
     set_distill_trigger(enqueue_document)
@@ -372,7 +385,10 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
         consolidations = neocortex.consolidate()
         summaries = consolidator.summarize_clusters(
             consolidations,
-            remember=lambda text: hippocampus.remember(text, agent_id="consolidator"),
+            # summarize_clusters 可能带 agent_id 等关键字调用，透传避免 TypeError
+            remember=lambda text, **kw: _remember_via_gate(
+                text, **{"agent_id": "consolidator", **kw}
+            ),
         )
         sweep_report = tier_manager.sweep()
         scanned = int(getattr(sweep_report, "scanned", 0) or 0)
@@ -593,7 +609,11 @@ def serve_forever(config: BrainConfig | None = None) -> int:
     """一键启动：六引擎 + 认知层 + 网关 + 昼夜调度 + 同步 worker；Ctrl-C 优雅停。"""
     config = config or get_config()
     configure_logging(config.log_level)
-    app = build_app(config)
+    # W1：--serve 独立模式同样用统一闸门，避免留下第七条旁路写入路径
+    from brain.write_gate import WriteGate
+
+    write_gate = WriteGate()
+    app = build_app(config, write_gate=write_gate)
     registry = AgentRegistry(app.storage.kv, timeseries=app.storage.timeseries, config=config)
     toolkit = MCPToolkit(
         registry=registry,
@@ -609,7 +629,8 @@ def serve_forever(config: BrainConfig | None = None) -> int:
     _bridge_token = read_local_token() or _secrets.token_urlsafe(24)
     if not read_local_token():
         write_local_token(_bridge_token)
-    http = HTTPAdapter(registry=registry, toolkit=toolkit, config=config, bridge_token=_bridge_token)
+    http = HTTPAdapter(registry=registry, toolkit=toolkit, config=config,
+                       bridge_token=_bridge_token, write_gate=write_gate)
     projector = EventProjector(
         relational=app.storage.relational, vector=app.storage.vector, graph=app.storage.graph,
         hypergraph=app.storage.hypergraph, timeseries=app.storage.timeseries, kv=app.storage.kv,

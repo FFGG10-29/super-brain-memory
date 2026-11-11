@@ -28,7 +28,8 @@ class RpcExtension:
 
         cached = getattr(daemon, "_memory_service", None)
         if cached is None or cached.app is not app:
-            cached = MemoryService(app, daemon._config)
+            cached = MemoryService(app, daemon._config,
+                                   write_gate=getattr(daemon, "write_gate", None))
             daemon._memory_service = cached
         return cached
 

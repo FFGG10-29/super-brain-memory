@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from brain.write_gate import WriteGate
 from config import BrainConfig, get_config
 from core.runtime_paths import (
     clear_local_bridge,
@@ -55,7 +56,9 @@ class HeadlessServer:
     ) -> None:
         self.config = config or get_config()
         apply_overrides(self.config, load_overrides())
-        self.app = build_app(self.config)
+        # W1（Q17/A1）：先建统一闸门，再装配内核 —— build_app 内部的两条后台写入路径要接线
+        self.write_gate = WriteGate()
+        self.app = build_app(self.config, write_gate=self.write_gate)
 
         # 唯一真源：v2 主库路径的兄弟目录放 v3 的 journal/inbox（不另开六引擎）
         sqlite_path = Path(self.config.storage.sqlite_path)
@@ -64,6 +67,7 @@ class HeadlessServer:
             self.root, config=self.config, http_port=http_port, ws_port=ws_port,
             worker_mode="thread", use_llm=use_llm, app=self.app,
         )
+        self.daemon.write_gate = self.write_gate
 
         self.registry = AgentRegistry(
             self.app.storage.kv, timeseries=self.app.storage.timeseries, config=self.config
@@ -80,6 +84,7 @@ class HeadlessServer:
         self.adapter = HTTPAdapter(
             registry=self.registry, toolkit=self.toolkit,
             config=self.config, bridge_token=self.bridge_token,
+            write_gate=self.write_gate,
         )
         self.mcp_port = int(mcp_port if mcp_port is not None else self.config.gateway.http_port)
         self._mcp_server: Any = None
@@ -162,20 +167,36 @@ class HeadlessServer:
         }
 
     def restart_kernel(self) -> dict[str, Any]:
-        """按最新配置重建内核，并让 v3 Worker、MCP toolkit、registry 全部切到新对象。"""
+        """按最新配置重建内核；闸门、Worker 线程、MCP toolkit、registry 一起切核。
+
+        W1：顺序为「停 Worker → 排空旧闸门 → 关旧引擎 → 建新闸门 → 装新内核 → 换全部引用」。
+        否则残留写入会打到已关闭的旧引擎（§15.11 第 4 条同类坑）。
+        """
         old = self.app
+        old_gate = self.write_gate
+        old_worker = self.daemon.worker
+        if old_worker is not None:
+            old_worker.stop()
+            thread = getattr(self.daemon, "_worker_thread", None)
+            if thread is not None:
+                thread.join(timeout=2.0)
         if self._circadian:
             old.circadian.stop()
+        old_gate.shutdown(timeout=5)
         # Kùzu 同路径只允许一个 Database：必须先关旧内核再开新内核
         old.close()
+        # 新闸门必须先于 build_app 建立：组合根内两条后台写入路径要接线
+        new_gate = WriteGate()
         try:
-            fresh = build_app(self.config)
+            fresh = build_app(self.config, write_gate=new_gate)
         except Exception as exc:  # noqa: BLE001
+            new_gate.shutdown(timeout=1)
             return {"ok": False, "message": f"内核重启失败，请重启后端进程：{type(exc).__name__}: {exc}"}
+        self.write_gate = new_gate
         self.app = fresh
         self.daemon.app = fresh
-        if self.daemon.worker is not None:
-            self.daemon.worker._app = fresh
+        self.daemon.write_gate = new_gate
+        self.adapter.rebind_write_gate(new_gate)
         self.daemon._memory_service = None
         self.registry._kv = fresh.storage.kv
         self.registry._timeseries = fresh.storage.timeseries
@@ -183,9 +204,22 @@ class HeadlessServer:
         self.toolkit._prefrontal = fresh.prefrontal
         self.toolkit._relational = fresh.storage.relational
         self.toolkit._engines = fresh.storage.all()
+        if old_worker is not None:
+            from v3.worker import V3Worker
+
+            self.daemon.worker = V3Worker(
+                self.daemon.inbox, self.daemon.alarm, fresh,
+                hub=self.daemon.hub,
+                use_llm=getattr(self.daemon, "_use_llm", True),
+                write_gate=new_gate,
+            )
+            self.daemon._worker_thread = threading.Thread(
+                target=self.daemon.worker.run, name="v3-worker", daemon=True,
+            )
+            self.daemon._worker_thread.start()
         if self._circadian:
             fresh.circadian.start()
-        return {"ok": True, "message": "内核已按新配置重启（MCP 网关与 v3 Worker 已同步切核）"}
+        return {"ok": True, "message": "内核已按新配置重启（WriteGate / MCP 网关 / v3 Worker 已同步切核）"}
 
     def stop(self) -> None:
         if self._circadian:
@@ -195,6 +229,14 @@ class HeadlessServer:
             self._mcp_server.server_close()
         if self._mcp_thread is not None:
             self._mcp_thread.join(timeout=2.0)
+        # W1（停机顺序）：先停 Worker 循环 → 排空 WriteGate → 之后才允许 daemon.stop() 关引擎。
+        # 反过来写会让队列里残留的写入打到已关闭的六引擎。
+        if self.daemon.worker is not None:
+            self.daemon.worker.stop()
+        worker_thread = getattr(self.daemon, "_worker_thread", None)
+        if worker_thread is not None:
+            worker_thread.join(timeout=2.0)
+        self.write_gate.shutdown(timeout=5)
         # 停机前收缩 WAL，避免被强杀/重启后留下巨大 -wal 与锁
         try:
             self.checkpoint_wal()

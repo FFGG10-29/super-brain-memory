@@ -94,11 +94,12 @@ def parse_memory_file(path: str | Path) -> list[str]:
 
 
 class MemoryService:
-    def __init__(self, app: Any, config: Any) -> None:
+    def __init__(self, app: Any, config: Any, *, write_gate: Any | None = None) -> None:
         self.app = app
         self.config = config
         self.browser = MemoryBrowser(app.storage.relational)
-        self.editor = MemoryEditor(app=app)
+        # W1（Q25）：纠正/遗忘的写主库部分也经统一闸门
+        self.editor = MemoryEditor(app=app, write_gate=write_gate)
         self.activation = ActivationService(app.storage.relational, app.embedder, config)
 
     # ── 列表 / 检查器 ────────────────────────────────────────────────────
