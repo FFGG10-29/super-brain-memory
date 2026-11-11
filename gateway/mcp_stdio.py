@@ -130,13 +130,26 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
     """直连模式（独占数据库）下的工具实现：桌面没开、也没有可用的 HTTP 桥接时用。"""
     agent_id = str(arguments.get("agent_id", "mcp-client"))
     if name == "save_memory":
-        result = app.hippocampus.remember(str(arguments["content"]), agent_id=agent_id)
+        # ★【2026-11-10 审计缺口2】直连降级路径此前只传 content+agent_id，丢弃了
+        #   调用方的 cognition 与 namespace，导致语义 PAD / 空间归属降级。
+        #   与 http_adapter.py:120-127 对齐：透传两者；namespace/cognition 合法性
+        #   由 hippocampus.remember 的 topic 兜底与 from_agent 统一处理。
+        namespace = str(arguments.get("namespace") or "topic:default")
+        cognition = arguments.get("cognition")
+        cognition = cognition if isinstance(cognition, dict) else None
+        result = app.hippocampus.remember(
+            str(arguments["content"]), agent_id=agent_id,
+            namespace=namespace, cognition=cognition,
+        )
         return {
             "applied": result.applied,
             "id": result.neuron.uuid7_id,
             "reason": result.admission.reason,
             "memory_type": result.neuron.memory_type,
             "pad": result.neuron.pad.as_tuple(),
+            "namespace": result.neuron.namespace,
+            "superseded": result.superseded,
+            "merge": (result.merge.action if result.merge is not None else None),
         }
     if name == "recall_memory":
         query = str(arguments.get("query", ""))
@@ -222,12 +235,13 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
 MCP_TOOL_DEFS: list[dict[str, Any]] = [
     {
         "name": "save_memory",
-        "description": "写入一条记忆：自动分类（事实/偏好/情绪/画像）、SimHash 去重、情绪标注、六引擎落库",
+        "description": "写入一条记忆：自动分类（事实/偏好/情绪/画像）、SimHash 去重、情绪标注、六引擎落库；同事项演进自动语义合并裁决（add/update/merge/skip）收敛为单条",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "记忆正文"},
                 "agent_id": {"type": "string", "description": "调用方标识，如 workbuddy / codebuddy"},
+                "cognition": {"type": "object", "description": "★ 认知契约（可选）：{memory_type, pad:{p,a,d}, confidence, entities, relations, hyperedge}；提供时后端跳过本地 Qwen3-0.6B 抽取"},
             },
             "required": ["content"],
         },

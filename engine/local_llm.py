@@ -16,7 +16,7 @@ from typing import Any
 from core.errors import EngineUnavailable
 from core.interfaces import LocalLLM
 
-__all__ = ["QwenLocalLLM", "extract_json_object"]
+__all__ = ["QwenLocalLLM", "DisabledLLM", "extract_json_object"]
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -134,3 +134,36 @@ class QwenLocalLLM(LocalLLM):
                 )
                 _ = attempt
         raise EngineUnavailable(f"LLM 输出在 {max_retries + 1} 次尝试后仍非法: {last_error}")
+
+
+class DisabledLLM(LocalLLM):
+    """本地 LLM 总开关关闭时的可选占位实现（低配/无 GPU 机器的降级逃生口）。
+
+    complete_json 恒抛 EngineUnavailable，让 RouterExtractor.extract 走 _rule_extract
+    （情绪词典 PAD 有非零基线；conf=0.45 低权重）。**永不 import / 实例化 llama_cpp**。
+    默认不使用：2026-11-10 实测 GTX 1060 上三模型全 GPU 共存正常，故 dev-backend.cmd
+    默认启用 GPU 推理。仅当机器无 CUDA 或需省显存时置 MODEL_LLM_ENABLED=false。
+    正规写入带 cognition 时走 from_agent，不调本类，故质量不受影响。
+    """
+
+    def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        required_keys: Sequence[str] = (),
+        max_retries: int = 2,
+    ) -> Mapping[str, Any]:
+        raise EngineUnavailable("本地 LLM 已禁用（MODEL_LLM_ENABLED=false），走规则抽取")
+
+    @property
+    def degraded(self) -> bool:
+        return True
+
+    @property
+    def loaded(self) -> bool:
+        return False
+
+    @property
+    def active_gpu_layers(self) -> int:
+        return 0

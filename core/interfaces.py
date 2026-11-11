@@ -50,7 +50,9 @@ __all__ = [
 Record = Mapping[str, Any]
 EntityKind = Literal["neuron", "synapse", "hyperedge"]
 MemoryType = Literal["fact", "code", "scenario", "emotion", "profile"]
-Namespace = Literal["private", "group", "global"]
+# 命名空间放宽为 str：历史值 private/group/global 保持兼容，新增 topic:<空间id>
+# 用作记忆分区（A 包类别索引）。分区只改这一列，不改六引擎投影链、不碰 Kùzu 单写锁。
+Namespace = str
 Tier = Literal["buffer", "core", "recall", "archive"]
 Pyramid = Literal["raw", "fact", "topic", "worldview"]
 EventType = Literal[

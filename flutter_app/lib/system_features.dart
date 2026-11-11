@@ -9,7 +9,7 @@ import 'win32.dart';
 const Color _hint = Color(0xFF8FA6C4);
 
 /// 桌面能力：托盘驻留 / 开机自启 / 密钥保管 / 数据目录一键迁移。
-/// 这四项原先只在 Qt 前端里有，现在全部由后端 core.* RPC 提供，Flutter 完全等价。
+/// 这四项全部由后端 core.* RPC 提供，Flutter 完全等价。
 class SystemFeaturesPage extends StatefulWidget {
   const SystemFeaturesPage({super.key, required this.client});
   final BrainClient client;
@@ -155,7 +155,7 @@ class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
   @override
   Widget build(BuildContext context) => PageFrame(
         title: '桌面能力',
-        subtitle: '托盘驻留 / 单实例 / 开机自启 / 系统钥匙串 / 数据目录迁移 —— 全部由后端 RPC 提供，不再依赖 Qt',
+        subtitle: '托盘驻留 / 单实例 / 开机自启 / 系统钥匙串 / 数据目录迁移 —— 全部由后端 RPC 提供',
         child: ListView(
           children: <Widget>[
             Text(_busy ? '正在读取状态…' : _message,

@@ -9,6 +9,7 @@ import 'brain_client.dart';
 import 'graph_model.dart';
 import 'nebula_math.dart';
 import 'nebula_painter.dart';
+import 'persona_whale.dart';
 import 'prefs.dart';
 
 /// 3D 星云页：拖拽翻滚、滚轮缩放、语义星团、景深、LOD 与全量渲染。
@@ -99,6 +100,19 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
   int _loadAttempts = 0;
   double _progress = 0.0;
   bool _panelExpanded = true;
+  // 大肥鱼显隐交给控制面板（Prefs 持久化），不再是右下角小窗的关闭按钮
+  bool get _showWhale => _nebBool('show_whale', true);
+  Map<String, dynamic> _personaParams = <String, dynamic>{};
+
+  // ── 大肥鱼自主漫游状态机 ─────────────────────────────────────────────
+  // 对齐桌宠的「分层生命节奏」：随机挑目标点 → walk 帧匀速走过去 →
+  // 到站休息几秒（ idle 微动作由 PersonaWhale 自己播）→ 再出发。
+  // 坐标为 Align 归一化系（-1..1），唤醒度 a 越高走得越勤、越快。
+  Offset _petAlign = const Offset(0.35, 0.05);
+  Offset? _petTarget;
+  bool _petWalking = false;
+  bool _petFlip = false;
+  Timer? _petRoamTimer;
 
   @override
   void initState() {
@@ -106,7 +120,9 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     _controller = AnimationController(vsync: this, duration: const Duration(hours: 1))..repeat();
     _controller.addListener(_tick);
     _buildStardust();
-    _fullMode = Prefs.get<bool>('full_render', false);
+    // ★ 默认全量渲染：不再用 200 条抽样 + 2-gram 近似牺牲精度；
+    //   全量节点分批渐进加载，聚类叠加 namespace 主题先验，跨主题关联边保留。
+    _fullMode = Prefs.get<bool>('full_render', true);
     if (_fullMode) {
       _loadAll();
     } else {
@@ -114,6 +130,15 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     }
     widget.client.connectEvents();
     _subscription = widget.client.events.listen(_onEvent);
+    _scheduleNextRoam(const Duration(milliseconds: 1800));
+    // L0 人格意象取当前可调参数（失败则用默认骨架，不影响星云）
+    widget.client.personaGet().then((Map<String, dynamic> d) {
+      if (!mounted) return;
+      final p = d['params'];
+      if (p is Map) {
+        setState(() => _personaParams = Map<String, dynamic>.from(p));
+      }
+    }).catchError((Object _) {});
   }
 
   void _buildStardust() {
@@ -193,6 +218,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
       confidence: (row['confidence'] as num? ?? 0.5).toDouble(),
       isEmotion: row['is_emotion'] == true || row['memory_type'] == 'emotion',
       pad: pad,
+      namespace: row['namespace']?.toString() ?? 'private',
     );
   }
 
@@ -216,9 +242,22 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         await _load();
         return;
       }
+      // 主题名映射：星团标签显示空间名而非 topic:<id>
+      Map<String, String> topicNames = <String, String>{};
+      try {
+        final tl = await widget.client.topicsList();
+        final list = tl['spaces'] is List<dynamic>
+            ? tl['spaces'] as List<dynamic> : <dynamic>[];
+        for (final raw in list) {
+          if (raw is Map) {
+            final id = (raw['id'] ?? '').toString();
+            if (id.isNotEmpty) topicNames[id] = (raw['name'] ?? id).toString();
+          }
+        }
+      } catch (_) {}
       // 第一批先建好星团骨架，后续批次只做轻量追加，避免逐批 O(n²) 聚类。
       final first = rows.take(500).toList();
-      _full = BrainGraph.fromRows(first);
+      _full = BrainGraph.fromRows(first, topicNames: topicNames);
       _graph = _full.filtered(_space);
       for (var i = 500; i < rows.length; i += 500) {
         final end = math.min(i + 500, rows.length);
@@ -232,7 +271,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
         // 让出一帧，保证进度条与新增节点真的被绘制出来。
         await Future<void>.delayed(const Duration(milliseconds: 24));
       }
-      _full.recluster();
+      _full.recluster(topicNames: topicNames);
       if (!mounted) return;
       setState(() {
         _graph = _full.filtered(_space);
@@ -321,6 +360,64 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     }
   }
 
+  double _personaA() {
+    final e = _personaParams['emotion_baseline'];
+    final a = e is Map ? e['a'] : null;
+    return ((a as num?)?.toDouble() ?? 0.45).abs().clamp(0.0, 1.0);
+  }
+
+  /// 安排下一次漫游出发：低唤醒鱼懒得动，高唤醒鱼歇一会就想游。
+  void _scheduleNextRoam([Duration? delay]) {
+    _petRoamTimer?.cancel();
+    final a = _personaA();
+    final wait =
+        (2600 + math.Random().nextInt(3800) - a * 1800).clamp(1200, 7200).toInt();
+    _petRoamTimer = Timer(delay ?? Duration(milliseconds: wait), () {
+      if (!mounted) return;
+      final rng = math.Random();
+      setState(() {
+        _petTarget = Offset(
+          -0.72 + rng.nextDouble() * 1.44,
+          -0.60 + rng.nextDouble() * 1.20,
+        );
+        _petWalking = true;
+      });
+    });
+  }
+
+  /// 每帧推进漫游（由 AnimatedBuilder 驱动，~60fps，按 1/60s 步进足够平滑）。
+  void _tickPet() {
+    if (!_petWalking) return;
+    final target = _petTarget;
+    if (target == null) {
+      _petWalking = false;
+      return;
+    }
+    final a = _personaA();
+    final delta = target - _petAlign;
+    final dist = delta.distance;
+    // 归一化速度：走完一整屏约 9~16 秒，唤醒度高时明显更快。
+    final speedPerSec = 0.10 + a * 0.12;
+    final step = speedPerSec / 60;
+    if (dist <= step) {
+      _petAlign = target;
+      _petWalking = false;
+      _petTarget = null;
+      _scheduleNextRoam();
+    } else {
+      _petAlign = _petAlign + delta / dist * step;
+      _petFlip = delta.dx > 0;
+    }
+  }
+
+  /// 用户点了/摸了/喂了鱼：停下游动陪玩，几秒后再继续漫游。
+  void _onPetInteracted() {
+    _petRoamTimer?.cancel();
+    _petWalking = false;
+    _petTarget = null;
+    _scheduleNextRoam(const Duration(milliseconds: 5200));
+  }
+
   void _tick() {
     for (final pulse in _pulses) {
       pulse.step();
@@ -331,6 +428,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
     }
     if (_burst > 0) _burst = math.max(0, _burst - 0.004);
     if (_coreBurst > 0) _coreBurst = math.max(0, _coreBurst - 0.012);
+    _tickPet();
   }
 
   Future<void> search(String query) async {
@@ -378,6 +476,7 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
 
   @override
   void dispose() {
+    _petRoamTimer?.cancel();
     _subscription?.cancel();
     _controller
       ..removeListener(_tick)
@@ -408,21 +507,48 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
                 builder: (context, _) {
                   final seconds = _controller.value * 3600;
                   final yaw = _yaw + (_style.autoRotate ? seconds * 0.0015 : 0);
-                  return CustomPaint(
-                    painter: NebulaPainter(
-                      graph: _graph,
-                      yaw: yaw,
-                      pitch: _pitch,
-                      zoom: _zoom,
-                      spinTime: seconds * (_style.spinSpeed / 0.00035),
-                      pulses: _pulses,
-                      style: _style,
-                      highlighted: _highlighted,
-                      stardust: _stardust,
-                      burst: _burst,
-                      coreBurst: _coreBurst,
-                    ),
-                    child: Container(),
+                  // ★ 整片星云就是大肥鱼的活动空间：自主漫游状态机挑目标点，
+                  //   walk 帧游过去、到站休息、再出发；交互时停下陪玩。
+                  //   原先那条 1 小时周期的 Lissajous 轨迹慢得像静止，已废弃。
+                  final petSize = (128 * _zoom).clamp(56.0, 340.0).toDouble();
+                  return Stack(
+                    children: <Widget>[
+                      Positioned.fill(
+                        child: CustomPaint(
+                          painter: NebulaPainter(
+                            graph: _graph,
+                            yaw: yaw,
+                            pitch: _pitch,
+                            zoom: _zoom,
+                            spinTime: seconds * (_style.spinSpeed / 0.00035),
+                            pulses: _pulses,
+                            style: _style,
+                            highlighted: _highlighted,
+                            stardust: _stardust,
+                            burst: _burst,
+                            coreBurst: _coreBurst,
+                          ),
+                          child: Container(),
+                        ),
+                      ),
+                      if (_showWhale)
+                        Align(
+                          alignment: Alignment(_petAlign.dx, _petAlign.dy),
+                          child: SizedBox(
+                            width: petSize,
+                            height: petSize,
+                            child: PersonaWhale(
+                              params: _personaParams,
+                              sceneMode: true,
+                              size: petSize,
+                              showStars: false,
+                              roaming: _petWalking,
+                              flip: _petFlip,
+                              onInteracted: _onPetInteracted,
+                            ),
+                          ),
+                        ),
+                    ],
                   );
                 },
               ),
@@ -512,8 +638,43 @@ class NebulaPageState extends State<NebulaPage> with SingleTickerProviderStateMi
                         _miniToggle('引力线', 'show_gravity', true),
                         _miniToggle('视差星尘', 'parallax', true),
                         _miniToggle('自动旋转', 'auto_rotate', true),
+                        _miniToggle('大肥鱼', 'show_whale', true),
                       ]),
                     ),
+                    // 主题星团：显示每团的主导 namespace 与占比（聚类先验，不是硬隔离）
+                    if (_graph.clusters.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 7),
+                      SizedBox(
+                        width: 268,
+                        child: Wrap(
+                          spacing: 5,
+                          runSpacing: 4,
+                          children: <Widget>[
+                            for (var i = 0;
+                                i < _graph.clusters.length && i < 12;
+                                i++)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: Color(_graph.clusters[i].tint)
+                                      .withValues(alpha: 0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  _graph.clusters[i].label.isEmpty
+                                      ? '星团 ${i + 1}'
+                                      : _graph.clusters[i].label,
+                                  style: TextStyle(
+                                    color: Color(_graph.clusters[i].tint),
+                                    fontSize: 9,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 6),
                     const SizedBox(
                       width: 268,

@@ -29,12 +29,6 @@ class ScriptedLLM:
         return self.responses.pop(0) if self.responses else {"action": "add", "reason": "default"}
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    yield app
-
-
 @pytest.fixture()
 def desktop_config(tmp_path):
     return BrainConfig(

@@ -15,6 +15,7 @@ class BrainNode {
     this.confidence = 0.5,
     this.isEmotion = false,
     this.pad = const <double>[0, 0, 0],
+    this.namespace = 'private',
     Vec3? position,
     this.cluster = 0,
   }) : position = position ?? const Vec3(0, 0, 0);
@@ -26,6 +27,8 @@ class BrainNode {
   final double confidence;
   final bool isEmotion;
   final List<double> pad;
+  /// 主题分区（namespace=topic:<id>）：作为聚类先验，不是硬隔离容器。
+  final String namespace;
   Vec3 position; // 相对所属星系中心的局部坐标
   int cluster;
   double flash = 0.0;
@@ -73,6 +76,8 @@ class GalaxyCluster {
     required this.frame,
     required this.dust,
     this.tint = 0xFF7FD8FF,
+    this.label = '',
+    this.topic = '',
   });
 
   final Vec3 center;
@@ -83,6 +88,9 @@ class GalaxyCluster {
   final List<Vec3> dust;    // 相对簇心的星系尘埃粒子
   /// 星团主色：由簇内节点最多的语义分类决定（事实金 / 情绪紫红 / 代码青蓝…）。
   final int tint;
+  /// ★ 主导主题标签（如「ECU 与 FCore 调校 78%」），由簇内 namespace 众数得出。
+  final String label;
+  final String topic;
 }
 
 class BrainGraph {
@@ -106,7 +114,8 @@ class BrainGraph {
     );
   }
 
-  factory BrainGraph.fromJson(Map<String, dynamic> json, {int? forceClusters}) {
+  factory BrainGraph.fromJson(Map<String, dynamic> json,
+      {int? forceClusters, Map<String, String>? topicNames}) {
     final nodes = <BrainNode>[];
     for (final raw in json['nodes'] as List<dynamic>? ?? <dynamic>[]) {
       final row = raw as Map<String, dynamic>;
@@ -121,6 +130,7 @@ class BrainGraph {
         confidence: (row['confidence'] as num? ?? 0.5).toDouble(),
         isEmotion: row['is_emotion'] == true,
         pad: pad,
+        namespace: row['namespace']?.toString() ?? 'private',
       ));
     }
     final edges = <BrainEdge>[];
@@ -133,19 +143,22 @@ class BrainGraph {
         row['kind']?.toString() ?? 'semantic',
       ));
     }
-    return _layout(nodes, edges, forceClusters: forceClusters);
+    return _layout(nodes, edges, forceClusters: forceClusters, topicNames: topicNames);
   }
 
-  /// ① 内容 2-gram 贪心社区检测；② 源码公式生成球壳簇心 + 螺旋臂 + 星系尘埃；
-  /// ③ 每社区边预算截断。连通分量≠社区：链式边会把 3000 节点连成一个大团。
-  static BrainGraph _layout(List<BrainNode> nodes, List<BrainEdge> edges, {int? forceClusters}) {
+  /// ① 内容 2-gram + namespace 亲和先验的贪心社区检测；② 球壳簇心 + 螺旋臂 + 星系尘埃；
+  /// ③ 每社区边预算截断 + 跨主题弱关联保留。
+  /// ★ 命名空间是「聚类先验」而非硬切分：同类更聚集，跨类边照常存在。
+  static BrainGraph _layout(List<BrainNode> nodes, List<BrainEdge> edges,
+      {int? forceClusters, Map<String, String>? topicNames}) {
     const maxClusters = 12;
     final index = <String, int>{for (var i = 0; i < nodes.length; i++) nodes[i].id: i};
 
     // 连通分量不能直接当社区：链式边会把 3000 节点连成一个大团。
-    // 用「内容 2-gram 余弦 + 贪心」做社区检测，代表文本截断到 160 字防 O(n²)。
+    // 用「内容 2-gram 余弦 + 同主题亲和加分」做社区检测，代表文本截断到 160 字防 O(n²)。
     final members = <List<int>>[];
     final representatives = <String>[];
+    final repNamespaces = <String>[];
     final assigned = List<int>.filled(nodes.length, -1);
     // 簇容量上限：内容高度雷同（批量导入/同主题）时强制分散成多个星系团
     final capacity = math.max(6, (nodes.length * 1.2 / maxClusters).ceil());
@@ -154,7 +167,11 @@ class BrainGraph {
       var bestScore = 0.0;
       for (var c = 0; c < representatives.length; c++) {
         if (members[c].length >= capacity) continue;
-        final score = _similarity(nodes[i].content, representatives[c]);
+        var score = _similarity(nodes[i].content, representatives[c]);
+        // ★ 同主题亲和：只加分、不排斥异主题，空间是标签不是隔离容器
+        if (c < repNamespaces.length && repNamespaces[c] == nodes[i].namespace) {
+          score += 0.18;
+        }
         if (score > bestScore) {
           bestScore = score;
           best = c;
@@ -167,6 +184,7 @@ class BrainGraph {
         target = members.length;
         members.add(<int>[]);
         representatives.add(nodes[i].content);
+        repNamespaces.add(nodes[i].namespace);
       } else {
         // 所有簇都满：选当前最小的簇，保持均衡
         var smallest = 0;
@@ -271,16 +289,35 @@ class BrainGraph {
           dh * spread,
         ));
       }
+      // ★ 星团标签 = 簇内 namespace 众数（可按主导主题看出这一团是什么）
+      final nsCount = <String, int>{};
+      for (final i in group) {
+        nsCount[nodes[i].namespace] = (nsCount[nodes[i].namespace] ?? 0) + 1;
+      }
+      var dominantNs = 'private';
+      var dominantCount = 0;
+      nsCount.forEach((String k, int v) {
+        if (v > dominantCount) {
+          dominantCount = v;
+          dominantNs = k;
+        }
+      });
+      final shortId = dominantNs.startsWith('topic:')
+          ? dominantNs.substring(6) : dominantNs;
+      final nsName = (topicNames?[shortId] ?? topicNames?[dominantNs]) ?? shortId;
+      final pct = group.isEmpty ? 0 : (dominantCount * 100 / group.length).round();
       clusters[c] = GalaxyCluster(
         center: clusters[c].center, radius: radius, spin: spin,
         tilt: tilt, frame: frame, dust: dust,
         tint: clusterTint(group.map((i) => nodes[i])),
+        label: '$nsName $pct%', topic: dominantNs,
       );
     }
 
     // 边预算：每簇 sqrt(size)*5（12~120），每节点最多 4 条，防止 3000 节点 O(n²) 连线
     final degree = <String, int>{};
     final perCluster = <int, int>{};
+    final crossCount = <String, int>{};
     final kept = <BrainEdge>[];
     final sorted = List<BrainEdge>.from(edges)
       ..sort((a, b) => b.weight.compareTo(a.weight));
@@ -288,7 +325,19 @@ class BrainGraph {
       final a = index[edge.source], b = index[edge.target];
       if (a == null || b == null) continue;
       final c = assigned[a];
-      if (c != assigned[b]) continue;
+      final c2 = assigned[b];
+      if (c != c2) {
+        // ★ 跨主题关联保留：空间只是标签，各主题之间本来就有关联。
+        //   给每对簇独立小预算（2 条），避免连线糊成一团又不会切断联系。
+        final key = '$c-$c2';
+        if ((crossCount[key] ?? 0) >= 2) continue;
+        if ((degree[edge.source] ?? 0) >= 4 || (degree[edge.target] ?? 0) >= 4) continue;
+        crossCount[key] = (crossCount[key] ?? 0) + 1;
+        degree[edge.source] = (degree[edge.source] ?? 0) + 1;
+        degree[edge.target] = (degree[edge.target] ?? 0) + 1;
+        kept.add(BrainEdge(edge.source, edge.target, edge.weight * 0.85, 'cross-topic'));
+        continue;
+      }
       final budget = math.min(120, math.max(12, (math.sqrt(members[c].length) * 5).floor()));
       if ((perCluster[c] ?? 0) >= budget) continue;
       if ((degree[edge.source] ?? 0) >= 4 || (degree[edge.target] ?? 0) >= 4) continue;
@@ -346,9 +395,10 @@ class BrainGraph {
 
   /// 全量加载：把后端分批推送的节点先轻量追加（不做 O(n²) 聚类），
   /// 让界面边收边渲染；全部到齐后再 recluster() 一次成团。
-  static BrainGraph fromRows(List<Map<String, dynamic>> rows, {int? forceClusters}) =>
+  static BrainGraph fromRows(List<Map<String, dynamic>> rows,
+      {int? forceClusters, Map<String, String>? topicNames}) =>
       BrainGraph.fromJson(<String, dynamic>{'nodes': rows, 'edges': <dynamic>[]},
-          forceClusters: forceClusters);
+          forceClusters: forceClusters, topicNames: topicNames);
 
   void addNodes(List<BrainNode> incoming) {
     if (incoming.isEmpty) return;
@@ -375,9 +425,10 @@ class BrainGraph {
   }
 
   /// 全部节点到位后重排成「致密星团 + 悬臂」布局。
-  void recluster() {
+  void recluster({Map<String, String>? topicNames}) {
     if (nodes.isEmpty) return;
-    final rebuilt = _layout(List<BrainNode>.from(nodes), List<BrainEdge>.from(edges));
+    final rebuilt = _layout(List<BrainNode>.from(nodes), List<BrainEdge>.from(edges),
+        topicNames: topicNames);
     nodes
       ..clear()
       ..addAll(rebuilt.nodes);

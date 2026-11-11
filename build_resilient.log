@@ -1,0 +1,35 @@
+[resilient 21:20:44] ===== 尝试 1/3 =====
+[resilient 21:58:15] build_backend_installer 退出 rc=0
+[resilient 21:58:15] 构建成功标记已出现
+[resilient 21:58:15] ===== 最终核验 =====
+self-check passed (no import error)
+BUILD_BACKEND_INSTALLER_DONE rc=0
+===== [验证1] 安装后端 self-check =====
+[verify1] headless-server-cli.exe --self-check rc=0
+ - leaked type "ExplainType"
+ - leaked type "PythonExceptionHandling"
+ - leaked type "_duckdb._sqltypes.DuckDBPyType"
+ - leaked type "PythonUDFType"
+ - leaked type "_duckdb.DuckDBPyConnection"
+ - leaked type "FunctionNullHandling"
+nanobind: leaked 84 functions!
+ - leaked function "__repr__"
+ - leaked function "_own_sources"
+ - leaked function "array_type"
+ - leaked function "appender"
+ - leaked function "decimal_type"
+ - leaked function "commit"
+ - leaked function "close"
+ - leaked function "interrupt"
+ - leaked function "_register_filelike"
+ - leaked function "query_appender"
+ - ... skipped remainder
+nanobind: this is likely caused by a reference counting issue in the binding code.
+See https://nanobind.readthedocs.io/en/latest/refleaks.html[verify1] PASS：import 链已修复，已安装后端可正常启动，前端将有数据
+===== [验证2] 新安装器产物 =====
+-rw-r--r-- 1 13966 197609 1897322752 Nov  9 21:37 B:/BaiduSyncdisk/desktop/VSProject/super-brain-memory/release/SuperBrainSetup-1.bin
+-rw-r--r-- 1 13966 197609 1900000000 Nov  9 21:54 B:/BaiduSyncdisk/desktop/VSProject/super-brain-memory/release/SuperBrainSetup-2.bin
+-rw-r--r-- 1 13966 197609  519215146 Nov  9 21:58 B:/BaiduSyncdisk/desktop/VSProject/super-brain-memory/release/SuperBrainSetup-3.bin
+-rwxr-xr-x 1 13966 197609    2676832 Nov  9 21:58 B:/BaiduSyncdisk/desktop/VSProject/super-brain-memory/release/SuperBrainSetup.exe
+[resilient 21:58:21] 全部结束
+[resilient 22:42:16] ===== 尝试 1/3 =====

@@ -68,10 +68,31 @@ class MCPToolkit:
         # 超级大脑是**统一记忆中枢**：所有 Agent 默认写进同一个共享库、读同一份记忆。
         # agent_id 只用于审计与限流，绝不参与隔离——否则每个 Agent 会看到不同的「自己」。
         # 只有客户端**显式指定**别的命名空间时才做权限校验（显式越权仍要拒绝）。
+        from core.context_layers import get_context_layers
+        layers = get_context_layers()
         requested = args.get("namespace")
-        namespace = str(requested or self._config.namespace_policy)
-        if requested and not self._registry.namespace_allowed(agent, namespace):
-            raise GatewayAuthError(f"Agent 无权访问命名空间 {namespace}")
+        cognition_raw = args.get("cognition")
+        cognition = cognition_raw if isinstance(cognition_raw, dict) else None
+        # ★ A 包：topic 分区。复用现有 namespace 列（值 topic:<空间id>），
+        #   id 必须来自后端 spaces.json，避免任意字符串污染索引。
+        topic = str((cognition or {}).get("topic") or args.get("topic") or "").strip()
+        if topic:
+            valid_ids = {str(s.get("id")) for s in layers.spaces_list().get("spaces", [])}
+            valid_ids.add("default")
+            if topic not in valid_ids:
+                raise GatewayAuthError(f"未知主题分区 {topic}（先调 spaces_list 取合法 id）")
+            namespace = f"topic:{topic}"
+        else:
+            namespace = str(requested or self._config.namespace_policy or "")
+            if requested and not self._registry.namespace_allowed(agent, str(requested)):
+                raise GatewayAuthError(f"Agent 无权访问命名空间 {requested}")
+            # ★ 无 cognition.topic 时也强制落空间，杜绝裸 private/document 写入
+            if not namespace.startswith("topic:"):
+                namespace = "topic:default"
+        # ★ L0 人格层写入门槛：全量可读 ≠ 可写人格，只有提案流程能显式授权
+        if tool == "save_memory" and cognition and str(cognition.get("layer") or "") == "persona":
+            if args.get("persona_write") is not True:
+                raise GatewayAuthError("L0 人格层写入需显式授权 persona_write=true")
 
         if tool == "save_memory":
             if not self._registry.permission_allowed(agent, "write"):
@@ -79,14 +100,27 @@ class MCPToolkit:
             content = str(args.get("content", "")).strip()
             if not content:
                 raise ValueError("content 不能为空")
-            result = self._hippocampus.remember(content, agent_id=agent.agent_id, namespace=namespace)
+            # ★ 认知契约：外部 Agent（WorkBuddy 等）直接给出分类 / PAD / 实体 / 置信度时，
+            #   后端跳过 Qwen3-0.6B 抽取，但仍做语义合并裁决（同事项 update/merge 收敛，
+            #   merge_cognition_enabled 可关）。不传 cognition 时行为与旧版完全一致。
+            if cognition_raw is not None and cognition is None:
+                raise ValueError("cognition 必须是对象")
+            result = self._hippocampus.remember(
+                content, agent_id=agent.agent_id, namespace=namespace,
+                cognition=cognition,
+            )
             return {
                 "applied": result.applied,
                 "neuron_id": result.neuron.uuid7_id,
                 "pad": result.neuron.pad.as_tuple(),
+                "source": "agent" if cognition else "local",
                 "reason": result.admission.reason,
                 "duplicate_of": result.admission.duplicate_of,
                 "superseded": result.superseded,
+                "merge": (result.merge.action if result.merge is not None else None),
+                "namespace": namespace,
+                "topic": topic,
+                "layer": str((cognition or {}).get("layer") or "fact"),
             }
 
         if tool == "recall_memory":
@@ -98,17 +132,28 @@ class MCPToolkit:
             # 六通道 embedding/RRF/精排实测 30-45s，只有 deep=true 才走，
             # 避免 Agent 每轮提问都卡在检索上（DSH 档案里的 known recall-hang）。
             deep = bool(args.get("deep", False))
-            from core.context_layers import get_context_layers
-
-            layers = get_context_layers()
+            # ★ A 包：按类召回下推。topics/scope=active/namespace 三选一；
+            #   Bot 通道（channel=bot）不传即 ALL 全量可读，不做隔离。
+            channel = str(args.get("channel") or "workbuddy")
+            topics = args.get("topics")
+            ns_filter: tuple[str, ...] = ()
+            if isinstance(topics, (list, tuple)) and topics:
+                ns_filter = tuple(
+                    str(t) if str(t).startswith("topic:") else f"topic:{t}" for t in topics)
+            elif str(args.get("scope") or "") == "active":
+                ns_filter = tuple(
+                    f"topic:{s.get('id')}" for s in layers.spaces_list().get("spaces", [])
+                    if s.get("active"))
+            elif requested and not topic:
+                ns_filter = (str(requested),)
             mode = "projection"
             rows: list[dict[str, Any]] = []
             injection = ""
             if deep or self._rpc_fallback is None:
                 mode = "six-channel"
-                # namespaces=() 表示不按命名空间过滤：任何 Agent 写的记忆其它 Agent 都能召回
+                # namespaces=() = 全量可读；非空则 RecallFilter 下推到 dense/sparse/fts 三路
                 hits = self._prefrontal.recall(
-                    query, agent_id=agent.agent_id, namespaces=(), limit=limit,
+                    query, agent_id=agent.agent_id, namespaces=ns_filter, limit=limit,
                 )
                 rows = [
                     {
@@ -122,7 +167,10 @@ class MCPToolkit:
                 ]
                 injection = self._prefrontal.inject(hits, agent_id=agent.agent_id)
             else:
-                fast = self._rpc_fallback("recall", {"q": query, "limit": limit, "deep": False})
+                fast = self._rpc_fallback("recall", {
+                    "q": query, "limit": limit, "deep": False,
+                    "namespaces": list(ns_filter),
+                })
                 raw_hits = fast.get("hits", []) if isinstance(fast, dict) else []
                 rows = [
                     {
@@ -146,7 +194,8 @@ class MCPToolkit:
                     head.append(f"{index}. {text}")
                 injection = "\n".join(head) if rows else ""
             # 每轮确定性注入的运行时记忆 + 相关档案摘要（dsh-mnemon 的三层 View）
-            projection = layers.compose(query)
+            # bot 通道额外注入 L0 人格层（骨架只读 + 当前可调参数），闲聊/指令双通道
+            projection = layers.compose(query, channel=channel)
             if projection:
                 injection = (injection + "\n\n" + projection).strip()
             return {
@@ -154,6 +203,8 @@ class MCPToolkit:
                 "injection": injection,
                 "context_layers": layers.status()["layers"],
                 "recall_mode": mode,
+                "channel": channel,
+                "namespaces": list(ns_filter),
             }
 
         if tool == "timeline_query":

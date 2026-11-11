@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'brain_client.dart';
 import 'pages.dart' show PageFrame;
 
-/// 顶栏实时仪表：Qt 桌面端「CPU / 内存 / 显卡」三表的 Flutter 等价实现。
+/// 顶栏实时仪表：后端系统资源数据的 Flutter 实时呈现。
 /// 数据来自后端 `system.stats` RPC（psutil + nvidia-smi，2 秒采样一次），
 /// 前端只读缓存、不跑子进程；没有 N 卡时显卡位显示「—」而不是假装 0%。
 class SystemGauges extends StatefulWidget {
@@ -162,7 +162,7 @@ class _RingPainter extends CustomPainter {
       oldDelegate.value != value || oldDelegate.color != color;
 }
 
-/// 完整硬件仪表页（顶栏是 compact 版，这里给大表 + 明细，对齐 Qt 的实时仪表区）。
+/// 完整硬件仪表页（顶栏是 compact 版，这里给大表 + 明细，对齐实时仪表区）。
 class HardwarePage extends StatefulWidget {
   const HardwarePage({super.key, required this.client});
   final BrainClient client;

@@ -107,8 +107,25 @@ class Hippocampus:
         now_ms: int | None = None,
         use_llm: bool = True,
         emit_event: bool = True,
+        cognition: dict | None = None,
     ) -> WriteResult:
-        extraction = self._extractor.extract(content, agent_id=agent_id, use_llm=use_llm)
+        # ★ A 包·空间标记兜底：所有写入最终汇聚于此，杜绝裸 private/document。
+        #   优先级 cognition.topic > 显式 topic:<id> > 兜底 topic:default。
+        #   这样任何新写入途径（MCP / inbox worker / stdio / 蒸馏）都自带空间归属。
+        _cog = cognition if isinstance(cognition, dict) else {}
+        _topic = str(_cog.get("topic") or "").strip()
+        if _topic:
+            namespace = _topic if _topic.startswith("topic:") else f"topic:{_topic}"
+        elif not str(namespace or "").startswith("topic:"):
+            namespace = "topic:default"
+        # ★ 认知契约：调用方（WorkBuddy 等）已给出结构化抽取结果时直接采信，
+        #   不再调用 Qwen3-0.6B 做分类 / PAD / 实体抽取。
+        #   cognition 缺省时行为与旧版完全一致。
+        extraction = (
+            self._extractor.from_agent(cognition)
+            if cognition
+            else self._extractor.extract(content, agent_id=agent_id, use_llm=use_llm)
+        )
         affect = self._amygdala.ingest(agent_id, extraction.pad, now_ms=now_ms)
 
         neuron = self._extractor.to_neuron(
@@ -135,7 +152,15 @@ class Hippocampus:
         # 语义合并裁决（Mem0 式）：LLM 判定 add/update/merge/skip
         merge = None
         # use_llm=False 是批量导入的快速通道：合并裁决也要调 LLM，一起跳过
-        if use_llm and self._consolidator is not None and self._config.merge.merge_enabled:
+        # ★ 认知契约下同样裁决（merge_cognition_enabled 控制，默认开）：
+        #   抽取结果仍直接采信调用方 cognition，但同事项演进走 update/merge 收敛为一条，
+        #   避免同一事项随时间无限追加版本。LLM 不可用时 decide() 兜底为 add，绝不阻断写入。
+        if (
+            use_llm
+            and self._consolidator is not None
+            and self._config.merge.merge_enabled
+            and (cognition is None or self._config.merge.merge_cognition_enabled)
+        ):
             merge = self._consolidator.decide(neuron.content, agent_id=agent_id, namespace=namespace)
             if merge.action == "skip":
                 return WriteResult(neuron=neuron, admission=admission, applied=False, merge=merge)
@@ -168,6 +193,26 @@ class Hippocampus:
             warnings=warnings,
             merge=merge,
         )
+        # ★ A 包：分区元数据旁路索引（layer/source/valence/sensitive/category）。
+        #   写 LMDB kv 而不给 Neuron 加字段：零 schema 变更、不改六引擎投影链、不碰 Kùzu 单写锁。
+        #   topic 本身落 neuron.namespace 列（topic:<空间id>），可按列过滤下推。
+        if cognition:
+            try:
+                import json as _json
+                valence = float(cognition.get("valence") or 0.0)
+                meta = {
+                    "topic": str(cognition.get("topic") or ""),
+                    "layer": str(cognition.get("layer") or "fact"),
+                    "source": str(cognition.get("source") or ""),
+                    "valence": max(-1.0, min(1.0, valence)),
+                    "sensitive": bool(cognition.get("sensitive", False)),
+                    "category": str(cognition.get("category") or ""),
+                    "namespace": neuron.namespace,
+                    "ts_ms": neuron.created_at_ms,
+                }
+                self._kv.put("meta", neuron.uuid7_id, _json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+            except (TypeError, ValueError, OSError) as exc:
+                warnings.append(f"meta 索引写入失败（不影响主记忆）：{exc}")
         # v3 Worker 消费事件时关闭再入队，避免 journal → inbox 无限回环
         if emit_event:
             self._emit_event(neuron, extraction, result)

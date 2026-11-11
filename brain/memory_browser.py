@@ -14,7 +14,8 @@ class MemoryBrowser:
         self._relational = relational
 
     def list(
-        self, *, limit: int = 80, tier: str | None = None, memory_type: str | None = None
+        self, *, limit: int = 80, tier: str | None = None, memory_type: str | None = None,
+        since_ms: int = 0,
     ) -> list[dict[str, Any]]:
         rows = [
             {
@@ -29,8 +30,9 @@ class MemoryBrowser:
                 "valid_to_ms": row.get("valid_to_ms"),
                 "tx_from": row.get("tx_from", ""),
                 "is_active": row.get("is_active", True),
+                "updated_at_ms": row.get("updated_at_ms", 0),
             }
-            for row in self._relational.query("neuron", limit=limit)
+            for row in self._relational.query("neuron", limit=limit, since_ms=since_ms)
         ]
         if tier:
             rows = [row for row in rows if row["tier"] == tier]

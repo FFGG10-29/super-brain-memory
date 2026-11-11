@@ -10,8 +10,9 @@
 3. 生成 PyInstaller onedir spec；冻结态下 core.runtime_paths 会把
    sys._MEIPASS 当作资源根，于是 cuda_bin/ 与 models/ 正好落在查找路径上。
 
-随后执行：.venv\\Scripts\\python.exe -m PyInstaller super-brain.spec --noconfirm
-发行目录 dist/super-brain/ 里，可写数据自动落到 %APPDATA%/super-brain/data。
+随后执行：.venv\\Scripts\\python.exe -m PyInstaller super-brain-backend.spec --noconfirm
+发行目录 dist/super-brain-backend/ 里，可写数据自动落到 %APPDATA%/super-brain/data。
+（本脚本只生成后端专用 onedir 构建，随 Flutter 安装包部署。）
 """
 from __future__ import annotations
 
@@ -77,112 +78,11 @@ def collect_models(source: Path | None = None, out: Path | None = None) -> int:
     return count
 
 
-_SPEC = '''# -*- mode: python -*-
-# 由 scripts/build_portable.py 生成；onedir，资源放 _internal 下。
-from pathlib import Path
-
-stage = Path(SPECPATH) / "build" / "portable_stage"
-cuda_bin = stage / "cuda_bin"
-models = stage / "models"
-
-# CUDA 运行库统一平铺进 cuda_bin/（engine.cuda_runtime 会登记该目录）。
-binaries = [(str(p), "cuda_bin") for p in sorted(cuda_bin.glob("*.dll"))]
-
-# llama_cpp/lib 不是数据目录而是 ctypes 运行时加载的 DLL：
-# 不显式收进来，冻结后 import llama_cpp 会抛「找不到 llama.dll」再静默退回规则抽取。
-try:
-    import llama_cpp as _llama_cpp
-    _llama_lib = Path(_llama_cpp.__file__).parent / "lib"
-except Exception:
-    _llama_lib = None
-if _llama_lib is not None and _llama_lib.is_dir():
-    binaries += [(str(p), "llama_cpp/lib") for p in sorted(_llama_lib.glob("*.dll"))]
-
-datas = [(str(models), "models")] if (INCLUDE_MODELS and models.is_dir()) else []
-# 图标资源：窗口图标 / 托盘图标都从这里读（tray.app_icon 用 resource_root()/ui/desktop/assets）
-_assets = Path(SPECPATH) / "ui" / "desktop" / "assets"
-if _assets.is_dir():
-    datas.append((str(_assets), "ui/desktop/assets"))
-_icon = _assets / "app.ico"
-
-a = Analysis(
-    [str(Path(SPECPATH) / "app_entry.py")],
-    pathex=[SPECPATH],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=[
-        "llama_cpp", "onnxruntime", "onnxruntime.capi._pybind_state", "tokenizers",
-        "kuzu", "lancedb", "pyarrow", "duckdb", "lmdb", "hypernetx",
-        "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "keyring", "mcp",
-        "dotenv", "pydantic_settings",
-        # 懒加载 / 函数内导入的模块，静态分析容易漏
-        "psutil",
-        "main", "ui.desktop.app", "ui.desktop.main_window", "ui.desktop.async_backend",
-        "ui.desktop.inspector", "ui.desktop.system_stats", "ui.desktop.bridge_launcher",
-        "ui.desktop.pages.timeline_page", "ui.desktop.pages.model_page",
-        "brain.memory_editor", "brain.memory_consolidator", "brain.activation",
-        "workers.life_loop", "workers.circadian", "sync.git_worker", "gateway.mcp_stdio",
-    ],
-    hookspath=[],
-    runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "pytest", "IPython"],
-    noarchive=False,
-)
-pyz = PYZ(a.pure, a.zipped_data, cipher=None)
-# 两个 exe 共用同一份依赖：GUI 无控制台；CLI 有控制台，供 --self-check / --probe-models 与排障。
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="super-brain", console=False,
-          icon=str(_icon) if _icon.is_file() else None)
-cli = EXE(pyz, a.scripts, [], exclude_binaries=True, name="super-brain-cli", console=True,
-          icon=str(_icon) if _icon.is_file() else None)
-coll = COLLECT(
-    exe, cli, a.binaries, a.zipfiles, a.datas,
-    strip=False, upx=False, name="super-brain",
-)
-'''
-
-_HEADER = '''# -*- mode: python -*-
-# 由 scripts/build_portable.py 生成；onedir，资源放 _internal 下。
-INCLUDE_MODELS = {include_models}
-'''
-
-_ENTRY = '''"""PyInstaller 冻结入口：无参数启动桌面；带 --self-check / --probe-models 走 CLI。"""
-from __future__ import annotations
-
-import sys
 
 
-def _cli(argv: list[str]) -> int | None:
-    """冻结态没有 `python -m main`，CLI 能力靠这里转接（super-brain-cli.exe）。"""
-    as_json = "--json" in argv
-    import main as cli
-
-    if "--probe-models" in argv:
-        return cli.probe_models(as_json=as_json)
-    if "--self-check" in argv:
-        return cli.self_check(as_json=as_json)
-    if "--mcp-stdio" in argv:
-        from gateway.mcp_stdio import main as mcp_main
-
-        return mcp_main()
-    return None
-
-
-def main() -> int:
-    code = _cli(sys.argv[1:])
-    if code is not None:
-        return code
-    from ui.desktop import launch
-
-    return launch()
-
-
-raise SystemExit(main())
-'''
-
-
-# ── 后端专用冻结模板（--headless）：无 GUI / 无 PySide6，随 Flutter 安装包部署 ──
+# ── 后端专用冻结模板（--headless）：无 GUI，随 Flutter 安装包部署 ──
 _SPEC_BACKEND = '''# -*- mode: python -*-
-# 由 scripts/build_portable.py --headless 生成；onedir，无 Qt 依赖。
+# 由 scripts/build_portable.py --headless 生成；onedir。
 from pathlib import Path
 
 stage = Path(SPECPATH) / "build" / "portable_stage"
@@ -198,6 +98,7 @@ except Exception:
 if _llama_lib is not None and _llama_lib.is_dir():
     binaries += [(str(p), "llama_cpp/lib") for p in sorted(_llama_lib.glob("*.dll"))]
 
+INCLUDE_MODELS = False  # 模型权重不进冻结包，统一由 --link-models 后处理硬链接
 datas = [(str(models), "models")] if (INCLUDE_MODELS and models.is_dir()) else []
 
 a = Analysis(
@@ -217,16 +118,16 @@ a = Analysis(
         # 函数内延迟导入，PyInstaller 静态分析抓不到，冻结包会 ModuleNotFoundError
         "core.context_layers", "core.fast_recall", "core.wal_maintenance",
         "core.structured_log", "core.runtime_paths", "core.user_config",
-        # Flutter 完全替代 Qt 后下沉到 core 的桌面能力（函数内惰性 import，静态分析会漏）
+        # Flutter 桌面能力已下沉到 core（函数内惰性 import，静态分析会漏）
         "core.system_stats", "core.desktop_features", "core.win32_tray",
         # psutil 是 CPU/内存仪表的硬依赖，绝不能 exclude
         "psutil", "winreg",
     ],
     hookspath=[],
     runtime_hooks=[],
-    # 调试入口（PySide6）不进发行包：省 200~300MB，运行时也不会被加载
-    excludes=["tkinter", "matplotlib", "pytest", "IPython",
-              "PySide6", "keyring", "ui.desktop"],
+    # keyring 是「桌面能力」页 SecretStore 的运行时依赖，必须保留（不能 exclude）。
+    # 仅排除真正不会用到的重型 / 测试库以缩小体积。
+    excludes=["tkinter", "matplotlib", "pytest", "IPython"],
     noarchive=False,
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
@@ -333,7 +234,7 @@ def link_models_into(dist: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="准备可移植 onedir 发行布局")
+    parser = argparse.ArgumentParser(description="准备可移植 onedir 后端发行布局（随 Flutter 部署）")
     parser.add_argument("--no-models", action="store_true", help="不归集模型权重（用户自行放置）")
     parser.add_argument(
         "--models-in-spec", action="store_true",
@@ -343,9 +244,9 @@ def main() -> int:
                         help="PyInstaller 完成后调用：把模型硬链接进 DIST/_internal/models")
     parser.add_argument("--trim", metavar="DIST", default="",
                         help="PyInstaller 完成后调用：删掉重复 CUDA DLL 与 TensorRT provider")
-    parser.add_argument("--out", default="dist/super-brain", help="发行目录名（写入 spec 说明）")
+    parser.add_argument("--out", default="dist/super-brain-backend", help="发行目录名")
     parser.add_argument("--headless", action="store_true",
-                        help="生成后端专用 spec/入口（不含 PySide6，随 Flutter 安装包部署）")
+                        help="（已默认）只生成后端专用 spec/入口，无桌面 UI")
     args = parser.parse_args()
 
     if args.trim:
@@ -363,32 +264,18 @@ def main() -> int:
     print(f"CUDA DLL 归集：{dll_count} 个 → {CUDA_OUT}")
     print(f"模型权重归集：{model_count} 个 → {MODEL_OUT}")
 
-    out = "dist/super-brain-backend" if (args.headless and args.out == "dist/super-brain") else args.out
-    header = _HEADER.format(include_models="True" if args.models_in_spec else "False")
-    if args.headless:
-        entry = ROOT / "backend_entry.py"
-        entry.write_text(_ENTRY_BACKEND, encoding="utf-8")
-        spec = ROOT / "super-brain-backend.spec"
-        spec.write_text(header + _SPEC_BACKEND, encoding="utf-8")
-        print(f"已生成 {spec.name}（后端专用：无 Qt / 无 GUI 资源）；执行：")
-        print("  .venv\\Scripts\\python.exe -m PyInstaller super-brain-backend.spec --noconfirm")
-        print(f"  .venv\\Scripts\\python.exe scripts/build_portable.py --trim {out}")
-        if not args.models_in_spec:
-            print(f"  .venv\\Scripts\\python.exe scripts/build_portable.py --link-models {out}")
-        print(f"产物 {out}\\headless-server.exe；由 Flutter 自动拉起，目标机器无需 Python / PySide6")
-        return 0
-
-    entry = ROOT / "app_entry.py"   # 生成物，每次覆盖，避免旧版本残留
-    entry.write_text(_ENTRY, encoding="utf-8")
-    spec = ROOT / "super-brain.spec"
-    spec.write_text(header + _SPEC, encoding="utf-8")
-    print(f"已生成 {spec.name}（INCLUDE_MODELS={'True' if args.models_in_spec else 'False'}）；执行：")
-    print("  .venv\\Scripts\\python.exe -m PyInstaller super-brain.spec --noconfirm")
+    # 仅后端构建：不再生成/覆盖 app_entry.py。
+    out = args.out
+    entry = ROOT / "backend_entry.py"
+    entry.write_text(_ENTRY_BACKEND, encoding="utf-8")
+    spec = ROOT / "super-brain-backend.spec"
+    spec.write_text(_SPEC_BACKEND, encoding="utf-8")
+    print(f"已生成 {spec.name}（后端专用：无 GUI 资源）；执行：")
+    print("  .venv\\Scripts\\python.exe -m PyInstaller super-brain-backend.spec --noconfirm")
     print(f"  .venv\\Scripts\\python.exe scripts/build_portable.py --trim {out}")
     if not args.models_in_spec:
         print(f"  .venv\\Scripts\\python.exe scripts/build_portable.py --link-models {out}")
-    print(f"发行目录 {out}；可写数据自动落到 %APPDATA%/super-brain/data")
-    print("装机后自检：dist\\super-brain\\super-brain.exe --probe-models --json（或看「模型配置」页）")
+    print(f"产物 {out}\\headless-server.exe；由 Flutter 自动拉起，目标机器无需 Python")
     return 0
 
 

@@ -1,8 +1,8 @@
 """brain.memory_service —— 与 UI 框架无关的桌面级业务服务。
 
 无头后端 / Flutter RPC 通过它访问检查器、用户控制闭环、事件时间轴、
-批量导入、真实六通道召回等能力；实现与 `ui.desktop.backend` 对齐，
-但不 import 任何 Qt 模块，删除 Qt 前端后功能不丢失。
+批量导入、真实六通道召回等能力；实现对齐历史后端设计，
+不依赖任何 UI 框架模块。
 """
 from __future__ import annotations
 
@@ -103,9 +103,10 @@ class MemoryService:
 
     # ── 列表 / 检查器 ────────────────────────────────────────────────────
     def memories(self, *, limit: int = 200, tier: str = "", memory_type: str = "",
-                 namespace: str = "", keyword: str = "") -> list[dict[str, Any]]:
+                 namespace: str = "", keyword: str = "", since_ms: int = 0) -> list[dict[str, Any]]:
         rows = self.browser.list(
-            limit=int(limit), tier=tier or None, memory_type=memory_type or None
+            limit=int(limit), tier=tier or None, memory_type=memory_type or None,
+            since_ms=int(since_ms),
         )
         if namespace:
             rows = [row for row in rows if str(row.get("namespace") or "") == namespace]

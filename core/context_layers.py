@@ -22,11 +22,23 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core.runtime_paths import data_dir
 
-__all__ = ["ContextLayers", "get_context_layers"]
+__all__ = ["ContextLayers", "get_context_layers", "set_distill_trigger"]
+
+_DISTILL_TRIGGER: Callable[[str], None] | None = None
+
+
+def set_distill_trigger(fn: Callable[[str], None] | None) -> None:
+    """后端注入：文档 create/update 后异步触发提炼（实时，不阻塞写入）。
+
+    传 None 即关闭（独立 stdio 模式默认无触发）。触发器本身只把 doc_id 投递到
+    后台队列，真正的提炼在独立线程进行；因此写入路径永远不被 LLM 调用阻塞。
+    """
+    global _DISTILL_TRIGGER
+    _DISTILL_TRIGGER = fn
 
 _IMPORTANCE_ORDER = {"low": 0, "normal": 1, "critical": 2}
 _DEFAULT_MEMORY_LIMIT = 8000
@@ -306,6 +318,12 @@ class ContextLayers:
             index["documents"] = rows
             index["revision"] = int(index.get("revision", 1)) + 1
             _atomic_json(self._doc_index_path, index)
+        # 实时提炼触发器：create/update 后异步把档案送进六引擎（不阻塞写入）
+        if action in ("create", "update") and _DISTILL_TRIGGER is not None and doc_id:
+            try:
+                _DISTILL_TRIGGER(doc_id)
+            except Exception:  # noqa: BLE001  触发失败不影响档案写入
+                pass
         return {"ok": True, "id": doc_id, "total": len(rows)}
 
     # ── 记忆空间（durable-evidence）─────────────────────────────────────
@@ -421,8 +439,13 @@ class ContextLayers:
         return {"ok": True, "id": skill_id, "remaining": len(data["skills"])}
 
     # ── View 组合（Strategy 语义）────────────────────────────────────────
-    def compose(self, query: str = "", max_runtime: int = 6, max_docs: int = 3) -> str:
-        """把三层拼成一段有预算的注入文本，等价于 dsh-mnemon 的 View projection。"""
+    def compose(self, query: str = "", max_runtime: int = 6, max_docs: int = 3,
+                channel: str = "workbuddy") -> str:
+        """把三层拼成一段有预算的注入文本，等价于 dsh-mnemon 的 View projection。
+
+        ★ A 包：空间语义从「隔离容器」改为「主题标签」；
+        channel=bot 时额外注入 L0 人格层（骨架只读 + 当前可调参数 + 护栏）。
+        """
         parts: list[str] = []
         runtime = self.runtime_projection(max_entries=max_runtime)
         if runtime:
@@ -436,9 +459,90 @@ class ContextLayers:
         spaces = self.spaces_list().get("spaces", [])
         active = [s for s in spaces if s.get("active")]
         if active:
-            parts.append("【激活记忆空间】" + "、".join(
-                f"{s.get('name')}({s.get('provider')})" for s in active))
+            label = "【Bot 全量可读主题分区】" if channel == "bot" else "【激活主题分区】"
+            text = label + "、".join(
+                f"{s.get('name')}(topic:{s.get('topic') or s.get('id')})" for s in active)
+            if channel == "bot":
+                text += " · 全部主题可读，不做隔离；人格层 L0 单独受写入门槛保护"
+            parts.append(text)
+        if channel == "bot":
+            try:
+                from core.persona import get_persona_layer
+                parts.append(get_persona_layer().compose_text())
+            except Exception:  # noqa: BLE001 - 人格层不可用时绝不阻断召回
+                pass
         return "\n\n".join(parts)
+
+    # ── 主题分区（A 包：空间 = 标签，不是隔离容器）────────────────────
+    def active_topics(self) -> list[str]:
+        return [str(s.get("topic") or s.get("id"))
+                for s in self.spaces_list().get("spaces", []) if s.get("active")]
+
+    def topics_migrate(self) -> dict[str, Any]:
+        """把 7 个空间升级为主题标签：补 topic/scope/sampleable，取消 Bot 对话隔离说明。
+
+        幂等；只改 context/spaces.json，不碰六引擎、不写 Kùzu、不动主记忆库。
+        """
+        with self._lock:
+            data = _read_json(self._spaces_path, {})
+            rows = list(data.get("spaces", []))
+            changed = 0
+            for row in rows:
+                sid = str(row.get("id") or "")
+                if not row.get("topic"):
+                    row["topic"] = sid
+                    changed += 1
+                if "scope" not in row:
+                    row["scope"] = "global-read"
+                    changed += 1
+                if "sampleable" not in row:
+                    row["sampleable"] = True
+                    changed += 1
+                if "与人的对话隔离" in str(row.get("note") or ""):
+                    row["note"] = ("Bot / Agent 通道：全量可读所有主题分区，不做隔离；"
+                                   "人格层 L0 单独受写入门槛保护")
+                    changed += 1
+            data["spaces"] = rows
+            if changed:
+                data["revision"] = int(data.get("revision", 1)) + 1
+                _atomic_json(self._spaces_path, data)
+        return {"ok": True, "changed": changed, "spaces": len(rows)}
+
+    def spaces_update(self, space_id: str, **patch: Any) -> dict[str, Any]:
+        """前端手动改空间的名称/说明/激活/采样开关（只动元数据）。"""
+        allowed = {"name", "note", "active", "sampleable", "scope", "topic", "provider"}
+        with self._lock:
+            data = _read_json(self._spaces_path, {})
+            rows = list(data.get("spaces", []))
+            row = next((r for r in rows if str(r.get("id")) == str(space_id)), None)
+            if row is None:
+                return {"ok": False, "error": f"空间不存在：{space_id}"}
+            for key, value in patch.items():
+                if key in allowed:
+                    row[key] = value
+            data["spaces"] = rows
+            data["revision"] = int(data.get("revision", 1)) + 1
+            _atomic_json(self._spaces_path, data)
+        return {"ok": True, "space": row}
+
+    def spaces_delete(self, space_id: str) -> dict[str, Any]:
+        """删除空间元数据；default 空间禁删。记忆迁移由 RPC 层完成（本层不碰六引擎）。"""
+        sid = str(space_id)
+        if sid == "default":
+            return {"ok": False, "error": "默认空间不可删除"}
+        with self._lock:
+            data = _read_json(self._spaces_path, {})
+            rows = list(data.get("spaces", []))
+            row = next((r for r in rows
+                        if str(r.get("id")) == sid or str(r.get("topic")) == sid), None)
+            if row is None:
+                return {"ok": False, "error": f"空间不存在：{sid}"}
+            rows = [r for r in rows if r is not row]
+            data["spaces"] = rows
+            data["revision"] = int(data.get("revision", 1)) + 1
+            _atomic_json(self._spaces_path, data)
+        return {"ok": True, "id": sid, "name": row.get("name", ""),
+                "topic": row.get("topic", sid), "remaining": len(rows)}
 
 
 _LAYERS: ContextLayers | None = None

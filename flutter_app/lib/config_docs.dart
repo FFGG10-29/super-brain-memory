@@ -1,5 +1,5 @@
-// 由 ui/desktop/widgets.py 的 FIELD_LABELS / FIELD_HINTS 自动生成，请勿手改。
-// Qt 版「鼠标悬停参数名显示解释」的等价实现：全量配置页每个字段都带 Tooltip。
+// 由后端配置字段元信息自动生成（config.py），请勿手改。
+// 前端「鼠标悬停参数名显示解释」的等价实现：全量配置页每个字段都带 Tooltip。
 // 重新生成：python 脚本解析 widgets.py 的两个 dict 即可。
 import 'package:flutter/material.dart';
 
@@ -229,7 +229,7 @@ const Map<String, String> kSectionLabels = <String, String>{
   "ui": "外观与动画",
 };
 
-// Qt 版未覆盖的新字段 / 被隐藏的外观参数：补齐中文名与悬停说明。
+// 新增字段与隐藏外观参数：补齐中文名与悬停说明。
 const Map<String, String> kExtraLabels = <String, String>{
   "embed_backend": "Embedding 来源",
   "embed_base_url": "Embedding API 地址",
@@ -315,7 +315,7 @@ String fieldLabel(String field) => kFieldLabels[field] ?? kExtraLabels[field] ??
 String sectionLabel(String section) => kSectionLabels[section] ?? section;
 String fieldHint(String field) => kFieldHints[field] ?? kExtraHints[field] ?? '';
 
-/// Qt 版 label.setToolTip 的等价物：解释 + 空行 + 完整参数名。
+/// 前端 label.setToolTip 的等价物：解释 + 空行 + 完整参数名。
 String configTooltip(String section, String field) {
   final hint = fieldHint(field);
   final key = '$section.$field';

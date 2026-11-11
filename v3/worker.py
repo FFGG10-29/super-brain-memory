@@ -62,9 +62,12 @@ class V3Worker:
                     })
                 self.processed += 1
                 return
+            # ★ A 包：把 journal 里的 namespace 一路带到落库，
+            #   否则 handle_event 收到的 topic:<id> 会在 worker 丢失、全落 private。
+            _ns = str(payload.get("namespace") or row.get("namespace") or "topic:default")
             result = self._app.hippocampus.remember(
                 str(row["content"]), agent_id=str(row["agent_id"]),
-                emit_event=False, use_llm=self._use_llm,
+                namespace=_ns, emit_event=False, use_llm=self._use_llm,
             )
             ok = self._inbox.finish(event_id, self.worker_id, ok=True)
             if not ok:

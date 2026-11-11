@@ -5,8 +5,8 @@
     memory.list / core_memory.get / core_memory.set / timeline / import_memories
     config.presets / config.apply_preset / config.reset / gateway.status
     system.stats / autostart.* / secrets.* / data.* / tray.* / pad.distribution /
-    graph.projection（Flutter 完全替代 Qt 所需的桌面能力）
-业务实现全部走 `brain.memory_service` 与 `core.*`（不依赖 Qt / ui.desktop）。
+    graph.projection（Flutter 桌面能力）
+业务实现全部走 `brain.memory_service` 与 `core.*`（不依赖任何 UI 框架模块）。
 """
 from __future__ import annotations
 
@@ -34,9 +34,11 @@ class RpcExtension:
 
     # ── 记忆检查器 / 用户控制闭环 ───────────────────────────────────────
     def _memory_list(self, limit: int = 200, tier: str = "", memory_type: str = "",
-                     namespace: str = "", keyword: str = "", **_: Any) -> list[dict[str, Any]]:
+                     namespace: str = "", keyword: str = "", since_ms: int = 0,
+                     **_: Any) -> list[dict[str, Any]]:
         return self._svc.memories(limit=int(limit), tier=str(tier), memory_type=str(memory_type),
-                                  namespace=str(namespace), keyword=str(keyword))
+                                  namespace=str(namespace), keyword=str(keyword),
+                                  since_ms=int(since_ms))
 
     def _memory_inspect(self, memory_id: str = "", **_: Any) -> dict[str, Any]:
         return self._svc.detail(str(memory_id))
@@ -314,7 +316,7 @@ class RpcExtension:
                 "by_type": by_type, "by_tier": by_tier}
 
     def _graph_projection(self, limit: int = 1200, **_: Any) -> dict[str, Any]:
-        """Qt 2D 语义环布局的服务端等价：环=分层，扇区=类型，扇区内角度=形成时间。
+        """2D 语义环布局的服务端等价：环=分层，扇区=类型，扇区内角度=形成时间。
 
         坐标是确定性的（同 id → 同位置），Flutter 直接画 CustomPainter，
         与 3D 星云共享同一份 neurons 数据，实现真正的联动而非另造一份。
@@ -384,4 +386,227 @@ class RpcExtension:
                     "target": getattr(edge, "target", ""),
                     "weight": getattr(edge, "weight", 0.5),
                 })
+        return result
+
+    # ── A 包：主题分区（空间 = 标签，不是隔离容器）────────────────────
+    def _topics_list(self, **_: Any) -> dict[str, Any]:
+        layers = self._layers()
+        spaces = layers.spaces_list().get("spaces", [])
+        by_namespace: dict[str, int] = {}
+        try:
+            app = self._daemon.app
+            if app is not None:
+                # 主库实时计数，避免投影延迟让前端空间数量滞后
+                conn = app.storage.relational._pool.get()
+                by_namespace = {str(r[0]): int(r[1]) for r in conn.execute(
+                    "SELECT namespace,count(*) FROM neurons WHERE is_active=1 GROUP BY namespace"
+                ).fetchall()}
+            else:
+                for row in self._daemon._rows(limit=5000):
+                    key = str(row.get("namespace") or "private")
+                    by_namespace[key] = by_namespace.get(key, 0) + 1
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "spaces": spaces, "active_topics": layers.active_topics(),
+                "by_namespace": by_namespace, "binding_mode": "topic-label",
+                "isolation": False, "bot_reads_all": True}
+
+    def _topics_migrate(self, **_: Any) -> dict[str, Any]:
+        return self._layers().topics_migrate()
+
+    def _spaces_update(self, id: str = "", name: str | None = None,  # noqa: A002
+                       note: str | None = None, active: bool | None = None,
+                       sampleable: bool | None = None, scope: str | None = None,
+                       **_: Any) -> dict[str, Any]:
+        patch: dict[str, Any] = {}
+        for key, value in (("name", name), ("note", note), ("active", active),
+                           ("sampleable", sampleable), ("scope", scope)):
+            if value is not None:
+                patch[key] = value
+        return self._layers().spaces_update(str(id), **patch)
+
+    def _spaces_delete(self, id: str = "", migrate_to: str = "default", **_: Any) -> dict[str, Any]:
+        """删除空间：先把该空间活跃记忆版本化更正迁到目标空间，再删元数据。
+
+        迁移走 MemoryEditor.correct（封存旧版本 + 建新活跃版本 + 写审计），
+        不直连数据库、不碰 Kùzu 单写锁。default 空间禁止删除；
+        迁移有失败则整单取消，避免留下 namespace 指向已删空间的孤儿记忆。
+        """
+        sid = str(id).strip()
+        if not sid or sid == "default":
+            return {"ok": False, "error": "默认空间不可删除 / id 不能为空"}
+        layers = self._layers()
+        spaces = layers.spaces_list().get("spaces", [])
+        row = next((s for s in spaces
+                    if str(s.get("id")) == sid or str(s.get("topic")) == sid), None)
+        if row is None:
+            return {"ok": False, "error": f"空间不存在：{sid}"}
+        topic_id = str(row.get("topic") or row.get("id"))
+        target = str(migrate_to or "default")
+        target_row = next((s for s in spaces
+                           if str(s.get("id")) == target or str(s.get("topic")) == target), None)
+        if target_row is None:
+            return {"ok": False, "error": f"迁移目标空间不存在：{target}"}
+        target_topic = str(target_row.get("topic") or target_row.get("id"))
+        src_ns, dst_ns = f"topic:{topic_id}", f"topic:{target_topic}"
+        try:
+            app = self._daemon.app
+            if app is None:
+                raise RuntimeError("后端内核未就绪")
+            # ★ 必须读主库实时数据：投影库 _rows 有 outbox 延迟，
+            #   刚写入的记忆可能尚未投影，用它扫描会漏迁并留下孤儿 namespace。
+            conn = app.storage.relational._pool.get()
+            ids = [str(r[0]) for r in conn.execute(
+                "SELECT id FROM neurons WHERE is_active=1 AND namespace=?", (src_ns,)
+            ).fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"扫描待迁移记忆失败：{exc}"}
+        migrated = failed = 0
+        errors: list[str] = []
+        for mid in ids:
+            try:
+                res = self._svc.correct(
+                    mid, {"namespace": dst_ns},
+                    reason=f"空间删除迁移：{row.get('name') or topic_id} → {target_topic}",
+                    actor="spaces_delete",
+                )
+                if res.get("ok", True):
+                    migrated += 1
+                else:
+                    failed += 1
+                    if len(errors) < 5:
+                        errors.append(f"{mid}: {res.get('message', '')}")
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"{mid}: {exc}")
+        if failed:
+            return {"ok": False, "error": f"迁移失败 {failed}/{len(ids)}，已取消删除（避免孤儿记忆）",
+                    "scanned": len(ids), "migrated": migrated, "failed": failed, "errors": errors}
+        deleted = layers.spaces_delete(sid)
+        result: dict[str, Any] = {
+            "ok": bool(deleted.get("ok")), "id": sid, "name": row.get("name", ""),
+            "from": src_ns, "to": dst_ns, "scanned": len(ids),
+            "migrated": migrated, "failed": failed,
+        }
+        if not deleted.get("ok"):
+            result["delete_error"] = deleted.get("error")
+        return result
+
+    def _memory_reclassify(self, items: list[dict[str, Any]] | None = None,
+                           dry_run: bool = False, **_: Any) -> dict[str, Any]:
+        """分批回填类别索引：每条由调用方（对话大模型）判定 topic / PAD / 类型。
+
+        走后端 MemoryEditor.correct 版本化更正，保留审计，不直连数据库、不碰 Kùzu 锁。
+        dry_run=True 只返回将要写入的变更，用于前端预览与用户确认。
+        """
+        rows = [x for x in (items or []) if isinstance(x, dict)][:200]
+        out: list[dict[str, Any]] = []
+        for item in rows:
+            mid = str(item.get("id") or "")
+            if not mid:
+                continue
+            changes: dict[str, Any] = {}
+            topic = str(item.get("topic") or "")
+            if topic:
+                changes["namespace"] = topic if topic.startswith("topic:") else f"topic:{topic}"
+            for key in ("memory_type", "confidence", "pad_p", "pad_a", "pad_d", "tier"):
+                if item.get(key) is not None:
+                    changes[key] = item[key]
+            if not changes:
+                continue
+            if dry_run:
+                out.append({"id": mid, "would_apply": changes})
+                continue
+            try:
+                result = self._svc.correct(mid, changes, reason="A 包类别索引回填", actor="reclassify")
+                out.append({"id": mid, "ok": bool(result.get("ok", True)),
+                            "message": result.get("message", "")})
+            except Exception as exc:  # noqa: BLE001
+                out.append({"id": mid, "ok": False, "message": str(exc)})
+        return {"ok": True, "dry_run": bool(dry_run), "count": len(out), "results": out,
+                "note": "每条经后端版本化更正；补 PAD 请同时传 pad_p/pad_a/pad_d"}
+
+    # ── C 包：真实关联边（带方向 / 谓词 / 权重）────────────────────────
+    def _graph_real_edges(self, limit: int = 500, **_: Any) -> dict[str, Any]:
+        app = self._daemon.app
+        if app is None:
+            return {"ok": False, "error": "后端内核未就绪", "edges": []}
+        try:
+            edges = app.storage.graph.real_edges(limit=int(limit))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "edges": []}
+        return {
+            "ok": True, "source": "kuzu", "count": len(edges), "edges": edges,
+            "relates": sum(1 for e in edges if e["kind"] == "RELATES"),
+            "member": sum(1 for e in edges if e["kind"] == "MEMBER"),
+            "note": "旧 graph() 的边是 2-gram 两两现算（无方向无谓词）；此处为 Kùzu 真实关系",
+        }
+
+    # ── L0 人格层（前端可视化 + 手动微调）──────────────────────────────
+    def _mirror_persona(self, params: dict[str, Any]) -> None:
+        """镜像到 LMDB kv persona/fish/params，供 AstrBot 侧读取生成提示词。"""
+        try:
+            import json
+            app = self._daemon.app
+            if app is not None:
+                app.storage.kv.put("persona", "fish/params",
+                                   json.dumps(params, ensure_ascii=False).encode("utf-8"))
+        except Exception:  # noqa: BLE001 - 镜像失败不影响人格层主存
+            pass
+
+    def _persona_get(self, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        return get_persona_layer().get()
+
+    def _persona_baseline(self, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        return {"ok": True, "content": get_persona_layer().baseline_text()}
+
+    def _persona_baseline_write(self, content: str = "", confirm: str = "",
+                                actor: str = "frontend", **_: Any) -> dict[str, Any]:
+        """骨架唯一写入口：仅前端人格设定页调用，需授权短语。MCP 侧不注册本方法。"""
+        from core.persona import get_persona_layer
+        return get_persona_layer().set_baseline(str(content), confirm=str(confirm), actor=str(actor))
+
+    def _persona_status(self, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        return get_persona_layer().status()
+
+    def _persona_set_params(self, patch: dict[str, Any] | None = None,
+                            actor: str = "frontend", reason: str = "",
+                            confirm_skeleton: bool = False, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        result = get_persona_layer().set_params(
+            patch or {}, actor=str(actor), reason=str(reason),
+            confirm_skeleton=bool(confirm_skeleton))
+        if result.get("ok"):
+            self._mirror_persona(result.get("params") or {})
+        return result
+
+    def _persona_rollback(self, version: int = 0, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        result = get_persona_layer().rollback(int(version))
+        if result.get("ok"):
+            self._mirror_persona(result.get("params") or {})
+        return result
+
+    def _persona_feedback(self, signal: str = "", valence: float = 0.0,
+                          target: str = "sassiness", note: str = "",
+                          session_id: str = "", actor: str = "bot", **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        return get_persona_layer().feedback(
+            signal=str(signal), valence=float(valence or 0.0), target=str(target),
+            note=str(note), session_id=str(session_id), actor=str(actor))
+
+    def _persona_proposals(self, **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        return get_persona_layer().proposals()
+
+    def _persona_apply_proposal(self, id: str = "", actor: str = "frontend",  # noqa: A002
+                                **_: Any) -> dict[str, Any]:
+        from core.persona import get_persona_layer
+        result = get_persona_layer().apply_proposal(str(id), actor=str(actor))
+        if result.get("ok"):
+            self._mirror_persona(result.get("params") or {})
         return result

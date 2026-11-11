@@ -1,7 +1,7 @@
 """core.desktop_features —— 开机自启 / 密钥保管 / 数据目录迁移（与 UI 框架无关）。
 
-Flutter 前端要能完全替代 Qt：这三类系统能力原先都在 `ui/desktop/` 里，
-而后端冻结 spec 会 `excludes` 掉 PySide6 与 `ui.desktop`，所以必须下沉到 core。
+系统级桌面能力（开机自启 / 密钥保管 / 数据目录迁移）统一在 core.* 实现，
+与任何 UI 框架无关，后端冻结包无 GUI。
 - 自启：Windows 用户级 Run 键（不写系统目录，不需要管理员）。
 - 密钥：优先系统 keyring，不可用则用 DPAPI 加密文件兜底（只有当前 Windows 用户能解）。
 - 数据目录迁移：复制到目标 + 写 `data_pointer.json`，后端重启后由 `runtime_paths.data_dir()` 生效。

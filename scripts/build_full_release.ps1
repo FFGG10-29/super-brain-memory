@@ -11,7 +11,9 @@ param(
     [switch]$SkipBackend,
     [switch]$Launch
 )
-$ErrorActionPreference = 'Stop'
+# 用 Continue：PyInstaller/ISCC 等原生命令会把进度日志写到 stderr，
+# 若用 Stop 会被 PowerShell 当作 NativeCommandError 把整个构建掐死。
+$ErrorActionPreference = 'Continue'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $root
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'

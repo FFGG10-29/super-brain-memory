@@ -14,7 +14,7 @@ const Color _border = Color(0xFF142238);
 typedef OpenMemoryCallback = void Function(String id);
 typedef NebulaSearchCallback = void Function(String query);
 
-/// Qt 六路召回通道（顺序与配色来自 ui/desktop/pages/recall_page.py）。
+/// 六路召回通道（顺序与配色来自后端召回逻辑）。
 const List<Map<String, Object>> _channels = <Map<String, Object>>[
   <String, Object>{'key': 'dense', 'label': '语义向量', 'color': Color(0xFF6EC6FF)},
   <String, Object>{'key': 'sparse', 'label': '稀疏词元', 'color': Color(0xFFB08CFF)},
@@ -635,7 +635,7 @@ class _Graph2DPageState extends State<Graph2DPage> {
     final selected = _selected;
     return PageFrame(
       title: '2D 语义环检查器',
-      subtitle: 'Qt 2D 可分析控制台的等价视图：确定性语义布局 + 节点标签 + 关系连线；点击节点可联动检查器与 3D 星云',
+      subtitle: '2D 语义环分析视图：确定性语义布局 + 节点标签 + 关系连线；点击节点可联动检查器与 3D 星云',
       child: Column(
         children: <Widget>[
           Row(
@@ -722,7 +722,7 @@ class _Graph2DPageState extends State<Graph2DPage> {
                     const Spacer(),
                     const SizedBox(height: 12),
                     const Text('联动说明：2D 与 3D 星云读取同一份主库 neurons，'
-                        '坐标算法与 Qt 语义环一致（同 ID 必在同位置），因此可在两视图与检查器之间自由跳转。',
+                        '坐标算法与前端语义环一致（同 ID 必在同位置），因此可在两视图与检查器之间自由跳转。',
                         style: TextStyle(color: Color(0xFF5D7690), fontSize: 10, height: 1.6)),
                   ]),
                 ),
@@ -785,7 +785,7 @@ class _SemanticRingPainter extends CustomPainter {
         canvas.drawCircle(point, radius + 7,
             Paint()..color = Colors.white..style = PaintingStyle.stroke..strokeWidth = 1.5);
       }
-      // 只给高置信度节点画标签，避免 3000+ 节点糊成一片（与 Qt 的标签优先级策略一致）
+      // 只给高置信度节点画标签，避免 3000+ 节点糊成一片（与标签优先级策略一致）
       if (labeled < 45 && (_d(node['confidence']) > 0.72 || chosen)) {
         final text = '${_s(node['type'])} ● ${_s(node['content']).substring(0, math.min(12, _s(node['content']).length))}';
         final painter = TextPainter(

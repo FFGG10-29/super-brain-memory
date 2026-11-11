@@ -1,8 +1,7 @@
 """core.system_stats —— CPU / 内存 / 显卡实时采样（与 UI 框架无关）。
 
-从 `ui.desktop.system_stats` 下沉而来：无头后端与 Flutter 顶栏仪表共用。
-Qt 前端保留为隐藏调试入口且冻结包会 excludes 掉 `ui.desktop`，
-所以后端**不能**再 import 它，否则发行包启动时 ModuleNotFoundError。
+无头后端与 Flutter 顶栏仪表共用。后端不依赖任何 UI 框架模块，
+UI 能力全部落在 core.*，发行包无 GUI。
 
 - CPU / 内存：psutil（缺失/受限时优雅降级为 None，前端显示「—」）
 - 显卡：`nvidia-smi`（没有 N 卡或没装驱动时返回 None）

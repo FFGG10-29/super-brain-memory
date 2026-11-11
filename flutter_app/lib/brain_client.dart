@@ -140,7 +140,19 @@ class BrainClient {
       final data = _asMap(await call('graph'));
       if (data['error'] == null && data['nodes'] is List) {
         final rawNodes = (data['nodes'] as List<dynamic>).length;
-        final built = BrainGraph.fromJson(data);
+        // 星团标签：把 topic:<id> 映射成空间名（后端不可用时静默降级为 id）
+        Map<String, String> topicNames = <String, String>{};
+        try {
+          final tl = _asMap(await call('topics.list').timeout(
+              const Duration(seconds: 2),
+              onTimeout: () => <String, dynamic>{}));
+          for (final raw in _asList(tl['spaces'])) {
+            final s = _asMap(raw);
+            final id = (s['id'] ?? '').toString();
+            if (id.isNotEmpty) topicNames[id] = (s['name'] ?? id).toString();
+          }
+        } catch (_) {}
+        final built = BrainGraph.fromJson(data, topicNames: topicNames);
         debugPrint('[nebula] graph ok: raw=$rawNodes parsed=${built.nodes.length} '
             'edges=${built.edges.length} clusters=${built.clusters.length}');
         return built;
@@ -213,6 +225,45 @@ class BrainClient {
   Future<Map<String, dynamic>> snapshot() async => _asMap(await call('snapshot'));
   Future<Map<String, dynamic>> spaces() async => _asMap(await call('spaces'));
   Future<Map<String, dynamic>> engines() async => _asMap(await call('engines'));
+
+  /// 系统概览增强：六引擎实时计数 / 投影足迹 / 空间绑定 / 召回通道 / 清洗记录。
+  Future<Map<String, dynamic>> storageOverview() async =>
+      _asMap(await call('storage.overview'));
+
+  // ── L0 人格层：可视化 + 手动微调 + 反馈演化 ──────────────────────────
+  Future<Map<String, dynamic>> personaGet() async => _asMap(await call('persona.get'));
+  Future<Map<String, dynamic>> personaStatus() async => _asMap(await call('persona.status'));
+  Future<String> personaBaseline() async {
+    final d = _asMap(await call('persona.baseline'));
+    return (d['content'] ?? '').toString();
+  }
+  Future<Map<String, dynamic>> personaSetParams(Map<String, dynamic> patch,
+          {String reason = '前端手动微调'}) async =>
+      _asMap(await call('persona.set_params', <String, dynamic>{
+        'patch': patch, 'actor': 'flutter', 'reason': reason,
+      }));
+  Future<Map<String, dynamic>> personaRollback(int version) async =>
+      _asMap(await call('persona.rollback', <String, dynamic>{'version': version}));
+  Future<Map<String, dynamic>> personaProposals() async =>
+      _asMap(await call('persona.proposals'));
+  Future<Map<String, dynamic>> personaApplyProposal(String id) async =>
+      _asMap(await call('persona.apply_proposal', <String, dynamic>{'id': id}));
+  Future<Map<String, dynamic>> personaFeedback({
+    required String signal,
+    required double valence,
+    String target = 'sassiness',
+    String sessionId = 'flutter',
+  }) async =>
+      _asMap(await call('persona.feedback', <String, dynamic>{
+        'signal': signal, 'valence': valence, 'target': target,
+        'session_id': sessionId, 'actor': 'flutter',
+      }));
+
+  // ── 主题分区 / 真实关联边 ────────────────────────────────────────────
+  Future<Map<String, dynamic>> topicsList() async => _asMap(await call('topics.list'));
+  Future<Map<String, dynamic>> topicsMigrate() async => _asMap(await call('topics.migrate'));
+  Future<Map<String, dynamic>> realEdges({int limit = 500}) async =>
+      _asMap(await call('graph.real_edges', <String, dynamic>{'limit': limit}));
   Future<Map<String, dynamic>> modelStatus() async => _asMap(await call('model_status'));
   Future<Map<String, dynamic>> gateway() async => _asMap(await call('gateway'));
 
@@ -299,6 +350,9 @@ class BrainClient {
   Future<Map<String, dynamic>> spacesActivate(String id, bool active) async =>
       _asMap(await call('spaces.activate', <String, dynamic>{'id': id, 'active': active}));
 
+  Future<Map<String, dynamic>> spacesDelete(String id, {String migrateTo = 'default'}) async =>
+      _asMap(await call('spaces.delete', <String, dynamic>{'id': id, 'migrate_to': migrateTo}));
+
   Future<Map<String, dynamic>> skillsList() async =>
       _asMap(await call('skills.list'));
 
@@ -336,10 +390,56 @@ class BrainClient {
         .toList();
   }
 
-  Future<List<MemoryRow>> memories({int limit = 200}) async {
-    final data = await call('memories', <String, dynamic>{'limit': limit});
-    // WS 直接返回数组；HTTP 兜底返回 {"memories":[...]} / {"result":[...]}
-    return _asList(data).map((row) => MemoryRow.fromJson(_asMap(row))).toList();
+  // ── 记忆全量缓存 ──────────────────────────────────────────────────────
+  // 首次拉全量（慢可接受，类似星云图首屏）；之后只增量拉 updated_at_ms 大于已缓存
+  // 最大值的记忆并合并。列表永远从缓存读，按时间戳最新在前。遗忘/封存靠 full
+  // 同步对账清除（主动操作后走 full）。
+  final Map<String, Map<String, dynamic>> _memCache = <String, Map<String, dynamic>>{};
+  int _memMaxTs = 0;
+  bool _memReady = false;
+
+  int _tsOf(Map<String, dynamic> row) {
+    final v = row['updated_at_ms'];
+    if (v is num) return v.toInt();
+    final id = row['id']?.toString() ?? '';
+    final hex = id.replaceAll('-', '');
+    if (hex.length >= 12) {
+      final ms = int.tryParse(hex.substring(0, 12), radix: 16);
+      if (ms != null) return ms;
+    }
+    return 0;
+  }
+
+  void _absorbMem(Map<String, dynamic> row) {
+    final id = row['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    _memCache[id] = row;
+    final ts = _tsOf(row);
+    if (ts > _memMaxTs) _memMaxTs = ts;
+  }
+
+  Future<void> syncMemories({bool full = false}) async {
+    if (full || !_memReady) {
+      final rows = await memoryList(limit: 0);
+      _memCache.clear();
+      _memMaxTs = 0;
+      for (final row in rows) _absorbMem(row);
+      _memReady = true;
+    } else if (_memMaxTs > 0) {
+      final rows = await memoryList(limit: 0, sinceMs: _memMaxTs);
+      for (final row in rows) _absorbMem(row);
+    }
+  }
+
+  List<Map<String, dynamic>> get memCacheView {
+    final list = _memCache.values.toList();
+    list.sort((a, b) => _tsOf(b).compareTo(_tsOf(a))); // 最新在前
+    return list;
+  }
+
+  Future<List<MemoryRow>> memories({bool full = false}) async {
+    await syncMemories(full: full);
+    return memCacheView.map((row) => MemoryRow.fromJson(row)).toList();
   }
 
   Future<Map<String, dynamic>> saveMemory(String content, {String agentId = 'flutter'}) async =>
@@ -351,12 +451,14 @@ class BrainClient {
   }
 
   // ── 功能补齐：检查器 / 用户控制 / 时间轴 / 导入 / 全量配置 ──────────
-  Future<List<Map<String, dynamic>>> memoryList({int limit = 200, String keyword = '',
-      String tier = '', String memoryType = '', String namespace = ''}) async {
-    final data = await call('memory.list', <String, dynamic>{
+  Future<List<Map<String, dynamic>>> memoryList({int limit = 0, String keyword = '',
+      String tier = '', String memoryType = '', String namespace = '', int sinceMs = 0}) async {
+    final args = <String, dynamic>{
       'limit': limit, 'keyword': keyword, 'tier': tier,
       'memory_type': memoryType, 'namespace': namespace,
-    });
+    };
+    if (sinceMs > 0) args['since_ms'] = sinceMs;
+    final data = await call('memory.list', args);
     final rows = _asList(data);
     return rows.map((row) => _asMap(row)).toList();
   }
@@ -407,7 +509,7 @@ class BrainClient {
         'text': text, 'suffix': suffix, 'fast': fast,
       }));
 
-  // ── 完全替代 Qt 所需的桌面能力（后端 core.* 下沉模块）───────────────
+  // ── 桌面能力（后端 core.* 下沉模块）───────────────
   Future<Map<String, dynamic>> systemStats() async => _asMap(await call('system.stats'));
 
   Future<Map<String, dynamic>> padDistribution({int limit = 1200}) async =>
@@ -556,12 +658,13 @@ class RecallHit {
 }
 
 class MemoryRow {
-  MemoryRow({required this.id, required this.content, this.memoryType = 'fact', this.tier = 'buffer', this.pad = const <double>[0, 0, 0]});
+  MemoryRow({required this.id, required this.content, this.memoryType = 'fact', this.tier = 'buffer', this.pad = const <double>[0, 0, 0], this.updatedAtMs = 0});
   final String id;
   final String content;
   final String memoryType;
   final String tier;
   final List<double> pad;
+  final int updatedAtMs;
 
   factory MemoryRow.fromJson(Map<String, dynamic> json) => MemoryRow(
         id: json['id']?.toString() ?? '',
@@ -571,6 +674,9 @@ class MemoryRow {
         pad: _asList(json['pad'])
             .map((value) => (value as num? ?? 0).toDouble())
             .toList(),
+        updatedAtMs: json['updated_at_ms'] is num
+            ? (json['updated_at_ms'] as num).toInt()
+            : 0,
       );
 }
 

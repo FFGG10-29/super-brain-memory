@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
+import 'pages.dart';
 
 /// 分层上下文 UI —— 对齐 dsh-mnemon 的「记忆系统」五个页签：
 /// 状态 / 运行时记忆 / 项目档案 / 记忆空间 / 技能管理。
@@ -11,6 +12,7 @@ import 'brain_client.dart';
 const Color _hint = Color(0xFF6B839F);
 const Color _accent = Color(0xFF4FC3F7);
 const Color _panel = Color(0xFF0A1424);
+const Color _panel2 = Color(0xFF16233A);
 
 Widget _frame(String title, String subtitle, Widget child) => Padding(
       padding: const EdgeInsets.all(18),
@@ -421,7 +423,9 @@ class MemorySpacesPage extends StatefulWidget {
 
 class _MemorySpacesPageState extends State<MemorySpacesPage> {
   List<dynamic> _spaces = <dynamic>[];
+  Map<String, int> _counts = <String, int>{}; // namespace → 记忆数（topics.list.by_namespace）
   String _error = '';
+  String _tip = '';
 
   @override
   void initState() {
@@ -432,10 +436,28 @@ class _MemorySpacesPageState extends State<MemorySpacesPage> {
   Future<void> _load() async {
     try {
       final data = await widget.client.spacesList();
-      if (mounted) setState(() => _spaces = data['spaces'] as List<dynamic>? ?? <dynamic>[]);
+      Map<String, int> counts = <String, int>{};
+      try {
+        final topics = await widget.client.topicsList();
+        final raw = topics['by_namespace'];
+        if (raw is Map) {
+          raw.forEach((k, v) => counts['$k'] = (v is num) ? v.toInt() : 0);
+        }
+      } catch (_) {} // 计数失败不阻塞空间列表
+      if (mounted) {
+        setState(() {
+          _spaces = data['spaces'] as List<dynamic>? ?? <dynamic>[];
+          _counts = counts;
+        });
+      }
     } catch (error) {
       if (mounted) setState(() => _error = '$error');
     }
+  }
+
+  int _countOf(Map<String, dynamic> row) {
+    final id = '${row['id']}';
+    return _counts['topic:$id'] ?? _counts[id] ?? 0;
   }
 
   Future<void> _create() async {
@@ -473,6 +495,44 @@ class _MemorySpacesPageState extends State<MemorySpacesPage> {
     await _load();
   }
 
+  Future<void> _delete(Map<String, dynamic> row) async {
+    final id = '${row['id']}';
+    if (id == 'default') return; // 默认空间禁删（后端也会再拦一次）
+    final name = '${row['name']}';
+    final count = _countOf(row);
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _panel,
+        title: const Text('删除记忆空间', style: TextStyle(color: Colors.white, fontSize: 15)),
+        content: Text(
+          '确定删除「$name」？\n该空间下 $count 条记忆会迁入「默认空间」，记忆正文不会丢失。',
+          style: const TextStyle(color: Colors.white70, fontSize: 12),
+        ),
+        actions: <Widget>[
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    try {
+      final res = await widget.client.spacesDelete(id);
+      if (mounted) {
+        setState(() => _tip = res['ok'] == true
+            ? '已删除「$name」：${res['migrated'] ?? 0} 条记忆迁入默认空间'
+            : '删除失败：${res['error'] ?? '未知错误'}');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _tip = '删除失败：$e');
+    }
+    await _load();
+  }
+
   @override
   Widget build(BuildContext context) => _frame(
         '记忆空间',
@@ -483,6 +543,9 @@ class _MemorySpacesPageState extends State<MemorySpacesPage> {
             const SizedBox(width: 10),
             TextButton(onPressed: _load, child: const Text('刷新')),
           ]),
+          if (_tip.isNotEmpty)
+            Padding(padding: const EdgeInsets.only(top: 8),
+                child: Text(_tip, style: const TextStyle(color: _accent, fontSize: 11))),
           if (_error.isNotEmpty)
             Padding(padding: const EdgeInsets.only(top: 8),
                 child: Text('读取失败：$_error', style: const TextStyle(color: Colors.redAccent, fontSize: 11))),
@@ -491,19 +554,52 @@ class _MemorySpacesPageState extends State<MemorySpacesPage> {
             itemCount: _spaces.length,
             itemBuilder: (ctx, index) {
               final row = Map<String, dynamic>.from(_spaces[index] as Map);
+              final count = _countOf(row);
               return ListTile(
                 leading: Icon(row['active'] == true ? Icons.radio_button_checked : Icons.radio_button_off,
                     color: row['active'] == true ? _accent : _hint, size: 18),
-                title: Text('${row['name']}', style: const TextStyle(color: Colors.white, fontSize: 12)),
-                subtitle: Text('${row['provider']} · ${row['note'] ?? ''}',
+                title: Row(children: <Widget>[
+                  Expanded(child: Text('${row['name']}', style: const TextStyle(color: Colors.white, fontSize: 12))),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: count > 0 ? _accent.withValues(alpha: 0.18) : _panel2,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text('$count 条',
+                        style: TextStyle(color: count > 0 ? _accent : _hint, fontSize: 10)),
+                  ),
+                ]),
+                subtitle: Text('${row['provider']} · ${row['note'] ?? ''} · 点击查看记忆',
                     style: const TextStyle(color: _hint, fontSize: 11)),
-                trailing: Switch(
-                  value: row['active'] == true,
-                  onChanged: (bool v) async {
-                    await widget.client.spacesActivate('${row['id']}', v);
-                    await _load();
-                  },
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    if ('${row['id']}' != 'default')
+                      IconButton(
+                        tooltip: '删除空间（记忆迁入默认空间）',
+                        icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
+                        onPressed: () => _delete(row),
+                      ),
+                    Switch(
+                      value: row['active'] == true,
+                      onChanged: (bool v) async {
+                        await widget.client.spacesActivate('${row['id']}', v);
+                        await _load();
+                      },
+                    ),
+                  ],
                 ),
+                onTap: () async {
+                  await Navigator.push(context, MaterialPageRoute<void>(
+                    builder: (_) => SpaceMemoriesPage(
+                      client: widget.client,
+                      spaceId: '${row['id']}',
+                      spaceName: '${row['name']}',
+                    ),
+                  ));
+                  await _load(); // 返回后刷新计数
+                },
               );
             },
           ))),

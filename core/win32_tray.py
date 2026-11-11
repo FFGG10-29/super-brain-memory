@@ -1,6 +1,6 @@
-"""core.win32_tray —— 纯 ctypes 系统托盘（无 Qt、无第三方依赖）。
+"""core.win32_tray —— 纯 ctypes 系统托盘（无第三方依赖）。
 
-Flutter Windows 端没有内置托盘 API，而发行包又不带 PySide6。这里直接在后端
+Flutter Windows 端没有内置托盘 API。这里直接在后端
 用 Win32 API 建一个隐藏消息窗口 + Shell_NotifyIconW，菜单动作经回调广播给
 Flutter（WS `tray_action` 事件），Flutter 再用 user32 显示/隐藏自己的窗口。
 
@@ -110,7 +110,7 @@ if _IS_WIN:
     _user32.LoadIconW.argtypes = [_HANDLE, wintypes.LPCWSTR]
     _user32.LoadIconW.restype = _HANDLE
 
-    # 品牌图标：沿用旧 Qt/Python 前端的 ui/desktop/assets/app.ico。
+    # 品牌图标：沿用项目统一图标资源。
     # 冻结态由 build.ps1 放一份到 backend\app.ico；找不到才退回系统默认图标。
     _IMAGE_ICON = 1
     _LR_LOADFROMFILE = 0x0010

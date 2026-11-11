@@ -10,7 +10,7 @@ PAD 用情绪词典估算 —— 保证"每条记忆都带 PAD"这一全链路�
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from config import BrainConfig, get_config
@@ -73,6 +73,37 @@ class RouterExtractor:
         self._llm = llm
         self._config = config or get_config()
 
+    def from_agent(self, cognition: dict[str, Any]) -> Extraction:
+        """★ 认知契约入口：外部 Agent 直接提供抽取结果，跳过本地 Qwen3-0.6B。
+
+        契约字段与 _SYSTEM_PROMPT 的 JSON 完全一致，且全部可选：
+            memory_type / pad{p,a,d} / confidence / entities / relations / hyperedge
+        复用 _from_payload 的 clamp 与白名单校验；source 标为 "agent"，
+        让 PAD 轨迹与 eval 能区分「本地模型估的」还是「外部大脑判的」。
+        """
+        payload = dict(cognition or {})
+        # 强容错：外部 Agent 字段类型不合法时收敛为空，绝不让写入链抛异常
+        if not isinstance(payload.get("pad"), dict):
+            payload["pad"] = {}
+        if not isinstance(payload.get("entities"), list):
+            payload["entities"] = []
+        else:
+            payload["entities"] = [x for x in payload["entities"] if isinstance(x, dict)]
+        if not isinstance(payload.get("relations"), list):
+            payload["relations"] = []
+        else:
+            payload["relations"] = [x for x in payload["relations"] if isinstance(x, dict)]
+        if not isinstance(payload.get("hyperedge"), dict):
+            payload["hyperedge"] = {}
+        elif not isinstance(payload["hyperedge"].get("members"), list):
+            payload["hyperedge"]["members"] = []
+        # 外部 Agent 已完成理解，缺省置信度高于 LLM 抽取的 0.6
+        payload.setdefault("confidence", 0.9)
+        extraction = self._from_payload(payload)
+        # ★ 零 PAD 兜底已统一下沉到 _from_payload（覆盖 llm/rule/agent 全部来源），
+        #   这里只负责把来源如实标为 "agent"。
+        return replace(extraction, source="agent")
+
     def extract(self, content: str, *, agent_id: str = "", use_llm: bool = True) -> Extraction:
         # 批量导入走规则抽取：LLM 单条 0.3~1s，几百条会拖成几分钟，
         # 而导入内容本来就是用户自己的正文，不需要再让模型"理解"一遍。
@@ -97,6 +128,13 @@ class RouterExtractor:
             a=_clamp_float(raw_pad.get("a", 0.0)),
             d=_clamp_float(raw_pad.get("d", 0.0)),
         )
+        # ★【2026-11-10 缺口1·统一最后防线】_from_payload 是本地0.6B(llm)、
+        #   规则(rule)、外部Agent(agent)三条抽取来源的共同出口。任何来源给出
+        #   PAD 三轴全 0（模型返回全0 / 调用方漏填 / 显式填零）一律兜中性非零基线，
+        #   从抽取出口根治「零 PAD 记忆落库」。17:26 distiller 那条零PAD即 0.6B 返回全0。
+        #   不冒充语义判定：仅满足「每条记忆 PAD 非零」不变量。
+        if pad.p == 0.0 and pad.a == 0.0 and pad.d == 0.0:
+            pad = PAD(p=0.05, a=0.10, d=0.10)
         entities = tuple(
             ExtractedEntity(name=str(item.get("name", "")).strip(), type=str(item.get("type", "concept")))
             for item in payload.get("entities") or []
@@ -139,6 +177,13 @@ class RouterExtractor:
         arousal = (arousal_hits - calm_hits) / max(arousal_hits + calm_hits, 1)
         arousal = max(arousal, 0.4 * arousal_hits / max(arousal_hits + 1, 1))
         dominance = 0.2 if negative else 0.0
+
+        # ★ 中性文本（情绪词典零命中）原本会得到 PAD=(0,0,0)，破坏「每条记忆自带 PAD」
+        #   这一全链路不变量。给极小非零基线：p=0.05（微正）、a=0.10（轻微唤醒）、
+        #   d=0.10（中性偏可控）。confidence 仍 0.45 低权重，不影响召回排序，
+        #   只是保证零 PAD 活跃记忆恒为 0（用户硬指标）。带 cognition 的写入不走这里。
+        if positive == 0 and negative == 0 and arousal_hits == 0 and calm_hits == 0:
+            valence, arousal, dominance = 0.05, 0.10, 0.10
 
         return Extraction(
             memory_type=self._rule_memory_type(text),

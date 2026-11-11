@@ -2,26 +2,25 @@
 
     .venv\\Scripts\\python.exe scripts/make_icon.py [源 PNG]
 
-输出 `ui/desktop/assets/app.ico`（16/24/32/48/64/128/256）与 `app.png`（256，托盘/关于页用）。
+输出 Flutter 安装包图标 `flutter_app/windows/runner/resources/app_icon.ico`（16/24/32/48/64/128/256）。
 """
 from __future__ import annotations
 
-import shutil
 import sys
 from pathlib import Path
 
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT / "ui" / "desktop" / "assets"
-# 原始设计稿已归档为 assets/app.png；仓库根的临时文件不再依赖
-DEFAULT_SOURCE = ASSETS / "app.png"
+ASSETS = ROOT / "flutter_app" / "windows" / "runner" / "resources"
+# 设计稿 PNG 需显式传入；仓库不再保留历史图标资源
+DEFAULT_SOURCE = None
 SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 __all__ = ["build"]
 
 
-def build(source: Path | None = None) -> tuple[Path, Path]:
+def build(source: Path | None = None) -> Path:
     src = source or DEFAULT_SOURCE
     if not src.is_file():
         raise FileNotFoundError(f"找不到图标源文件：{src}")
@@ -33,20 +32,18 @@ def build(source: Path | None = None) -> tuple[Path, Path]:
     top = (image.height - side) // 2
     square = image.crop((left, top, left + side, top + side))
 
-    ico = ASSETS / "app.ico"
+    ico = ASSETS / "app_icon.ico"
     square.save(ico, format="ICO", sizes=[(s, s) for s in SIZES])
-
-    png = ASSETS / "app.png"
-    square.resize((256, 256), Image.LANCZOS).save(png, format="PNG")
-    return ico, png
+    return ico
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    ico, png = build(Path(args[0]) if args else None)
-    print(f"图标已生成：{ico} / {png}")
-    if not (ASSETS / "app.ico").is_file():
-        shutil.copy2(png, ASSETS / "app.ico")
+    src = Path(args[0]) if args else None
+    if src is None:
+        raise SystemExit("用法：scripts/make_icon.py <设计稿 PNG>")
+    ico = build(src)
+    print(f"图标已生成：{ico}")
     return 0
 
 

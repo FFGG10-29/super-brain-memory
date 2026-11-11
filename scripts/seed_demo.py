@@ -2,7 +2,7 @@
 
     .venv\\Scripts\\python.exe scripts/seed_demo.py
 
-注意：先关闭桌面窗口再运行（Kùzu 单进程写锁）；灌完重新 `python -m ui.desktop` 即可看到。
+注意：先关闭后端进程再运行（Kùzu 单进程写锁）；灌完重启后端、用 Flutter 前端即可看到。
 走完整写入流：丘脑路由 + SimHash 去重 + PAD + 六引擎 + 事件日志，重复运行自动去重。
 """
 from __future__ import annotations
@@ -80,7 +80,7 @@ def main() -> int:
             skipped += 0 if result.applied else 1
         total = app.storage.relational.count("neuron", active_only=False)
         print(f"\n写入 {applied} 条，去重跳过 {skipped} 条；库内现有 {total} 条记忆")
-        print("重新启动桌面前端即可看到：python -m ui.desktop")
+        print("重启后端后用 Flutter 前端即可看到记忆星云")
         return 0
     finally:
         app.journal.flush()

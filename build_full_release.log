@@ -1,0 +1,113 @@
+﻿=== build start 11/09/2026 18:31:59 (policy=Bypass) ===
+=== build process exited 11/09/2026 18:31:59 rc= ===
+=== INLINE BUILD start 11/09/2026 18:33:30 ===
+--- flutter pub get ---
+Resolving dependencies...
+Downloading packages...
+  material_color_utilities 0.13.0 (0.13.1 available)
+  test_api 0.7.12 (0.7.15 available)
+Got dependencies!
+2 packages have newer versions incompatible with dependency constraints.
+Try `flutter pub outdated` for more information.
+--- flutter analyze ---
+Analyzing flutter_app...                                        
+No issues found! (ran in 3.2s)
+--- flutter build windows --release ---
+Building Windows application...                                    65.3s
+鈭?Built build\windows\x64\runner\Release\super_brain.exe
+--- build_portable --headless (regen spec) ---
+CUDA DLL 归集：25 个 → B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory\build\portable_stage\cuda_bin
+模型权重归集：9 个 → B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory\build\portable_stage\models
+已生成 super-brain-backend.spec（后端专用：无 GUI 资源）；执行：
+  .venv\Scripts\python.exe -m PyInstaller super-brain-backend.spec --noconfirm
+  .venv\Scripts\python.exe scripts/build_portable.py --trim dist/super-brain-backend
+  .venv\Scripts\python.exe scripts/build_portable.py --link-models dist/super-brain-backend
+产物 dist/super-brain-backend\headless-server.exe；由 Flutter 自动拉起，目标机器无需 Python
+--- PyInstaller ---
+281 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.9
+282 INFO: Python: 3.12.10
+311 INFO: Platform: Windows-10-10.0.19045-SP0
+311 INFO: Python environment: B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory\.venv
+828 INFO: Module search paths (PYTHONPATH):
+['D:\\workbuddy',
+ 'D:\\Python312\\python312.zip',
+ 'D:\\Python312\\DLLs',
+ 'D:\\Python312\\Lib',
+ 'D:\\Python312',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\win32',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\win32\\lib',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\pythonwin',
+ 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory']
+1477 INFO: Appending 'binaries' from .spec
+1485 INFO: checking Analysis
+1485 INFO: Building Analysis because Analysis-00.toc is non existent
+1485 INFO: Looking for Python shared library...
+1485 INFO: Using Python shared library: D:\Python312\python312.dll
+1485 INFO: Running Analysis Analysis-00.toc
+1485 INFO: Target bytecode optimization level: 0
+1485 INFO: Initializing module dependency graph...
+1488 INFO: Initializing module graph hook caches...
+1518 INFO: Analyzing modules for base_library.zip ...
+2941 INFO: Processing standard module hook 'hook-heapq.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+3338 INFO: Processing standard module hook 'hook-encodings.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5150 INFO: Processing standard module hook 'hook-math.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5462 INFO: Processing standard module hook 'hook-pickle.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+7462 INFO: Caching module dependency graph...
+7527 INFO: Analyzing B:\BaiduSyncdisk\desktop\VSProject\super-brain-memory\backend_entry.py
+7658 INFO: Processing standard module hook 'hook-pydantic.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+8299 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+8302 INFO: SetuptoolsInfo: initializing cached setuptools info...
+9676 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+9952 INFO: Processing standard module hook 'hook-xml.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+10420 INFO: Processing standard module hook 'hook-_ctypes.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+11009 INFO: Processing standard module hook 'hook-platform.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+11527 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+11561 INFO: Processing standard module hook 'hook-sysconfig.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+13493 INFO: Processing standard module hook 'hook-numpy.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+14024 INFO: Processing standard module hook 'hook-difflib.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+15895 INFO: Processing standard module hook 'hook-webbrowser.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+15954 INFO: Processing standard module hook 'hook-psutil.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+17299 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+17660 INFO: Processing standard module hook 'hook-onnxruntime.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+18007 INFO: Processing standard module hook 'hook-urllib3.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+18125 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18126 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+18170 INFO: Processing standard module hook 'hook-setuptools.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18191 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18224 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18227 INFO: Setuptools: 'jaraco' appears to be a partial setuptools-vendored copy - extending search paths to ['B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\jaraco', 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\setuptools\\_vendor\\jaraco']!
+18228 INFO: Processing pre-safe-import-module hook 'hook-jaraco.functools.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18242 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18402 INFO: Processing standard module hook 'hook-_osx_support.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18419 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18681 INFO: Processing pre-safe-import-module hook 'hook-jaraco.text.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18682 INFO: Setuptools: 'jaraco.text' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco.text'!
+18695 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18697 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18699 INFO: Processing pre-safe-import-module hook 'hook-jaraco.context.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+19367 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+19368 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+20034 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+20035 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+20520 INFO: Processing standard module hook 'hook-certifi.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+20641 INFO: Processing standard module hook 'hook-cryptography.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+22389 INFO: hook-cryptography: cryptography does not seem to be using dynamically linked OpenSSL.
+22877 INFO: Processing standard module hook 'hook-sqlite3.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+23523 INFO: Processing standard module hook 'hook-jinja2.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+24293 INFO: Processing standard module hook 'hook-anyio.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+26206 INFO: Processing standard module hook 'hook-pygments.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+28658 INFO: Processing standard module hook 'hook-pandas.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+31421 INFO: Processing standard module hook 'hook-pytz.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+31955 INFO: Processing standard module hook 'hook-scipy.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+33128 INFO: Processing standard module hook 'hook-pycparser.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+34339 INFO: Processing standard module hook 'hook-scipy.linalg.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+34488 INFO: Processing standard module hook 'hook-scipy.special._ufuncs.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+35997 INFO: Processing standard module hook 'hook-scipy.spatial._ckdtree.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+36652 INFO: Processing standard module hook 'hook-scipy.spatial.transform.rotation.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+37904 INFO: Processing standard module hook 'hook-scipy.stats._stats.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+38545 INFO: Processing standard module hook 'hook-scipy.sparse.csgraph.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+39598 INFO: Processing standard module hook 'hook-scipy.special._ellip_harm_2.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+41494 INFO: Processing standard module hook 'hook-pyarrow.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+42823 INFO: Processing standard module hook 'hook-fsspec.py' from 'B:\\BaiduSyncdisk\\desktop\\VSProject\\super-brain-memory\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'

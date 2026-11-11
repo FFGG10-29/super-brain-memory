@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File flutter_app\scripts\run_windows.ps1
 > 首次运行需要 Flutter SDK（本机当前未安装，故 `flutter analyze` / 编译产物尚未验收）。
 > 若 `flutter pub get` 报 SDK 约束不匹配，删掉 `pubspec.lock` 后重新生成即可。
 
-## 18 个页面（完全覆盖 Qt 11 页，并补齐全部 6 项差异）
+## 18 个页面（覆盖 11 页，并补齐全部能力项）
 
 | 页面 | 能力 |
 |---|---|
@@ -49,7 +49,7 @@ powershell -ExecutionPolicy Bypass -File flutter_app\scripts\run_windows.ps1
 | 召回测试 | 真实六通道召回 + **检索即解释**：通道分解（召回→注入）、单条归因（余弦/权重/PAD）、注入上下文复制 |
 | **硬件仪表** | 顶栏同款 CPU / 内存 / 显卡实时环形仪表的大表 + 明细（显存、温度、采样时间） |
 | **PAD 认知分区** | P–A 情绪散点（点色=类型、点径=置信度）+ 按类型/分层的 P/A/D 均值，点选联动检查器 |
-| **2D 语义环** | Qt 语义环布局的服务端等价投影：环=分层 / 扇区=类型 / 角度=形成时间；节点标签、关系连线、点击联动检查器与 3D 星云 |
+| **2D 语义环** | 语义环布局的服务端等价投影：环=分层 / 扇区=类型 / 角度=形成时间；节点标签、关系连线、点击联动检查器与 3D 星云 |
 | 系统概览 | 六引擎健康、昼夜任务手动执行、快照统计 |
 | 展示数据 | 结构化快照 JSON、导出快照 + 记忆 |
 | 模型配置 | 三通道状态、API 地址、内核重启 |
@@ -64,21 +64,20 @@ powershell -ExecutionPolicy Bypass -File flutter_app\scripts\run_windows.ps1
 | 关于 | 架构说明 |
 
 顶栏右侧常驻 **CPU / 内存 / 显卡环形仪表**（后端 `system.stats` 每 2 秒采样：psutil + `nvidia-smi`，
-N 卡缺失时显示「—」），与 Qt 顶栏仪表等价。
+N 卡缺失时显示「—」），与顶栏仪表呈现一致。
 
 ## 发行包：后端随包部署
 
 **不能把 Python 塞进 `super_brain.exe` 内部**——Flutter 编译出来的是原生 Dart 二进制，
 里面没有 Python 解释器。可行的做法是「一个安装包、两个进程」：安装时把冻结好的后端
-一起部署到 `backend\`，Flutter 启动时自动拉起它。目标机器**不需要装 Python、PySide6
-或任何依赖**。
+一起部署到 `backend\`，Flutter 启动时自动拉起它。目标机器**不需要装 Python 或任何依赖**。
 
 ```
 {app}\
   super_brain.exe              ← 快捷方式只指向它（双击即启动）
   flutter_windows.dll, data\
   backend\
-    headless-server.exe        ← 冻结后端（无 GUI、无 Qt）
+    headless-server.exe        ← 冻结后端（无 GUI）
     headless-server-cli.exe    ← 排障用（--self-check / --probe-models）
     _internal\
 ```
@@ -115,22 +114,10 @@ ISCC.exe scripts\installer\setup.iss
 
 | 形态 | 主进程 | UI 进程 | 说明 |
 |---|---|---|---|
-| 旧 v2.2 | **PySide6 桌面进程**（`super-brain.exe`） | 同一个进程 | UI 同时持有 `build_app()` 六引擎、8766 网关、托盘、自启；没有独立后端 |
+| 旧 v2.2（历史） | **桌面进程**（`super-brain.exe`） | 同一个进程 | UI 同时持有 `build_app()` 六引擎、8766 网关、托盘、自启；没有独立后端 |
 | 现在 v3.1 | **无头后端 `headless_server`** | **Flutter `super_brain.exe`**（另一进程） | 后端唯一持有六引擎；Flutter 只是 WS 客户端，并负责探活/拉起后端 |
-| 可选调试入口 | Qt 桌面进程 | 自身 | `python -m ui.desktop` 显式调用才启动；与后端互斥（Kùzu 单写者） |
 
-Qt 代码约 **7,000 行 / 630 KB 源码**，但真正占体积的是 `PySide6-Essentials`（200–300 MB）。
-默认发行包用 `--headless` 模板把它 `excludes` 掉，Qt 源码不进包，运行时也完全不加载；
-只有传 `-IncludeDebugConsole` 才会额外部署一份源码 + Python 运行时供排障。
-
-## 与 Qt 前端的关系
-
-Qt 前端 `ui/desktop/` 目前**仍保留**作为隐藏调试入口与功能对照。按 ADR-021 的约定，
-需先完成 `flutter build windows` + 逐页验收，确认运行时等价后再删除 `ui/desktop/`。
-后端已不依赖任何 Qt 模块（`core/user_config.py`、`gateway/bridge_launcher.py`、
-`brain/memory_service.py` 已下沉）。
-
-### 2026-11-08 补齐：Qt 独占能力全部下沉到 `core.*`
+### 2026-11-08 补齐：桌面独占能力全部下沉到 `core.*`
 
 原先 ADR-021 列的 6 项差异已逐项实现，Flutter 侧**不再有功能缺口**：
 
@@ -141,7 +128,7 @@ Qt 前端 `ui/desktop/` 目前**仍保留**作为隐藏调试入口与功能对�
 | 数据目录一键迁移 | `core/desktop_features.py::migrate_data` + `core/runtime_paths.py::data_dir()` 读 `data_pointer.json` | `桌面能力` 页：查看当前目录/文件数/大小 → 复制到目标 → 重启后端生效（默认保留原目录） |
 | PAD 认知分区图表 | `v3/rpc_ext.py::_pad_distribution`（主库真实 pad_p/a/d） | `analytics.dart::PadAnalyticsPage`（散点 + 分类型/分层均值） |
 | 召回归因可视化 | `brain/memory_service.py::recall` 已有 `audit`（counts/injected/weights/similarities）与 `injection` | `analytics.dart::RecallAnalyticsPage` 三块解释面板 + 复制注入上下文 |
-| 2D 检查器联动 | `v3/rpc_ext.py::_graph_projection`（Qt `_semantic_position` 的服务端等价，坐标确定性） | `analytics.dart::Graph2DPage`，点节点 → 跳记忆检查器（带 `initialId`）或回 3D 星云发检索光脉冲 |
+| 2D 检查器联动 | `v3/rpc_ext.py::_graph_projection`（`_semantic_position` 的服务端等价，坐标确定性） | `analytics.dart::Graph2DPage`，点节点 → 跳记忆检查器（带 `initialId`）或回 3D 星云发检索光脉冲 |
 | CPU/内存/显卡仪表 | `core/system_stats.py`（psutil + nvidia-smi，2s 守护线程） | `system_gauges.dart` 顶栏环形仪表 + `硬件仪表` 大表页 |
 
 **零第三方 pub 依赖**：Win32 句柄用 `dart:ffi` 直接调 `user32.dll` 五个函数，

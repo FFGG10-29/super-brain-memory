@@ -12,7 +12,7 @@
 
 启动（开发态，Flutter 会自动拉起这条命令）：
     .venv\\Scripts\\python.exe -m headless_server
-Flutter 端只负责 UI 与拉起/探活，后端崩溃或换机时不带任何 Qt 依赖。
+Flutter 端只负责 UI 与拉起/探活，后端崩溃或换机时无需任何额外 UI 依赖。
 """
 from __future__ import annotations
 

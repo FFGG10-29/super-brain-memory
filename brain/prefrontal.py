@@ -104,7 +104,9 @@ class Prefrontal:
         top_k = int(limit or self._config.recall.top_k)
         oversample = max(1, self._config.recall.rrf_k_oversample) * top_k
 
-        channels = self._collect_channels(query, oversample, namespaces)
+        # ★ B 包：把 dense 通道的 cosine 相似度带回总分（旧版只以通道名次进 RRF）
+        dense_scores: dict[str, float] = {}
+        channels = self._collect_channels(query, oversample, namespaces, dense_scores)
         rrf = self._rrf(channels)
         if not rrf:
             return []
@@ -119,7 +121,8 @@ class Prefrontal:
                 continue
             if namespaces and neuron.namespace not in namespaces:
                 continue
-            score = self._score(neuron, rrf_score, now)
+            score = self._score(neuron, rrf_score, now,
+                                dense_score=dense_scores.get(neuron_id, 0.0))
             score *= self._amygdala.recall_weight(agent_id, now_ms=now)
             channels_of = tuple(channel for channel, hits in channels.items() if neuron_id in hits)
             candidates.append(RecallHit(neuron=neuron, score=score, channels=channels_of))
@@ -168,7 +171,8 @@ class Prefrontal:
         )
 
     def _collect_channels(
-        self, query: str, oversample: int, namespaces: tuple[str, ...]
+        self, query: str, oversample: int, namespaces: tuple[str, ...],
+        dense_scores: dict[str, float] | None = None,
     ) -> dict[str, list[str]]:
         channels: dict[str, list[str]] = {}
 
@@ -183,9 +187,11 @@ class Prefrontal:
 
         recall_filter = RecallFilter(namespaces=namespaces, active_only=True)
         if embedding is not None:
-            channels["dense"] = [
-                hit.id for hit in self._vector.search_dense(embedding.dense, limit=oversample, where=recall_filter)
-            ]
+            dense_hits = self._vector.search_dense(embedding.dense, limit=oversample, where=recall_filter)
+            channels["dense"] = [hit.id for hit in dense_hits]
+            if dense_scores is not None:
+                for hit in dense_hits:
+                    dense_scores[hit.id] = max(0.0, min(1.0, float(hit.score)))
             if embedding.sparse:
                 channels["sparse"] = [
                     hit.id
@@ -247,7 +253,8 @@ class Prefrontal:
                 scores[neuron_id] = scores.get(neuron_id, 0.0) + 1.0 / (constant + rank + 1)
         return scores
 
-    def _score(self, neuron: Neuron, rrf_score: float, now_ms: int) -> float:
+    def _score(self, neuron: Neuron, rrf_score: float, now_ms: int,
+               dense_score: float = 0.0) -> float:
         recall = self._config.recall
         anchor = neuron.last_recall_ms or neuron.valid_from_ms or neuron.created_at_ms
         age_days = max(0.0, (now_ms - anchor) / _MS_PER_DAY)
@@ -255,6 +262,7 @@ class Prefrontal:
         retrievability = self._plasticity.retrievability(neuron, now_ms=now_ms)
         return (
             recall.w_rrf * rrf_score * recall.rrf_constant  # 归一到 ~O(1)
+            + recall.w_dense * dense_score                   # ★ B 包：真实 cosine 相似度
             + recall.w_freshness * freshness
             + recall.w_synapse * retrievability
             + recall.w_pad * neuron.pad.salience()
@@ -264,14 +272,27 @@ class Prefrontal:
     def _rerank(self, query: str, candidates: list[RecallHit], top_k: int) -> list[RecallHit]:
         if not candidates:
             return []
-        if not self._config.recall.rerank_enabled:
+        recall = self._config.recall
+        # ★ B 包：交叉编码器候选硬上限（旧版把 k×4 甚至全部候选灌进去，是 deep 22.7s 的大头）
+        candidates = candidates[: max(int(recall.rerank_top_n), top_k)]
+        fallback = candidates[: max(top_k * recall.rrf_k_oversample, top_k)]
+        if not recall.rerank_enabled:
             # 低配设备/追求低延迟：跳过交叉编码精排，保留 RRF 顺序
-            return candidates[: max(top_k * self._config.recall.rrf_k_oversample, top_k)]
-        order = self._reranker.rerank(
-            query,
+            return fallback
+        # 硬超时：超时直接回退 RRF 顺序，绝不让 deep 卡死 Agent 一轮对话
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(
+            self._reranker.rerank, query,
             [(hit.neuron.uuid7_id, hit.neuron.content) for hit in candidates],
             top_k=len(candidates),
         )
+        try:
+            order = future.result(timeout=max(0.2, float(recall.rerank_timeout_ms) / 1000.0))
+        except Exception:  # noqa: BLE001 - 超时 / 模型异常一律回退，不阻断召回
+            pool.shutdown(wait=False)
+            return fallback
+        pool.shutdown(wait=False)
         by_id = {hit.neuron.uuid7_id: hit for hit in candidates}
         reranked: list[RecallHit] = []
         for rank, scored in enumerate(order):

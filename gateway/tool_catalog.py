@@ -51,14 +51,59 @@ def _d(key: str, description: str, kind: dict[str, Any] | None = None) -> dict[s
     return {**(kind or _S), "description": description}
 
 
+# ── 认知契约（Cognition Contract）────────────────────────────────────────
+# 架构 §五「三模型藏于接口之后，可整体替换」的落地：
+# 强认知 Agent（WorkBuddy / CodeBuddy / DSH）在写入时直接给出抽取结果，
+# 后端跳过 Qwen3-0.6B 的分类 / PAD / 实体抽取与合并裁决，只做确定性落库。
+# 与 router_extractor._SYSTEM_PROMPT 的 JSON 结构一一对应，字段全部可选。
+_COGNITION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "★ 认知契约（可选）：调用方直接给出分类/PAD/实体/置信度。提供时后端跳过 Qwen3-0.6B 抽取与合并裁决 LLM，只做确定性落库；不提供则走本地模型自动抽取（旧行为不变）。",
+    "properties": {
+        "memory_type": {"type": "string", "enum": ["fact", "code", "scenario", "emotion", "profile"],
+                        "description": "五类记忆，缺省 fact"},
+        "pad": {"type": "object", "description": "PAD 三维情绪坐标 ∈ [-1,1]",
+                "properties": {
+                    "p": {"type": "number", "description": "愉悦度 Pleasure"},
+                    "a": {"type": "number", "description": "唤醒度 Arousal"},
+                    "d": {"type": "number", "description": "支配度 Dominance"},
+                }},
+        "confidence": {"type": "number", "description": "置信度 0~1，缺省 0.9"},
+        "entities": {"type": "array", "description": "实体列表 [{name, type}]",
+                     "items": {"type": "object", "properties": {
+                         "name": {"type": "string"}, "type": {"type": "string"}}}},
+        "relations": {"type": "array", "description": "关系三元组 [{subject, predicate, object}]",
+                      "items": {"type": "object", "properties": {
+                          "subject": {"type": "string"}, "predicate": {"type": "string"},
+                          "object": {"type": "string"}}}},
+        "hyperedge": {"type": "object", "description": "超边事件 {label, members:[]}"},
+        # ★ A 包类别索引：由对话大模型在写入时判定，落到 namespace 列 + LMDB meta 旁路索引
+        "topic": {"type": "string", "description": "主题分区 id（spaces_list 返回的 id），落库为 namespace=topic:<id>；缺省强制落默认空间 topic:default，不再裸写 private/document"},
+        "layer": {"type": "string", "enum": ["persona", "fact", "episode"],
+                  "description": "三层正交：L0 人格 / L1 事实项目 / L2 会话事件；persona 需 persona_write 显式授权"},
+        "source": {"type": "string", "description": "来源：workbuddy / bot / import / manual"},
+        "category": {"type": "string", "description": "自由类别标签，写入 meta 索引"},
+        "valence": {"type": "number", "description": "反馈极性 [-1,1]，供人格强化回路采样"},
+        "sensitive": {"type": "boolean", "description": "敏感标记：不外发、不进人格层"},
+    },
+}
+
+
 # ── 原有 6 个核心工具（保持名字与契约不变）────────────────────────────────
 CORE_TOOL_DEFS: list[dict[str, Any]] = [
-    _t("save_memory", "写入一条记忆：自动分类、SimHash 去重、PAD 情绪标注、六引擎落库",
-       {"content": _d("content", "记忆正文"), "agent_id": _d("agent_id", "调用方标识")}, ["content"]),
-    _t("recall_memory", "召回记忆：默认走只读投影的 2-gram 召回（毫秒级）；deep=true 才走六通道精排（30-45s，非必要不用）。返回 hits + 收敛注入 injection（含运行时记忆与档案摘要）+ context_layers + recall_mode",
+    _t("save_memory", "写入一条记忆：自动分类、SimHash 去重、PAD 情绪标注、六引擎落库；同事项演进自动语义合并裁决（add/update/merge/skip，收敛为单条不无限追加版本）；可传 cognition 认知契约由调用方直接供给 PAD/分类/实体/主题分区（跳过本地 0.6B 抽取，合并裁决仍执行）",
+       {"content": _d("content", "记忆正文"), "agent_id": _d("agent_id", "调用方标识"),
+        "topic": _d("topic", "主题分区 id（也可写在 cognition.topic）"),
+        "persona_write": _d("persona_write", "L0 人格层写入显式授权，默认 false", _B),
+        "cognition": _COGNITION_SCHEMA}, ["content"]),
+    _t("recall_memory", "召回记忆：默认走只读投影的 2-gram 召回（毫秒级）；deep=true 才走六通道精排。topics 可下推按类召回省开销；channel=bot 时全量可读并注入 L0 人格层",
        {"query": _d("query", "查询语句"), "limit": _d("limit", "返回条数，默认 3", _I),
         "deep": _d("deep", "是否启用六通道精排，默认 false", _B),
-        "namespace": _d("namespace", "可选命名空间（需权限）")}, ["query"]),
+        "namespace": _d("namespace", "可选命名空间（需权限）"),
+        "topics": {"type": "array", "items": {"type": "string"},
+                   "description": "★ 按类召回：主题 id 列表，下推到 RecallFilter / 只读投影"},
+        "scope": _d("scope", "active=只召回激活空间，其它值=全量", _S),
+        "channel": _d("channel", "workbuddy（默认）或 bot（全量可读 + L0 人格层注入）", _S)}, ["query"]),
     _t("timeline_query", "按事件时间窗口查询记忆",
        {"since_ms": _d("since_ms", "起始毫秒时间戳", _I), "until_ms": _d("until_ms", "结束毫秒时间戳", _I),
         "limit": _d("limit", "条数", _I)}),
@@ -141,7 +186,7 @@ _UNIQUE: list[dict[str, Any]] = [
        {"blocks": _d("blocks", "区块名→内容 的对象", _O)}, ["blocks"], "core_memory.set"),
     _t("pad_distribution", "【PAD 认知分区】全部记忆在愉悦度/唤醒度/支配度三维的分布统计",
        None, None, "pad.distribution"),
-    _t("graph_projection", "【2D 语义环】图谱节点的确定性二维投影（与 Qt 语义环布局一致）",
+    _t("graph_projection", "【2D 语义环】图谱节点的确定性二维投影（与前端语义环布局一致）",
        None, None, "graph.projection"),
     _t("activation_graph", "【激活图】当前语义激活子图（节点/边/degraded 标记）",
        None, None, "activation.graph"),
@@ -178,6 +223,43 @@ _UNIQUE: list[dict[str, Any]] = [
        None, None, "model_status"),
     _t("system_shutdown", "【危险】让后端优雅停机（flush journal / WAL TRUNCATE / 关六引擎）。调用后所有 MCP 工具不可用，除非手动重启后端",
        None, None, "system.shutdown"),
+    # ── A 包：主题分区 / 类别索引 ────────────────────────────────────
+    _t("topics_list", "【主题分区】列出 7 个空间（已降级为主题标签）、激活 topic、按 namespace 的真实记忆分布；空间不再是隔离容器",
+       None, None, "topics.list"),
+    _t("topics_migrate", "【主题分区】把 spaces.json 升级为 topic 标签模型（幂等）：补 topic/scope/sampleable，取消 Bot 对话隔离说明",
+       None, None, "topics.migrate"),
+    _t("spaces_update", "【主题分区】手动改空间名称/说明/激活/采样开关（只动元数据）",
+       {"id": _d("id", "空间 id"), "name": _d("name", "名称"), "note": _d("note", "说明"),
+        "active": _d("active", "是否激活", _B), "sampleable": _d("sampleable", "是否允许人格采样学习", _B)},
+       ["id"], "spaces.update"),
+    _t("memory_reclassify", "【类别索引】分批回填历史记忆的 topic / PAD / 类型，走后端版本化更正；dry_run=true 只预览",
+       {"items": {"type": "array", "items": {"type": "object"},
+                  "description": "[{id, topic, memory_type, confidence, pad_p, pad_a, pad_d}]"},
+        "dry_run": _d("dry_run", "只预览不落库", _B)}, None, "memory.reclassify"),
+    _t("graph_real_edges", "【关联边】读 Kùzu 真实 RELATES/MEMBER 边，带方向、谓词、权重（旧 graph() 是 2-gram 两两现算，已丢方向）",
+       {"limit": _d("limit", "最多返回条数，默认 500", _I)}, None, "graph.real_edges"),
+    # ── L0 人格层：可视化 + 手动微调 ─────────────────────────────────
+    _t("persona_get", "【L0 人格层】读骨架只读信息、当前可调参数、版本历史、反馈提案与护栏",
+       None, None, "persona.get"),
+    _t("persona_baseline", "【L0 人格层】读基线骨架全文（项目档案按需取，不进每轮注入）",
+       None, None, "persona.baseline"),
+    _t("persona_status", "【L0 人格层】版本数 / 待确认提案数 / 反馈事件数",
+       None, None, "persona.status"),
+    _t("persona_set_params", "【L0 人格层】手动微调可调参数（骨架只读禁改），每次落版本可回滚",
+       {"patch": _d("patch", "要改的参数对象", _O), "actor": _d("actor", "操作者"),
+        "reason": _d("reason", "变更理由"), "confirm_skeleton": _d("confirm_skeleton", "骨架变更需显式确认", _B)},
+       ["patch"], "persona.set_params"),
+    _t("persona_rollback", "【L0 人格层】回滚到指定版本",
+       {"version": _d("version", "版本号", _I)}, ["version"], "persona.rollback"),
+    _t("persona_feedback", "【人格演化】记录正/负反馈；同向连续 3 次且跨会话 ≥2 次才生成提案，不直接改性格",
+       {"signal": _d("signal", "反馈信号描述"), "valence": _d("valence", "极性 [-1,1]", {"type": "number"}),
+        "target": _d("target", "目标参数，默认 sassiness"), "note": _d("note", "备注"),
+        "session_id": _d("session_id", "会话 id"), "actor": _d("actor", "来源 bot/workbuddy")},
+       ["signal"], "persona.feedback"),
+    _t("persona_proposals", "【人格演化】列出反馈驱动的人格提案（pending / applied）",
+       None, None, "persona.proposals"),
+    _t("persona_apply_proposal", "【人格演化】应用一个待确认提案（自动微调单次 ≤0.05）",
+       {"id": _d("id", "提案 id")}, ["id"], "persona.apply_proposal"),
 ]
 
 EXTENDED_TOOL_DEFS: list[dict[str, Any]] = _CONTEXT + _UNIQUE

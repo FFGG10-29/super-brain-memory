@@ -34,8 +34,7 @@ websockets==17.4
 # MCP 官方 SDK（外部 Agent 接入：WorkBuddy / CodeBuddy / DSH）
 mcp==1.30.0
 
-# 桌面前端（PySide6 星云视图 / PAT 钥匙串）
-PySide6-Essentials==6.12.0
+# PAT 钥匙串（「桌面能力」页的 SecretStore：keyring 优先，DPAPI 加密文件兜底）
 keyring==25.7.0
 
 # 首页仪表：CPU / 内存采样（显卡走 nvidia-smi，无依赖）

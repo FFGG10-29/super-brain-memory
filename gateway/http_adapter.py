@@ -120,9 +120,11 @@ class HTTPAdapter:
         if method.upper() == "POST" and path.rstrip("/") == "/save":
             # 记忆插件常用字段：text / content / memory / query
             content = body.get("content") or body.get("text") or body.get("memory") or ""
-            return 200, self._call_tool(
-                "save_memory", {"content": content, "namespace": body.get("namespace")}, headers=headers
-            )
+            save_args = {"content": content, "namespace": body.get("namespace")}
+            # ★ 认知契约：HTTP /save 也允许透传 cognition（DSH、AstrBot 等插件可用）
+            if isinstance(body.get("cognition"), dict):
+                save_args["cognition"] = body["cognition"]
+            return 200, self._call_tool("save_memory", save_args, headers=headers)
         if method.upper() == "POST" and path.rstrip("/") == "/search":
             query = body.get("query") or body.get("text") or body.get("content") or ""
             return 200, self._call_tool(

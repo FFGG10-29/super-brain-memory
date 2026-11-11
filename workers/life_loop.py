@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from config import BrainConfig, get_config
 from core.interfaces import GraphRepository, RelationalRepository, TimeSeriesRepository
 from brain.memory_tier_manager import MemoryTierManager
+from workers.document_distiller import distill_documents as _distill_documents
 
 __all__ = ["EmotionalReview", "LifeLoop", "NightlyReport"]
 
@@ -56,6 +57,8 @@ class NightlyReport:
     tier_changes: int = 0
     weak_relations: list[str] = field(default_factory=list)
     consolidations: int = 0
+    distilled_docs: int = 0
+    neurons_written: int = 0
 
     def as_brief(self) -> str:
         lines = ["【晨报】"]
@@ -63,6 +66,8 @@ class NightlyReport:
             lines.append(self.emotional.as_brief())
         lines.append(f"分层迁移 {self.tier_changes} 条，归档 {len(self.archived)} 条")
         lines.append(f"金字塔固化 {self.consolidations} 个主题，弱关系标记 {len(self.weak_relations)} 条")
+        if self.distilled_docs:
+            lines.append(f"档案自动提炼 {self.distilled_docs} 篇 → 写入神经元 {self.neurons_written} 条")
         return "\n".join(lines)
 
 
@@ -75,12 +80,14 @@ class LifeLoop:
         graph: GraphRepository | None = None,
         tier_manager: MemoryTierManager | None = None,
         config: BrainConfig | None = None,
+        save_memory: Callable[..., Any] | None = None,
     ) -> None:
         self._timeseries = timeseries
         self._relational = relational
         self._graph = graph
         self._tier_manager = tier_manager
         self._config = config or get_config()
+        self._save_memory = save_memory
 
     def emotional_review(self, *, since_ms: int | None = None, agent_id: str | None = None) -> EmotionalReview:
         since = _now_ms() - int(_MS_PER_DAY * 1000) if since_ms is None else int(since_ms)
@@ -153,11 +160,23 @@ class LifeLoop:
                 continue
         return weak
 
+    def distill_documents(self, *, limit: int = 200, agent_id: str = "distiller",
+                          namespace: str = "document") -> dict[str, Any]:
+        """兜底：扫描未归档项目档案并提炼（实时线程漏掉或上线前遗留的）。"""
+        if self._save_memory is None:
+            return {"ok": False, "error": "未注入 save_memory，跳过档案蒸馏"}
+        return _distill_documents(
+            self._save_memory, limit=limit, agent_id=agent_id, namespace=namespace
+        )
+
     def nightly(self, *, consolidations: int = 0, agent_id: str | None = None) -> NightlyReport:
         report = NightlyReport(emotional=self.emotional_review(agent_id=agent_id))
         report.archived = self.forget_sweep()
         report.tier_changes = len(report.archived)
         report.weak_relations = self.graph_prune()
+        distill = self.distill_documents(agent_id=agent_id or "distiller")
+        report.distilled_docs = int(distill.get("distilled", 0))
+        report.neurons_written = int(distill.get("written", 0))
         report.consolidations = consolidations
         return report
 

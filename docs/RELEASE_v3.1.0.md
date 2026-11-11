@@ -55,4 +55,4 @@ certutil -hashfile SuperBrainSetup.exe SHA256
 - 数据默认落 `D:\Super-Brain\Data`，可在「系统设置 → 设置」换盘迁移。
 - 首次启动若在低配机（机械盘）上，后端六引擎冷启动约 1~3 秒；星云页会显示
   「等待后端返回记忆节点…」并在就绪后自动出图。
-- Qt 桌面端已降级为隐藏调试入口（`python -m ui.desktop`），发行包内不含 Qt。
+- Flutter 为唯一前端，发行包内不含任何桌面 UI 依赖。

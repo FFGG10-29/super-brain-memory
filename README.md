@@ -163,8 +163,8 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 </tr>
 </table>
 
-> 旧版 Qt 控制台的截图（`memory.png` / `data.png` / `models.png` / `mcp.png` / `timeline.png` / `settings.png`）
-> 仍保留在 `docs/screenshots/` 作对照；发行包只带 Flutter 前端，Qt 仅作隐藏调试入口。
+> 历史控制台截图（`memory.png` / `data.png` / `models.png` / `mcp.png` / `timeline.png` / `settings.png`）
+> 仍保留在 `docs/screenshots/` 作历史对照；发行包只带 Flutter 前端。
 
 ---
 
@@ -217,7 +217,7 @@ CodeBuddy / WorkBuddy / DSH / Cursor / Claude Desktop 写进去的记忆，下�
 ### A. 一体安装包（推荐：Flutter 前端 + 随包部署的后端）
 
 一个安装包、**两个进程**：双击 `super_brain.exe`（Flutter 原生窗口），它探活并自动拉起
-`backend\headless-server.exe`——冻结的 Python 后端，无 GUI、无 Qt，目标机器不需要装 Python / Flutter / 任何依赖。
+`backend\headless-server.exe`——冻结的 Python 后端，无 GUI，目标机器不需要装 Python / Flutter / 任何依赖。
 
 1. 到 [Releases](../../releases) 下载分卷（每卷 < 2GB），全部放到同一目录；
 2. 双击 `reassemble.cmd` 合并解压（或手动 `copy /b part1+part2+... super-brain.zip`）；
@@ -230,11 +230,6 @@ powershell -ExecutionPolicy Bypass -File scripts\build_full_release.ps1 -Install
 
 > 打包注意：`flutter build windows --release` 必须加 **`--no-tree-shake-icons`**。
 > 默认的图标树摇会删掉「只在 const Map 里动态引用」的字形（表现为左栏两个菜单没图标）。
-
-### B. 旧版 Qt 桌面便携包（调试 / 对照）
-
-Qt 桌面端约 7,000 行源码，但独占 `PySide6` 200–300MB，`--headless` 模板已排除出发行包。
-现在只作为隐藏调试入口保留：`python -m ui.desktop`（与后端互斥，Kùzu 单写者）。
 
 ### C. 从源码跑（开发者）
 
@@ -279,7 +274,7 @@ GPU 验证（最权威的一条）：
 - [x] 分层上下文四层 + 技能层（版本化 + 反馈自迭代）
 - [x] MCP 能力面统一到 `tool_catalog.py`（53 工具 / 6 resources）
 - [x] Flutter 真机验收（analyze 0 issues / build windows 通过）并出安装包
-- [ ] 删除 Qt 前端 `ui/desktop/`（等再跑一轮全页回归）
+- [x] Flutter 为唯一前端
 - [ ] 记忆图谱自动补全与关系推理（三元组抽取已就绪，待更强模型）
 - [ ] 跨设备增量同步可视化（落后游标 / 冲突预览）
 - [ ] Linux / macOS 发行包

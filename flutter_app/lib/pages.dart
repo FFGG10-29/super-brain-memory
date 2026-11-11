@@ -50,6 +50,24 @@ class _Card extends StatelessWidget {
       );
 }
 
+class _RefineStat extends StatelessWidget {
+  const _RefineStat({required this.label, required this.value, required this.color});
+  final String label;
+  final int value;
+  final Color color;
+  @override
+  Widget build(BuildContext context) => Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text('$value', style: TextStyle(color: color, fontSize: 18, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 2),
+            Text(label, style: const TextStyle(color: _hint, fontSize: 10)),
+          ],
+        ),
+      );
+}
+
 /// 记忆管理：列表 + 写入（走 /v1/events 受理，最终结果由 WS 点亮星云）。
 class MemoriesPage extends StatefulWidget {
   const MemoriesPage({super.key, required this.client});
@@ -66,11 +84,15 @@ class _MemoriesPageState extends State<MemoriesPage> {
   String _status = '—';
   String _typeFilter = '全部';
   bool _newestFirst = true;
+  Map<String, dynamic>? _refine;
+  Timer? _refineTimer;
+  bool _refining = false;
 
   @override
   void initState() {
     super.initState();
     _reload();
+    _startRefinePoll();
     _eventsSub = widget.client.events.listen((Map<String, dynamic> event) {
       if (event['type'] == 'node_created' && mounted) _reload();
     });
@@ -79,13 +101,14 @@ class _MemoriesPageState extends State<MemoriesPage> {
   @override
   void dispose() {
     _eventsSub?.cancel();
+    _refineTimer?.cancel();
     _input.dispose();
     super.dispose();
   }
 
-  Future<void> _reload() async {
+  Future<void> _reload({bool full = false}) async {
     try {
-      final rows = await widget.client.memories();
+      final rows = await widget.client.memories(full: full);
       if (mounted) {
         setState(() {
           _rows = rows;
@@ -108,6 +131,104 @@ class _MemoriesPageState extends State<MemoriesPage> {
     } catch (error) {
       setState(() => _status = '写入失败：$error');
     }
+  }
+
+  Future<void> _loadRefine() async {
+    try {
+      final data = await widget.client.call('refine_stats');
+      if (mounted) setState(() => _refine = data is Map<String, dynamic> ? data : null);
+    } catch (_) {
+      // 离线或非 dev 后端无此方法时静默忽略，不影响记忆页其余功能
+    }
+  }
+
+  void _startRefinePoll() {
+    _loadRefine();
+    _refineTimer = Timer.periodic(const Duration(seconds: 3), (_) => _loadRefine());
+  }
+
+  Future<void> _triggerRefine() async {
+    if (_refining) return;
+    setState(() => _refining = true);
+    try {
+      final res = await widget.client.call('refine_trigger', <String, dynamic>{'limit': 50});
+      await _loadRefine();
+      if (mounted) {
+        setState(() => _status = res is Map
+            ? '已触发提炼：处理 ${res['processed'] ?? 0} 条 · 剩余 ${res['pending_after'] ?? '?'}'
+            : '已触发提炼');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = '触发失败：$e');
+    } finally {
+      if (mounted) setState(() => _refining = false);
+    }
+  }
+
+  Widget _buildRefineCard() {
+    final r = _refine!;
+    final pending = (r['pending'] as int?) ?? 0;
+    final processing = (r['processing'] as int?) ?? 0;
+    final done = (r['done'] as int?) ?? 0;
+    final failed = (r['failed'] as int?) ?? 0;
+    final total = (r['total'] as int?) ?? 0;
+    final pct = ((r['refined_pct'] as num?) ?? 0).toDouble();
+    final worker = (r['worker'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final workerMode = (r['worker_mode']?.toString()) ?? '—';
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              const Text('记忆提炼进度',
+                  style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              const Text('后端模型提炼 · 每 3s 刷新', style: TextStyle(color: _hint, fontSize: 10)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          LinearProgressIndicator(
+            value: total > 0 ? pct / 100 : 0,
+            backgroundColor: const Color(0xFF16243A),
+            valueColor: AlwaysStoppedAnimation<Color>(_accent),
+            minHeight: 6,
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: <Widget>[
+              _RefineStat(label: '待提炼', value: pending, color: const Color(0xFFFFB74D)),
+              _RefineStat(label: '提炼中', value: processing, color: const Color(0xFF4FC3F7)),
+              _RefineStat(label: '已完成', value: done, color: const Color(0xFF66BB6A)),
+              _RefineStat(label: '失败', value: failed, color: const Color(0xFFFF4D7D)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '队列总量 $total · 已提炼 $pct% · Worker($workerMode) 已处理 ${worker['processed'] ?? 0} / 失败 ${worker['failed'] ?? 0}',
+            style: const TextStyle(color: _hint, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: <Widget>[
+              FilledButton.icon(
+                onPressed: _refining ? null : _triggerRefine,
+                icon: _refining
+                    ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.play_arrow, size: 14),
+                label: Text(_refining ? '提炼中…' : '手动开始提炼', style: const TextStyle(fontSize: 11)),
+              ),
+              const SizedBox(width: 10),
+              OutlinedButton.icon(
+                onPressed: _refining ? null : _loadRefine,
+                icon: const Icon(Icons.refresh, size: 14),
+                label: Text('重新拉取进度', style: const TextStyle(fontSize: 11)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 
   /// 记忆 id 是 UUIDv7：前 48 bit 就是毫秒时间戳，可直接拿来排序/显示，
@@ -133,8 +254,8 @@ class _MemoriesPageState extends State<MemoriesPage> {
         .where((MemoryRow r) => _typeFilter == '全部' || r.memoryType == _typeFilter)
         .toList();
     list.sort((MemoryRow a, MemoryRow b) {
-      final ta = _timeOf(a.id) ?? 0;
-      final tb = _timeOf(b.id) ?? 0;
+      final ta = a.updatedAtMs != 0 ? a.updatedAtMs : (_timeOf(a.id) ?? 0);
+      final tb = b.updatedAtMs != 0 ? b.updatedAtMs : (_timeOf(b.id) ?? 0);
       final byTime = ta != tb ? ta.compareTo(tb) : a.id.compareTo(b.id);
       return _newestFirst ? -byTime : byTime;
     });
@@ -176,8 +297,14 @@ class _MemoriesPageState extends State<MemoriesPage> {
     return PageFrame(
       title: '记忆管理',
       subtitle: '按类型分类 · 默认最新记忆在最顶部 · 写入走丘脑路由 → 语义合并 → 六引擎投影',
-      child: Column(
-        children: <Widget>[
+      child: Scrollbar(
+        thumbVisibility: true,
+        thickness: 8,
+        radius: const Radius.circular(8),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
           _Card(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -199,7 +326,7 @@ class _MemoriesPageState extends State<MemoriesPage> {
                     const SizedBox(width: 12),
                     FilledButton(onPressed: _save, child: const Text('写入记忆')),
                     const SizedBox(width: 12),
-                    OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+                    OutlinedButton(onPressed: () => _reload(full: true), child: const Text('刷新')),
                   ],
                 ),
                 const SizedBox(height: 10),
@@ -223,41 +350,45 @@ class _MemoriesPageState extends State<MemoriesPage> {
             ),
           ),
           const SizedBox(height: 10),
+          if (_refine != null) _buildRefineCard(),
+          if (_refine != null) const SizedBox(height: 10),
           Align(
               alignment: Alignment.centerLeft,
               child: Text('$_status · 当前显示 ${visible.length} 条',
                   style: const TextStyle(color: _hint, fontSize: 11))),
           const SizedBox(height: 10),
-          Expanded(
-            child: _Card(
-              child: ListView.separated(
-                itemCount: visible.length,
-                separatorBuilder: (_, __) =>
-                    const Divider(color: Color(0xFF16243A), height: 1),
-                itemBuilder: (context, index) {
-                  final row = visible[index];
-                  final when = _timeLabel(row.id);
-                  return ListTile(
-                    leading: Icon(
-                      row.memoryType == 'emotion' ? Icons.favorite : Icons.memory,
-                      color: row.memoryType == 'emotion'
-                          ? const Color(0xFFFF4D7D)
-                          : _accent,
-                      size: 18,
-                    ),
-                    title: Text(row.content,
-                        style: const TextStyle(color: Colors.white, fontSize: 13)),
-                    subtitle: Text(
-                      '${when.isEmpty ? "" : "$when · "}${row.memoryType} · ${row.tier} · '
-                      'PAD ${row.pad.map((v) => v.toStringAsFixed(1)).join("/")}',
-                      style: const TextStyle(color: _hint, fontSize: 10),
-                    ),
-                  );
-                },
-              ),
+          _Card(
+            child: ListView.separated(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: visible.length,
+              separatorBuilder: (_, __) =>
+                  const Divider(color: Color(0xFF16243A), height: 1),
+              itemBuilder: (context, index) {
+                final row = visible[index];
+                final when = _timeLabel(row.id);
+                return ListTile(
+                  leading: Icon(
+                    row.memoryType == 'emotion' ? Icons.favorite : Icons.memory,
+                    color: row.memoryType == 'emotion'
+                        ? const Color(0xFFFF4D7D)
+                        : _accent,
+                    size: 18,
+                  ),
+                  title: Text(row.content,
+                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+                  subtitle: Text(
+                    '${when.isEmpty ? "" : "$when · "}${row.memoryType} · ${row.tier} · '
+                    'PAD ${row.pad.map((v) => v.toStringAsFixed(1)).join("/")}',
+                    style: const TextStyle(color: _hint, fontSize: 10),
+                  ),
+                );
+              },
             ),
           ),
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -635,7 +766,8 @@ class _SettingsPageState extends State<SettingsPage> {
 
 }
 
-/// 系统概览：六引擎健康 + PAD/分层采样 + 昼夜任务手动执行。
+/// 系统概览：六引擎实时明细 + 投影/空间/召回真相 + 生命循环任务。
+/// 数据全部来自后端 `storage.overview` RPC（后端自有存储层，不新建连接、不伪造数值）。
 class SystemPage extends StatefulWidget {
   const SystemPage({super.key, required this.client});
   final BrainClient client;
@@ -645,9 +777,9 @@ class SystemPage extends StatefulWidget {
 }
 
 class _SystemPageState extends State<SystemPage> {
-  List<Map<String, dynamic>> _engines = <Map<String, dynamic>>[];
   List<Map<String, dynamic>> _tasks = <Map<String, dynamic>>[];
   Map<String, dynamic> _snapshot = <String, dynamic>{};
+  Map<String, dynamic> _ov = <String, dynamic>{};
   String _status = '—';
 
   @override
@@ -657,16 +789,19 @@ class _SystemPageState extends State<SystemPage> {
   }
 
   Future<void> _reload() async {
-    final engines = await widget.client.engines();
     final tasks = await widget.client.tasks();
     final snapshot = await widget.client.snapshot();
+    Map<String, dynamic> ov;
+    try {
+      ov = await widget.client.storageOverview();
+    } catch (_) {
+      ov = <String, dynamic>{};
+    }
     if (!mounted) return;
     setState(() {
-      _engines = (engines['engines'] as List<dynamic>? ?? <dynamic>[])
-          .map((row) => (row as Map<String, dynamic>))
-          .toList();
       _tasks = tasks;
       _snapshot = snapshot;
+      _ov = ov;
     });
   }
 
@@ -677,64 +812,195 @@ class _SystemPageState extends State<SystemPage> {
     _reload();
   }
 
-  @override
-  Widget build(BuildContext context) => PageFrame(
-        title: '系统概览',
-        subtitle: '六引擎健康、记忆分层分布与生命循环任务（全部经 WebSocket RPC）',
+  Map<String, dynamic> _m(String key) {
+    final value = _ov[key];
+    return value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
+  }
+
+  List<dynamic> _l(String key) {
+    final value = _ov[key];
+    return value is List ? value : <dynamic>[];
+  }
+
+  String _join(String group, String key) {
+    final value = _m(group)[key];
+    return value is List ? value.map((e) => '$e').join(' → ') : '—';
+  }
+
+  String _fmt(dynamic value) {
+    if (value is Map) {
+      return value.entries.map((e) => '${e.key}:${e.value}').join('   ');
+    }
+    if (value is List) return value.map((e) => '$e').join('、');
+    return value == null ? '—' : '$value';
+  }
+
+  Widget _kpi(String num, String label) => Expanded(
+        child: _Card(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(num, style: const TextStyle(color: _accent, fontSize: 19, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              Text(label, style: const TextStyle(color: _hint, fontSize: 10)),
+            ],
+          ),
+        ),
+      );
+
+  Widget _title(String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Text(text, style: const TextStyle(color: Colors.white, fontSize: 13)),
+      );
+
+  Widget _line(String key, String value) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Expanded(
-              child: _Card(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    const Text('引擎 / 它在干什么 / 状态', style: TextStyle(color: Colors.white, fontSize: 13)),
-                    const SizedBox(height: 10),
-                    ..._engines.map((row) => Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4),
-                          child: Text(
-                            '${row['name'] ?? row['engine'] ?? '?'} · ${row['description'] ?? row['detail'] ?? ''} · ${row['ok'] == false ? '异常' : '正常'}',
-                            style: const TextStyle(color: _hint, fontSize: 11),
-                          ),
-                        )),
-                    const SizedBox(height: 14),
-                    Text('记忆 ${_snapshot['memory_stream']?['count'] ?? 0} 条 · 待重放 ${_snapshot['sync_status']?['pending_events'] ?? 0}',
-                        style: const TextStyle(color: _accent, fontSize: 11)),
-                    Text('分层 ${_snapshot['spaces']?['tiers'] ?? {}}', style: const TextStyle(color: _hint, fontSize: 10)),
-                    const SizedBox(height: 10),
-                    OutlinedButton(onPressed: _reload, child: const Text('刷新')),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: _Card(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    const Text('生命循环任务', style: TextStyle(color: Colors.white, fontSize: 13)),
-                    const SizedBox(height: 10),
-                    ..._tasks.map((task) => ListTile(
-                          dense: true,
-                          title: Text('${task['name']}', style: const TextStyle(color: Colors.white, fontSize: 12)),
-                          subtitle: Text('${task['at']} · ${task['description'] ?? ''}',
-                              style: const TextStyle(color: _hint, fontSize: 10)),
-                          trailing: TextButton(
-                            onPressed: () => _run('${task['name']}'),
-                            child: const Text('执行'),
-                          ),
-                        )),
-                    const SizedBox(height: 8),
-                    Text(_status, style: const TextStyle(color: _hint, fontSize: 11)),
-                  ],
-                ),
-              ),
-            ),
+            SizedBox(width: 104, child: Text(key, style: const TextStyle(color: _accent, fontSize: 11))),
+            Expanded(child: Text(value, style: const TextStyle(color: _hint, fontSize: 11))),
           ],
         ),
       );
+
+  Widget _engineCard() {
+    final rows = <Widget>[_title('六引擎实时明细 · 职责 / 写入策略 / 实际落盘')];
+    final engines = _l('engines');
+    if (engines.isEmpty) {
+      rows.add(const Text('后端未升级 storage.overview，或内核为进程分离模式',
+          style: TextStyle(color: _hint, fontSize: 11)));
+    }
+    for (final raw in engines) {
+      final e = Map<String, dynamic>.from(raw as Map);
+      rows.add(Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text('${e['name']}  ·  ${e['ok'] == false ? '异常' : '正常'}  ·  ${e['rows']} 行  ·  ${e['latency_ms']}ms',
+                style: const TextStyle(color: Colors.white, fontSize: 11)),
+            const SizedBox(height: 2),
+            Text('${e['role']}', style: const TextStyle(color: _accent, fontSize: 11)),
+            Text('写入：${e['write_policy']}', style: const TextStyle(color: _hint, fontSize: 10)),
+            Text('存什么：${e['stores']}', style: const TextStyle(color: _hint, fontSize: 10)),
+            Text('实时：${e['counts_text']}', style: const TextStyle(color: _hint, fontSize: 10)),
+          ],
+        ),
+      ));
+    }
+    final totals = _m('totals');
+    rows.add(const SizedBox(height: 6));
+    rows.add(_line('主库总量', '全量 ${_fmt(totals['neurons_all'])} · 活跃 ${_fmt(totals['active'])} · 封存 ${_fmt(totals['archived'])}'));
+    rows.add(_line('待重放', '${_snapshot['sync_status']?['pending_events'] ?? _fmt(totals['outbox_pending'])}'));
+    rows.add(_line('分层 / 类型', '${_fmt(totals['by_tier'])}  /  ${_fmt(totals['by_type'])}'));
+    return _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows));
+  }
+
+  Widget _taskCard() => _Card(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            _title('生命循环任务'),
+            ..._tasks.map((task) => ListTile(
+                  dense: true,
+                  title: Text('${task['name']}', style: const TextStyle(color: Colors.white, fontSize: 12)),
+                  subtitle: Text('${task['at']} · ${task['description'] ?? ''} · 上次 ${task['last_run'] ?? '—'}',
+                      style: const TextStyle(color: _hint, fontSize: 10)),
+                  trailing: TextButton(
+                    onPressed: () => _run('${task['name']}'),
+                    child: const Text('执行'),
+                  ),
+                )),
+            const SizedBox(height: 8),
+            Text(_status, style: const TextStyle(color: _hint, fontSize: 11)),
+          ],
+        ),
+      );
+
+  Widget _truthCard() {
+    final projection = _m('projection');
+    final spaces = _m('spaces_binding');
+    final recall = _m('recall');
+    final totals = _m('totals');
+    final cleanup = _m('cleanup');
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          _title('存储投影 / 空间绑定 / 召回链路真相'),
+          _line('投影模式', '${projection['mode'] ?? '—'}（事实源 ${projection['source_of_truth'] ?? '—'}）'),
+          _line('每条必写', _join('projection', 'every_write')),
+          _line('条件写入', _join('projection', 'conditional')),
+          _line('不落盘', _join('projection', 'no_disk')),
+          _line('路由说明', '${projection['note'] ?? '—'}'),
+          const Divider(color: Color(0xFF1B2A42), height: 18),
+          _line('记忆空间', '${_fmt(spaces['spaces_total'])} 个（启用 ${_fmt(spaces['spaces_active'])}）· 已绑定记忆 ${_fmt(spaces['bound_memories'])} 条'),
+          _line('空间清单', _fmt(spaces['names'])),
+          _line('namespace', _fmt(spaces['namespace_distribution'])),
+          _line('分类真相', '${spaces['truth'] ?? '—'}'),
+          const Divider(color: Color(0xFF1B2A42), height: 18),
+          _line('快速召回', '${recall['fast'] ?? '—'}'),
+          _line('深度召回', '${recall['deep'] ?? '—'}'),
+          _line('向量真相', '${recall['vector_truth'] ?? '—'}'),
+          _line('关联真相', '${recall['graph_truth'] ?? '—'}'),
+          const Divider(color: Color(0xFF1B2A42), height: 18),
+          _line('认知质量', '零 PAD ${_fmt(totals['zero_pad_active'])} 条 · conf=0.45 ${_fmt(totals['confidence_045_active'])} 条（0.6B 降级期产物，非脏数据）'),
+          _line('关系表', 'synapses ${_fmt(totals['synapses'])} · hyperedges ${_fmt(totals['hyperedges'])}'),
+          _line('清洗快照', '${cleanup['latest_snapshot'] ?? '—'}'),
+          _line('清洗动作', '${cleanup['action'] ?? '—'}'),
+          _line('清洗结果', '${cleanup['result'] ?? '—'}'),
+          _line('未动数据', _fmt(cleanup['untouched'])),
+          const SizedBox(height: 8),
+          Text('生成于 ${_fmt(_ov['generated_at_ms'])} · ${_fmt(_ov['mode'])} 模式 · 实测数据 ${_fmt(recall['measured_at'])}',
+              style: const TextStyle(color: _hint, fontSize: 10)),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final totals = _m('totals');
+    final spaces = _m('spaces_binding');
+    return PageFrame(
+      title: '系统概览',
+      subtitle: '六引擎实时计数 · 投影足迹 · 认知质量 · 空间绑定 · 召回通道（全部经 WebSocket RPC）',
+      child: SingleChildScrollView(
+        child: Column(
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                _kpi(_fmt(totals['active']), '活跃记忆（真实计数）'),
+                const SizedBox(width: 10),
+                _kpi(_fmt(totals['zero_pad_active']), '零 PAD（认知缺失）'),
+                const SizedBox(width: 10),
+                _kpi('${_fmt(spaces['spaces_total'])} / ${_fmt(spaces['bound_memories'])}', '空间 / 已绑定记忆'),
+                const SizedBox(width: 10),
+                _kpi('${_l('engines').length}', '引擎（5 必写 + 条件投影）'),
+                const SizedBox(width: 10),
+                SizedBox(
+                  width: 76,
+                  child: OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Expanded(child: _engineCard()),
+                const SizedBox(width: 14),
+                Expanded(child: _taskCard()),
+              ],
+            ),
+            const SizedBox(height: 14),
+            _truthCard(),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 /// 展示数据：全量快照 JSON + 导出。
@@ -892,7 +1158,7 @@ class _ModelPageState extends State<ModelPage> {
             const SizedBox(height: 12),
             _Card(
               child: Text('完整参数分组（${_sections.keys.length} 组）：${_sections.keys.join(" / ")}\n'
-                  '在「设置」页或 Qt 控制台可逐项微调；这里通过 WS RPC 的 config.get / config.set 读写同一份用户差异补丁。',
+                  '在「设置」页可逐项微调；这里通过 WS RPC 的 config.get / config.set 读写同一份用户差异补丁。',
                   style: const TextStyle(color: _hint, fontSize: 11, height: 1.6)),
             ),
           ],
@@ -1159,10 +1425,180 @@ class AboutPage extends StatelessWidget {
             const SizedBox(height: 10),
             _section('版本与许可', <String>[
               'Super Brain v3.1 · Flutter 3.47.9 / Dart 3.13 · Python 3.12 · PyInstaller 6.22',
-              '后端基于 rusEFI/epicEFI 无关的独立实现；Qt 前端仅保留为隐藏调试入口，不随发行包分发。',
+              '后端基于 rusEFI/epicEFI 无关的独立实现；Flutter 为唯一前端，发行包不含任何桌面 UI 依赖。',
               '图标、界面与内核均为本项目自研，本地使用，不上传任何遥测。',
             ]),
           ],
         ),
       );
+}
+
+/// 空间内记忆列表：从「记忆空间」页点击空间进入。
+/// 样式对齐 MemoriesPage（类型胶囊过滤 + 深色卡片列表），
+/// 自带 AppBar 返回按钮（app_shell 是 IndexedStack 自管导航，根路由 push 覆盖全屏）。
+class SpaceMemoriesPage extends StatefulWidget {
+  const SpaceMemoriesPage({super.key, required this.client, required this.spaceId, required this.spaceName});
+  final BrainClient client;
+  final String spaceId;
+  final String spaceName;
+
+  @override
+  State<SpaceMemoriesPage> createState() => _SpaceMemoriesPageState();
+}
+
+class _SpaceMemoriesPageState extends State<SpaceMemoriesPage> {
+  final TextEditingController _search = TextEditingController();
+  List<Map<String, dynamic>> _rows = <Map<String, dynamic>>[];
+  String _error = '';
+  String _typeFilter = '全部';
+  bool _newestFirst = true;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    if (mounted) setState(() => _loading = true);
+    try {
+      final rows = await widget.client.memoryList(
+        namespace: 'topic:${widget.spaceId}', limit: 500, keyword: _search.text.trim());
+      if (mounted) setState(() { _rows = rows; _error = ''; _loading = false; });
+    } catch (error) {
+      if (mounted) setState(() { _error = '$error'; _loading = false; });
+    }
+  }
+
+  String _timeOf(Map<String, dynamic> row) {
+    final ms = row['updated_at_ms'] ?? row['valid_from_ms'];
+    final n = (ms is num) ? ms.toInt() : int.tryParse('$ms') ?? 0;
+    if (n <= 0) return '';
+    final d = DateTime.fromMillisecondsSinceEpoch(n).toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
+  }
+
+  List<Map<String, dynamic>> get _visible {
+    final list = _rows
+        .where((r) => _typeFilter == '全部' || '${r['memory_type'] ?? ''}' == _typeFilter)
+        .toList();
+    int ts(Map<String, dynamic> r) {
+      final ms = r['updated_at_ms'] ?? r['valid_from_ms'];
+      return (ms is num) ? ms.toInt() : int.tryParse('${ms ?? ''}') ?? 0;
+    }
+    list.sort((a, b) => _newestFirst ? ts(b).compareTo(ts(a)) : ts(a).compareTo(ts(b)));
+    return list;
+  }
+
+  Widget _typeChips() {
+    final types = <String>{'全部', for (final r in _rows) '${r['memory_type'] ?? '其他'}'}.toList();
+    int countOf(String t) =>
+        t == '全部' ? _rows.length : _rows.where((r) => '${r['memory_type'] ?? '其他'}' == t).length;
+    return Wrap(
+      spacing: 6, runSpacing: 4,
+      children: <Widget>[
+        for (final type in types)
+          ChoiceChip(
+            label: Text('$type ${countOf(type)}',
+                style: TextStyle(fontSize: 10,
+                    color: _typeFilter == type ? const Color(0xFF06121F) : const Color(0xFFBFD8F5))),
+            selected: _typeFilter == type,
+            selectedColor: const Color(0xFF4FC3F7),
+            backgroundColor: const Color(0xFF0E1B2D),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            onSelected: (_) => setState(() => _typeFilter = type),
+          ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final visible = _visible;
+    return Scaffold(
+      backgroundColor: const Color(0xFF05080E),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF070D18),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        title: Text(widget.spaceName, style: const TextStyle(fontSize: 15)),
+      ),
+      body: PageFrame(
+        title: '${widget.spaceName} · 记忆列表',
+        subtitle: 'namespace=topic:${widget.spaceId} · 写入走丘脑路由 → 语义合并 → 六引擎投影',
+        child: Column(children: <Widget>[
+          _Card(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+              Row(children: <Widget>[
+                Expanded(child: TextField(
+                  controller: _search,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: const InputDecoration(
+                    hintText: '按关键字过滤本空间记忆…',
+                    hintStyle: TextStyle(color: Color(0xFF63788F), fontSize: 13),
+                    border: InputBorder.none,
+                  ),
+                  onSubmitted: (_) => _reload(),
+                )),
+                const SizedBox(width: 12),
+                OutlinedButton(onPressed: _reload, child: const Text('刷新')),
+              ]),
+              const SizedBox(height: 10),
+              Row(crossAxisAlignment: CrossAxisAlignment.center, children: <Widget>[
+                Expanded(child: _typeChips()),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: () => setState(() => _newestFirst = !_newestFirst),
+                  icon: Icon(_newestFirst ? Icons.arrow_downward : Icons.arrow_upward, size: 13),
+                  label: Text(_newestFirst ? '最新在前' : '最早在前', style: const TextStyle(fontSize: 10)),
+                ),
+              ]),
+            ]),
+          ),
+          const SizedBox(height: 10),
+          if (_error.isNotEmpty)
+            Align(alignment: Alignment.centerLeft,
+                child: Text('读取失败：$_error', style: const TextStyle(color: Colors.redAccent, fontSize: 11)))
+          else
+            Align(alignment: Alignment.centerLeft,
+                child: Text('共 ${_rows.length} 条 · ${_newestFirst ? "最新在前" : "最早在前"} · 当前显示 ${visible.length} 条',
+                    style: const TextStyle(color: _hint, fontSize: 11))),
+          const SizedBox(height: 10),
+          Expanded(child: _loading
+              ? const Center(child: CircularProgressIndicator(color: _accent, strokeWidth: 2))
+              : _Card(child: visible.isEmpty
+                  ? const Center(child: Text('该空间暂无匹配记忆', style: TextStyle(color: _hint, fontSize: 12)))
+                  : ListView.separated(
+                      itemCount: visible.length,
+                      separatorBuilder: (_, __) => const Divider(color: Color(0xFF16243A), height: 1),
+                      itemBuilder: (context, index) {
+                        final row = visible[index];
+                        final type = '${row['memory_type'] ?? ''}';
+                        final pad = row['pad'];
+                        final padStr = (pad is List && pad.length >= 3)
+                            ? 'PAD ${(pad[0] as num?)?.toStringAsFixed(1) ?? '?'}/${(pad[1] as num?)?.toStringAsFixed(1) ?? '?'}/${(pad[2] as num?)?.toStringAsFixed(1) ?? '?'}'
+                            : '';
+                        final when = _timeOf(row);
+                        return ListTile(
+                          leading: Icon(
+                            type == 'emotion' ? Icons.favorite : Icons.memory,
+                            color: type == 'emotion' ? const Color(0xFFFF4D7D) : _accent,
+                            size: 18,
+                          ),
+                          title: Text('${row['content'] ?? ''}',
+                              style: const TextStyle(color: Colors.white, fontSize: 13)),
+                          subtitle: Padding(padding: const EdgeInsets.only(top: 3), child: Text(
+                            [if (when.isNotEmpty) when, if (type.isNotEmpty) type, '${row['tier'] ?? ''}', padStr]
+                                .where((s) => s.isNotEmpty).join(' · '),
+                            style: const TextStyle(color: _hint, fontSize: 10),
+                          )),
+                        );
+                      },
+                    ))),
+        ]),
+      ),
+    );
+  }
 }

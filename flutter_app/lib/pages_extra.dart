@@ -75,9 +75,16 @@ class _MemoryInspectorPageState extends State<MemoryInspectorPage> {
     super.dispose();
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool full = false}) async {
     setState(() => _busy = true);
-    final rows = await widget.client.memoryList(limit: 300, keyword: _keyword.text.trim());
+    await widget.client.syncMemories(full: full);
+    // 关键词过滤在前端缓存上做，命中即出，不回后端（缓存已是全量）。
+    final kw = _keyword.text.trim().toLowerCase();
+    final all = widget.client.memCacheView;
+    final rows = kw.isEmpty
+        ? all
+        : all.where((Map<String, dynamic> r) =>
+            (r['content']?.toString() ?? '').toLowerCase().contains(kw)).toList();
     if (!mounted) return;
     setState(() {
       _rows = rows;
@@ -106,7 +113,7 @@ class _MemoryInspectorPageState extends State<MemoryInspectorPage> {
       _busy = false;
       _message = result['message']?.toString() ?? result['error']?.toString() ?? result.toString();
     });
-    await _load();
+    await _load(full: true);
     if (_detail != null && _detail!['id'] != null) {
       await _select(_detail!['id'].toString());
     }

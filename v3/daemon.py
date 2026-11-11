@@ -156,12 +156,17 @@ class V3Daemon:
 
     # ── 在线受理（不等待任何计算）────────────────────────────────────────
     def handle_event(self, content: str, *, agent_id: str = "default",
-                     namespace: str = "private") -> dict[str, Any]:
+                     namespace: str = "topic:default") -> dict[str, Any]:
         content = str(content).strip()
         if len(content) < 4:
             return {"accepted": False, "error": "content too short"}
         started = time.perf_counter()
-        event = self.journal.append(content, agent_id=agent_id, namespace=namespace)
+        # ★ 新写入默认带空间标记：非 topic: 前缀一律归默认空间，
+        #   journal 记录与最终落库 namespace 保持一致，避免审计错位。
+        ns = str(namespace or "topic:default")
+        if not ns.startswith("topic:"):
+            ns = "topic:default"
+        event = self.journal.append(content, agent_id=agent_id, namespace=ns)
         self.inbox.enqueue(event)
         self.alarm.ring(str(event["event_id"]))
         cost_ms = (time.perf_counter() - started) * 1000
@@ -225,7 +230,7 @@ class V3Daemon:
                     result = daemon.handle_event(
                         str(body.get("content", "")),
                         agent_id=str(body.get("agent_id", "default")),
-                        namespace=str(body.get("namespace", "private")),
+                        namespace=str(body.get("namespace", "topic:default")),
                     )
                     self._send(202 if result.get("accepted") else 400, result)
                 elif path == "/v1/config":
@@ -310,10 +315,14 @@ class V3Daemon:
         try:
             con = sqlite3.connect(f"file:{self._projection_db.as_posix()}?mode=ro", uri=True)
             con.row_factory = sqlite3.Row
-            rows = con.execute(
-                "SELECT * FROM neurons WHERE is_active=1 LIMIT ? OFFSET ?",
-                (max(0, int(limit)), max(0, int(offset))),
-            ).fetchall()
+            if limit and limit > 0:
+                cur = con.execute(
+                    "SELECT * FROM neurons WHERE is_active=1 LIMIT ? OFFSET ?",
+                    (int(limit), int(offset)),
+                )
+            else:
+                cur = con.execute("SELECT * FROM neurons WHERE is_active=1")
+            rows = cur.fetchall()
             con.close()
         except sqlite3.Error:
             return []
@@ -347,6 +356,7 @@ class V3Daemon:
                 "pad": (row.get("pad_p", 0.0), row.get("pad_a", 0.0), row.get("pad_d", 0.0)),
                 "is_emotion": row.get("memory_type") == "emotion",
                 "confidence": row.get("confidence", 0.5),
+                "namespace": str(row.get("namespace") or "private"),
             }
             for row in rows
         ]
@@ -395,9 +405,19 @@ class V3Daemon:
             for row in self._rows(limit=limit, offset=offset)
         ]
 
-    def recall(self, query: str, *, limit: int = 8) -> dict[str, Any]:
-        """轻量召回：字符 2-gram 余弦（只读投影，不加载模型）。Flutter 用结果发射光脉冲。"""
-        rows = self._rows(limit=500)
+    def recall(self, query: str, *, limit: int = 8,
+               namespaces: tuple[str, ...] | list[str] = ()) -> dict[str, Any]:
+        """轻量召回：字符 2-gram 余弦（只读投影，不加载模型）。Flutter 用结果发射光脉冲。
+
+        ★ A 包：namespaces 非空时按 topic 分区下推过滤，2-gram 只计算候选类，
+        扫描/打分开销按类数成比例下降（7 类下约 7 倍）。空元组 = Bot 全量可读。
+        """
+        ns = {str(x) for x in namespaces}
+        # 按类召回时取全量再先过滤：旧版固定 LIMIT 500（无 ORDER BY，实际是最早 500 行），
+        # 新写入的记忆永远进不了候选。先按 namespace 收窄，2-gram 只算同类，开销反而更低。
+        rows = self._rows(limit=0 if ns else 500)
+        if ns:
+            rows = [r for r in rows if str(r.get("namespace") or "private") in ns]
         vector = _ngram(query)
         scored = []
         for row in rows:
@@ -470,6 +490,7 @@ class V3Daemon:
                 "pad": (row.get("pad_p", 0.0), row.get("pad_a", 0.0), row.get("pad_d", 0.0)),
                 "is_emotion": row.get("memory_type") == "emotion" or abs(float(row.get("pad_a") or 0)) > 0.6,
                 "confidence": row.get("confidence", 0.5),
+                "namespace": str(row.get("namespace") or "private"),
             }
             for row in rows
         ]

@@ -178,6 +178,53 @@ class KuzuGraphDB(GraphRepository):
         rows = self._rows(result)
         return int(rows[0]["c"]) if rows else 0
 
+    def real_edges(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """★ C 包：读 Kùzu 真实关系边，保留方向 / 谓词 / 权重。
+
+        前端星云旧版用「200 条两两 2-gram 现算」造 semantic 边，丢掉方向与谓词，
+        这才是「关联记忆指向看不清」的根因。本方法只读，不改写入链、不碰单写锁。
+        """
+        conn = self._pool.get()
+        cap = max(1, min(int(limit), 2000))
+        edges: list[dict[str, Any]] = []
+        try:
+            rows = self._rows(conn.execute(
+                "MATCH (a:Entity)-[r:RELATES]->(b:Entity) "
+                "RETURN a.id AS source, a.name AS source_name, b.id AS target, "
+                "b.name AS target_name, r.predicate AS predicate, r.weight AS weight "
+                f"LIMIT {cap}"))
+            for row in rows:
+                edges.append({
+                    "source": str(row.get("source", "")),
+                    "source_name": str(row.get("source_name", "")),
+                    "target": str(row.get("target", "")),
+                    "target_name": str(row.get("target_name", "")),
+                    "predicate": str(row.get("predicate", "")),
+                    "weight": float(row.get("weight") or 0.5),
+                    "kind": "RELATES",
+                })
+        except Exception:  # noqa: BLE001 - 关系表为空或 schema 版本差异时优雅降级
+            pass
+        try:
+            rows = self._rows(conn.execute(
+                "MATCH (h:HyperEvent)-[m:MEMBER]->(e:Entity) "
+                "RETURN h.id AS source, h.label AS label, e.id AS target, "
+                "e.name AS target_name, m.weight AS weight "
+                f"LIMIT {cap}"))
+            for row in rows:
+                edges.append({
+                    "source": str(row.get("source", "")),
+                    "source_name": str(row.get("label", "")),
+                    "target": str(row.get("target", "")),
+                    "target_name": str(row.get("target_name", "")),
+                    "predicate": "成员",
+                    "weight": float(row.get("weight") or 0.5),
+                    "kind": "MEMBER",
+                })
+        except Exception:  # noqa: BLE001
+            pass
+        return edges
+
     @staticmethod
     def _rows(result: Any) -> list[dict[str, Any]]:
         """kuzu 结果转 dict 列表（不用 get_as_df：它需要 pandas）。"""

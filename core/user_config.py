@@ -6,8 +6,8 @@
 - 预设：均衡默认 / 核显省电 / 独显性能，应用 = 覆盖一组补丁并立即生效。
 - apply_overrides：把补丁写回 BrainConfig 运行期对象（子模型逐字段赋值）。
 
-本模块从 ui.desktop.user_config 下沉而来，供无头后端 / Flutter RPC 共用；
-Qt 前端保留同名转发模块，验收后可整体删除而配置能力不丢失。
+本模块为无头后端 / Flutter RPC 提供用户配置读写能力；
+配置能力完全由 core.* 承接，不依赖任何 UI 框架模块。
 """
 from __future__ import annotations
 

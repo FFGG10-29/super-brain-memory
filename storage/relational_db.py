@@ -325,6 +325,7 @@ class SqliteRelationalDB(RelationalRepository):
         active_only: bool = True,
         limit: int = 50,
         offset: int = 0,
+        since_ms: int = 0,
     ) -> list[Record]:
         spec = self._spec(kind)
         clauses: list[str] = []
@@ -340,10 +341,20 @@ class SqliteRelationalDB(RelationalRepository):
         if memory_types and "memory_type" in spec.columns:
             clauses.append(f"memory_type IN ({', '.join('?' for _ in memory_types)})")
             params.extend(memory_types)
+        if since_ms and since_ms > 0 and "updated_at_ms" in spec.columns:
+            clauses.append("updated_at_ms > ?")
+            params.append(int(since_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT payload FROM {spec.table}{where} ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?"
-        rows = self._pool.get().execute(sql, [*params, int(limit), int(offset)]).fetchall()
-        return [json.loads(row["payload"]) for row in rows]
+        if limit and limit > 0:
+            sql = (f"SELECT payload, updated_at_ms FROM {spec.table}{where} "
+                   f"ORDER BY updated_at_ms DESC LIMIT ? OFFSET ?")
+            args = [*params, int(limit), int(offset)]
+        else:
+            sql = f"SELECT payload, updated_at_ms FROM {spec.table}{where} ORDER BY updated_at_ms DESC"
+            args = list(params)
+        rows = self._pool.get().execute(sql, args).fetchall()
+        # 把 updated_at_ms 列一并带出，前端增量/排序直接用，不必再猜 id 时间戳。
+        return [dict(json.loads(row["payload"]), updated_at_ms=row["updated_at_ms"]) for row in rows]
 
     def full_text_search(
         self,

@@ -98,6 +98,13 @@ class ModelConfig(BaseSettings):
     llm_model: str = ""                                  # 如 deepseek-chat / gpt-4o-mini
     llm_timeout_sec: int = 30
     llm_api_key_env: str = "LLM_API_KEY"
+    # ★ 本地 LLM 总开关（MODEL_LLM_ENABLED，默认 True=启用 GPU/CPU 推理）。
+    #   2026-11-10 实测：GTX 1060(Pascal 6.1) 上 bge-m3+reranker(CUDA)+qwen3-0.6b
+    #   (n_gpu_layers=-1) 三模型同进程共存、推理全部正常，无需禁用 LLM。
+    #   此前误判的 ggml-cuda.cu:109 "CUDA error" 实为进程关闭时 CUDA context 释放的
+    #   stderr 噪音（紧跟 WS 断连），非运行期崩溃。本开关仅作为可选降级逃生口：
+    #   置 False 时注入 DisabledLLM，裸写走规则抽取（PAD 有非零基线），用于低配/无 GPU 机器。
+    llm_enabled: bool = True
 
 
 class RecallConfig(BaseSettings):
@@ -107,6 +114,7 @@ class RecallConfig(BaseSettings):
     rrf_k_oversample: int = 4                            # 各路超采样 k×4
     rrf_constant: int = 60                               # 1/(k+rank)
     w_rrf: float = 1.0                                   # RRF 名次
+    w_dense: float = 0.35                                # ★ B 包：dense cosine 相似度直接进总分（旧版只以名次进 RRF）
     w_freshness: float = 0.6                             # 新鲜度
     w_synapse: float = 0.8                               # 突触强度
     w_pad: float = 0.5                                   # PAD 显著性
@@ -115,6 +123,8 @@ class RecallConfig(BaseSettings):
     p95_target_ms: int = 800                             # CPU 单次召回 P95
     pad_salience_arousal_weight: float = 0.6             # PAD 显著性里唤醒度的占比
     rerank_enabled: bool = True                          # False=跳过交叉编码精排（省时省电，低配设备）
+    rerank_top_n: int = 30                               # ★ B 包：精排候选上限（旧版 = k×4 全量灌给交叉编码器）
+    rerank_timeout_ms: int = 3000                        # ★ B 包：精排硬超时，超时回退 RRF 顺序，deep 不再卡 20s+
 
 
 class PlasticityConfig(BaseSettings):
@@ -207,6 +217,7 @@ class MergeConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MERGE_")
 
     merge_enabled: bool = True                    # 写入时由 LLM 裁决 新增/更新/合并/跳过
+    merge_cognition_enabled: bool = True          # 带 cognition（认知契约）的写入也参与合并裁决——同事项演进收敛为一条，不再无限追加版本
     merge_candidate_limit: int = 3                # 参与裁决的最相似旧记忆条数
     cluster_summary_enabled: bool = True          # 夜间巩固时为语义聚簇生成主题摘要
     cluster_min_members: int = 3                  # 聚簇至少多少条成员才值得生成摘要
@@ -226,7 +237,7 @@ class ActivationConfig(BaseSettings):
 
 
 class UiConfig(BaseSettings):
-    """PySide6 桌面前端全部动画/配色参数（禁止散落在视图代码里）。"""
+    """前端动画/配色参数（供前端样式参考）。"""
     model_config = SettingsConfigDict(env_prefix="UI_")
 
     timer_interval_ms: int = 16                 # ~60fps

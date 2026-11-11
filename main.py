@@ -47,7 +47,7 @@ from core.interfaces import (
 )
 from engine.cuda_runtime import prepare_cuda_dll_path
 from engine.embedding import BgeM3Embedder
-from engine.local_llm import QwenLocalLLM
+from engine.local_llm import QwenLocalLLM, DisabledLLM
 from engine.reranker import create_reranker
 from gateway.http_adapter import HTTPAdapter
 from gateway.mcp_server import MCPToolkit
@@ -253,8 +253,11 @@ def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
         )
 
     local_llm_path = model.llm_gguf_dir / model.llm_gguf_file
-    llm: LocalLLM
-    if model.llm_backend == "cloud":
+    # ★ 本地 LLM 总开关：关掉时用 DisabledLLM 占位，裸写也绝不实例化 llama_cpp（规避 CUDA 崩）。
+    #   认知契约下带 cognition 的写入走 from_agent，不经过 LLM，质量不受影响。
+    if not model.llm_enabled:
+        llm: LocalLLM = DisabledLLM()
+    elif model.llm_backend == "cloud":
         if model.llm_base_url and model.llm_model:
             from brain.cloud_models import CloudCredentials, CloudLLM, load_cloud_api_key
 
@@ -343,12 +346,25 @@ def build_app(config: BrainConfig | None = None) -> BrainApp:
         storage.relational, plasticity, event_log=journal, config=config
     )
     neocortex = Neocortex(storage.relational, event_log=journal, config=config)
+
+    # 项目档案实时提炼：agent 写入即异步进六引擎（事件驱动后台线程），夜间只兜底
+    from workers.document_distiller import (
+        start_distill_worker, enqueue_document,
+    )
+    from core.context_layers import set_distill_trigger
+    _distill_save = lambda text, *, agent_id="distiller", namespace="document": (
+        hippocampus.remember(text, agent_id=agent_id, namespace=namespace)
+    )
+    start_distill_worker(_distill_save)
+    set_distill_trigger(enqueue_document)
+
     life_loop = LifeLoop(
         storage.timeseries,
         relational=storage.relational,
         graph=storage.graph,
         tier_manager=tier_manager,
         config=config,
+        save_memory=_distill_save,
     )
     circadian = Circadian()
 

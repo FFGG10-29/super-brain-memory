@@ -83,44 +83,6 @@ def test_mcp_save_recall_health_via_handlers(desktop_config):
         app.close()
 
 
-def test_multi_agent_bridge_forwards_to_single_kernel(desktop_config, tmp_path, monkeypatch):
-    """三个 Agent 同时接入：桌面内核独占 Kùzu，stdio 进程走 /mcp/call 转发。"""
-    monkeypatch.setenv("SUPER_BRAIN_HOME", str(tmp_path / "home"))
-    from core.runtime_paths import local_bridge_path
-
-    import gateway.mcp_stdio as mcp_stdio
-    from ui.desktop.backend import DesktopBackend
-
-    backend = DesktopBackend(desktop_config)
-    try:
-        assert backend.start_http("127.0.0.1", 0)["ok"] is True
-        payload = json.loads(local_bridge_path().read_text(encoding="utf-8"))
-        assert payload["token"] and payload["url"].startswith("http://127.0.0.1:")
-
-        # 令牌必须持久化：重启软件后复制的 MCP JSON 仍要有效
-        from core.runtime_paths import read_local_token
-
-        assert read_local_token() == payload["token"], "桥接令牌必须与落盘令牌一致（重启不变）"
-
-        bridge = mcp_stdio.bridge_config()
-        assert bridge is not None, "stdio 进程必须能自动发现桌面内核"
-        assert bridge["url"] == payload["url"]
-
-        saved = mcp_stdio._remote_call(
-            bridge, "save_memory", {"content": "三个 Agent 共用同一内核", "agent_id": "codebuddy"}
-        )
-        assert saved["applied"] is True, saved
-        recalled = mcp_stdio._remote_call(
-            bridge, "recall_memory", {"query": "共用同一内核", "agent_id": "dsh", "top_k": 3}
-        )
-        assert recalled["hits"], recalled
-        assert mcp_stdio._remote_call(bridge, "health_check", {})["engines"]
-    finally:
-        backend.stop_http()
-        backend.close()
-    assert not local_bridge_path().exists(), "停服务要清桥接文件，避免 Agent 连到死端口"
-
-
 def test_memories_are_shared_across_all_agents(desktop_config):
     """核心承诺：超级大脑是外置共享大脑——A 写的记忆，B 立刻能召回，不需任何额外参数。"""
     from gateway.mcp_server import MCPToolkit
