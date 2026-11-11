@@ -7,6 +7,8 @@ HTTP 适配器、单元测试共用；`serve()` 才按需 import 官方 mcp SDK�
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import time
 from typing import Any
 
@@ -19,6 +21,45 @@ from gateway.registry import Agent, AgentRegistry
 from gateway.tool_catalog import RPC_MAP, TOOL_SCHEMAS, manifest as context_manifest
 
 __all__ = ["MCPToolkit", "TOOL_SCHEMAS"]
+
+# ── C19：幂等读工具结果缓存（独立 ns "tool_read"）────────────────────────
+# 设计：CacheConfig.namespaces 里 "tool" 是 enabled=False 预留位（config.py 归
+# c17 成员，不可改），故用独立 ns 名 "tool_read" 绕开：CacheManager._settings 对
+# 未注册 ns 回退默认 settings（enabled=True / capacity=512 / ttl=600 / memory）。
+# TTL 60s 由下方 set(ttl_sec=…) 显式传入覆盖默认 600。
+# 局限（如实声明）：
+#   ① 仍受 config.cache 总开关约束：总开关关 → get 恒 miss，缓存自动静默；
+#   ② E1 衰减曲线默认开启时，高频命中条目的有效 TTL 会按 log1p(access_count)
+#      略长于 60s（可接受：读工具结果 60s 陈旧窗口本就允许小幅放大）；
+#   ③ 纯进程内，重启即空，不跨进程共享。
+_TOOL_CACHE_NS = "tool_read"
+_TOOL_CACHE_TTL_SEC = 60.0
+# 白名单（逐条核对 gateway/tool_catalog.py：全部为 list/get/status/统计类只读
+# 工具，无写库、无审计副作用，结果 60s 内确定；白名单与写标记零交集）：
+_TOOL_READ_WHITELIST = frozenset({
+    # _dispatch 内置只读工具：
+    "health_check", "context_manifest", "profile_read", "conflict_report", "timeline_query",
+    # v3 RPC 只读转发：
+    "context_status", "runtime_get", "documents_list", "documents_search",
+    "spaces_list", "skills_list", "skills_get", "memory_list", "memory_inspect",
+    "memory_audit", "core_memory_get", "pad_distribution", "graph_projection",
+    "graph_real_edges", "activation_graph", "config_presets", "gateway_status",
+    "engine_status", "model_status", "topics_list", "data_status", "secrets_status",
+    "tray_status", "autostart_get", "persona_get", "persona_baseline", "persona_status",
+})
+# ★ 刻意排除（取舍，勿随手加回）：
+#   - recall_memory / recall_deep：六通道召回 _audit 写 DuckDB access_log + 结构化
+#     日志（prefrontal._audit，只写不改）；fast 路径转 v3 RPC 同理。缓存命中会丢
+#     召回审计 → 审计丢失不可接受，故整条召回链路不进白名单。
+#   - documents_read：读全文记录 last_read（最久未读优先归档），非幂等。
+#   - system_stats：CPU/显卡实时快照，60s 陈旧值有误导性。
+#   - 其余全部为写类工具（见 _TOOL_WRITE_MARKERS），绝不缓存。
+_TOOL_WRITE_MARKERS = frozenset({
+    "save", "set", "delete", "forget", "correct", "mutate", "write", "create",
+    "update", "import", "migrate", "apply", "sync", "snapshot", "shutdown",
+    "enable", "disable", "upsert", "evolve", "activate", "reclassify",
+    "feedback", "rollback", "sensitive",
+})
 
 
 class MCPToolkit:
@@ -69,34 +110,91 @@ class MCPToolkit:
         return f"记忆来源可信度：{weights}"
 
     def _agent_brief(self, agent_id: str) -> str:
-        """E6 Agent 心智模型：拼「与该 Agent 的既往协作要点」块（无匹配返回空串）。
+        """E6（深度版）Agent 心智模型 brief，三段：
 
-        数据源是画像（memory_type=profile）神经元，按 payload 的 agent_id 匹配该 Agent
-        取最近 3 条。结果缓存进 _agent_brief_cache（TTL 300s）：brief 是低风险摘要，
-        写路径失效不做——最坏 5 分钟后过期重建（见 __init__ 注释）。
+        1.「与该 Agent 的既往协作要点」：画像（profile）前 3 条（与最小可行版一致）；
+        2.「它写过：topic×n、…」：该 agent 的 fact 记忆按 topic 聚合 top3
+          （topic 优先取行内 topic 字段，缺省回退 namespace 的 "topic:" 前缀）；
+        3.「最近一次协作时间」：该 agent 最新一条记忆 created_at_ms 的相对时间。
+
+        数据源：单次 self._relational.query("neuron", memory_types=("profile","fact"),
+        limit=50)，本地按 memory_type 分流——保持「每 brief 恰好 1 次 relational
+        查询」契约（tests/test_meta_e2e6.py::test_agent_brief_cached_with_ttl 锁定
+        次数），不做第二遍 fact 专项查询。brief 仍按 agent_id 缓存，TTL 保持 300s。
         """
         now = time.time()
         cached = self._agent_brief_cache.get(agent_id)
         if cached is not None and now - cached[0] < self._AGENT_BRIEF_TTL_SEC:
             return cached[1]
         try:
-            rows = self._relational.query("neuron", memory_types=("profile",), limit=20)
+            rows = self._relational.query(
+                "neuron", memory_types=("profile", "fact"), limit=50)
         except Exception:  # noqa: BLE001  brief 失败不阻断召回
             rows = []
-        lines: list[str] = []
+        profile_lines: list[str] = []
+        topic_counts: dict[str, int] = {}
+        latest_ms = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
             if str(row.get("agent_id") or "") != agent_id:
                 continue
+            created = int(row.get("created_at_ms") or 0)
+            if created > latest_ms:
+                latest_ms = created
+            memory_type = str(row.get("memory_type") or "profile")  # 旧行缺类型 → 按画像（兼容）
+            if memory_type == "fact":
+                topic = str(row.get("topic") or "").strip()
+                if not topic:
+                    namespace = str(row.get("namespace") or "")
+                    if namespace.startswith("topic:"):
+                        topic = namespace[len("topic:"):]
+                if topic:
+                    topic_counts[topic] = topic_counts.get(topic, 0) + 1
+                continue
             text = str(row.get("content") or "").strip()
-            if text:
-                lines.append(f"- {text[:120]}")
-            if len(lines) >= 3:
-                break
-        brief = "【与该 Agent 的既往协作要点】\n" + "\n".join(lines) if lines else ""
+            if text and len(profile_lines) < 3:
+                profile_lines.append(f"- {text[:120]}")
+        sections: list[str] = []
+        if profile_lines:
+            sections.append("【与该 Agent 的既往协作要点】\n" + "\n".join(profile_lines))
+        if topic_counts:
+            top = sorted(topic_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            sections.append("它写过：" + "、".join(f"{name}×{count}" for name, count in top))
+        if latest_ms:
+            sections.append(
+                f"最近一次协作时间：{self._relative_time(latest_ms, now_ms=int(now * 1000))}")
+        brief = "\n".join(sections)
         self._agent_brief_cache[agent_id] = (now, brief)
         return brief
+
+    @staticmethod
+    def _relative_time(ms: int, *, now_ms: int) -> str:
+        """created_at_ms → 「刚刚 / N 分钟前 / N 小时前 / N 天前 / N 个月前」。"""
+        diff = max(0, now_ms - int(ms))
+        if diff < 60_000:
+            return "刚刚"
+        if diff < 3_600_000:
+            return f"{diff // 60_000} 分钟前"
+        if diff < 86_400_000:
+            return f"{diff // 3_600_000} 小时前"
+        if diff < 30 * 86_400_000:
+            return f"{diff // 86_400_000} 天前"
+        return f"{diff // (30 * 86_400_000)} 个月前"
+
+    @staticmethod
+    def _perspective_of(source: Any) -> str:
+        """E6：从 hit / 行记录提取 perspective（整包 meta/payload 或平铺字段均可）。"""
+        if isinstance(source, dict):
+            value = source.get("perspective")
+            if value is None:
+                nested = source.get("meta") or source.get("payload") or {}
+                value = nested.get("perspective") if isinstance(nested, dict) else None
+            return str(value or "")
+        nested = getattr(source, "meta", None) or getattr(source, "payload", None)
+        if isinstance(nested, dict):
+            return str(nested.get("perspective") or "")
+        return str(getattr(source, "perspective", "") or "")
 
     def authenticate(self, headers: dict) -> Agent:
         authorization = str(headers.get("authorization") or headers.get("Authorization") or "")
@@ -107,7 +205,7 @@ class MCPToolkit:
         started = time.perf_counter()
         try:
             agent = self.authenticate(headers)
-            result = self._dispatch(tool, dict(args or {}), agent)
+            result = self._call_with_tool_cache(tool, dict(args or {}), agent)
             self._registry.audit(agent.agent_id, tool, ok=True, latency_ms=(time.perf_counter() - started) * 1000)
             return result
         except (GatewayAuthError, ValueError, KeyError) as exc:
@@ -134,11 +232,78 @@ class MCPToolkit:
         started = time.perf_counter()
         try:
             result = self._dispatch("save_memory", dict(args or {}), agent)
+            self._invalidate_tool_cache_after_write(result)
             self._registry.audit(agent.agent_id, "save_memory", ok=True,
                                  latency_ms=(time.perf_counter() - started) * 1000)
             return result
         except (GatewayAuthError, ValueError, KeyError) as exc:
             return {"error": type(exc).__name__, "message": str(exc)}
+
+    def _call_with_tool_cache(self, tool: str, args: dict, agent: Agent) -> dict[str, Any]:
+        """C19 缓存层：白名单读工具命中直接返回（跳过 dispatch，零重复执行）；
+        写类工具成功后清空整个 tool_read ns。
+
+        缓存键 = sha256(tool + json.dumps(args, sort_keys=True))：参数顺序无关、
+        跨进程可复算。错误/异常响应一律不缓存。
+        与「禁止清空整个命名空间」纪律（Q28-Q36）的取舍：精确失效要求键或值含
+        neuron id，而工具缓存键是「工具+参数哈希」，不含任何记忆 id，写事件无法
+        按值精确命中；逐键追失效复杂度不划算。工具缓存是低价值高确定性缓存
+        （容量 512、TTL 仅 60s），整 ns 清空的代价只是写后第一批读 miss 一次。
+        故此处是对纪律的显式、有注释的例外，仅限 tool_read ns。
+        """
+        from core.cache_manager import get_cache_manager
+        mgr = get_cache_manager()
+        key = self._tool_cache_key(tool, args)
+        if mgr is not None and tool in _TOOL_READ_WHITELIST:
+            try:
+                cached = mgr.get(_TOOL_CACHE_NS, key)
+            except Exception:  # noqa: BLE001  缓存读失败不阻断调用
+                cached = None
+            if isinstance(cached, dict) and "result" in cached:
+                return {**cached["result"], "tool_cache_hit": True}
+        result = self._dispatch(tool, args, agent)
+        if mgr is None or (isinstance(result, dict) and result.get("error")):
+            return result  # 错误响应不缓存、不触发失效
+        try:
+            if tool in _TOOL_READ_WHITELIST:
+                mgr.set(_TOOL_CACHE_NS, key, {"result": result},
+                        ttl_sec=_TOOL_CACHE_TTL_SEC)
+            elif self._is_write_tool(tool):
+                mgr.invalidate(_TOOL_CACHE_NS, "*")
+        except Exception:  # noqa: BLE001  缓存读写失败不影响工具结果
+            pass
+        return result
+
+    @staticmethod
+    def _is_write_tool(tool: str) -> bool:
+        """写类工具判定：按 -_ . 分词后精确命中写标记。
+
+        已修文档代码：原实现为裸子串匹配，会把只读工具 config_presets 误判为写
+        （"preSETs" 含 "set"），白名单与写标记不零交集。改为按分隔符分词精确匹配，
+        词表不变；已逐名核对 31 项白名单零命中、常见写工具（save_memory /
+        core_memory_set / memory_forget / memory_sensitive 等）仍全部命中。
+        """
+        tokens = {part for part in re.split(r"[-_.]", tool) if part}
+        return bool(tokens & _TOOL_WRITE_MARKERS)
+
+    @staticmethod
+    def _tool_cache_key(tool: str, args: dict) -> str:
+        blob = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(f"{tool}|{blob}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _invalidate_tool_cache_after_write(result: dict[str, Any]) -> None:
+        """ChatEngine 等进程内写路径（save_for_agent，绕过 call()）同样清 tool_read。"""
+        if isinstance(result, dict) and result.get("error"):
+            return
+        from core.cache_manager import get_cache_manager
+        mgr = get_cache_manager()
+        if mgr is None:
+            return
+        try:
+            mgr.invalidate(_TOOL_CACHE_NS, "*")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── C06：prompt_prefix 稳定前缀缓存 ──────────────────────────────────
     @staticmethod
@@ -236,10 +401,8 @@ class MCPToolkit:
             if cognition_raw is not None and cognition is None:
                 raise ValueError("cognition 必须是对象")
             # E6 社会认知：cognition.perspective（如 "Agent A 认为…"）整体随 cognition
-            # 透传给 hippocampus.remember，不在本层拆改。落点差距：hippocampus 的
-            # 旁路 meta 白名单（brain/hippocampus.py _remember 的 meta 块）当前不含
-            # perspective 键，故该字段暂不落旁路索引，需 hippocampus 侧增补后才落盘；
-            # 本层只保证 cognition 字段原样可达 + 响应回显，便于上层观察。
+            # 透传给 hippocampus.remember；hippocampus 旁路索引 meta 已含 perspective 键
+            # （brain/hippocampus.py），recall 侧按当前 agent 做视角前置排序。
             perspective = str((cognition or {}).get("perspective") or "")
             result = self._hippocampus.remember(
                 content, agent_id=agent.agent_id, namespace=namespace,
@@ -302,6 +465,7 @@ class MCPToolkit:
                         # E2：来源追溯——source=写入者，trust 按 source 前缀查 config.recall.source_trust
                         "source": str(hit.neuron.agent_id or ""),
                         "trust": self._source_trust(str(hit.neuron.agent_id or "")),
+                        "perspective": self._perspective_of(hit),
                     }
                     for hit in hits
                 ]
@@ -323,6 +487,7 @@ class MCPToolkit:
                         "source": str(row.get("agent_id") or row.get("source") or ""),
                         "trust": self._source_trust(
                             str(row.get("agent_id") or row.get("source") or "")),
+                        "perspective": self._perspective_of(row),
                     }
                     for row in raw_hits if isinstance(row, dict)
                 ]
@@ -337,6 +502,17 @@ class MCPToolkit:
                         text = text[:120].rstrip() + "…（摘要）"
                     head.append(f"{index}. {text}")
                 injection = "\n".join(head) if rows else ""
+            # E6 视角选择注入：neuron payload/meta 带 perspective（hippocampus
+            # 旁路索引已落盘，brain/hippocampus.py meta 块含 perspective 键）时，
+            # 匹配当前 agent 的条目前置。Python sort 稳定 → 只换顺序不改内容。
+            current_agent = str(agent.agent_id or "")
+            matched = sum(
+                1 for row in rows
+                if row.get("perspective") and current_agent
+                and current_agent in row["perspective"])
+            if matched and len(rows) > 1:
+                rows.sort(key=lambda row: 0 if (
+                    row.get("perspective") and current_agent in row["perspective"]) else 1)
             # W5 / P4.2：事件骨架作为整体注入，内部成员已由 prefrontal 从各通道移除
             narratives = (list(getattr(self._prefrontal, "last_narratives", []) or [])
                           if mode == "six-channel" else [])
@@ -378,6 +554,7 @@ class MCPToolkit:
                 "namespaces": list(ns_filter),
                 "narratives": narratives,
                 "knowledge_gap": knowledge_gap,
+                "perspective_matched": matched,
                 "degraded": bool(getattr(self._prefrontal, "last_degraded", False)),
             }
 

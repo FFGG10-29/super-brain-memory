@@ -18,7 +18,7 @@ __all__ = ["CacheInvalidationBus", "write_result_to_event"]
 
 MEMORY_EVENT = "memory_updated"
 # 记忆更新默认波及的缓存命名空间（消费者可按事件扩展）
-DEFAULT_AFFECTED = ("recall", "episodic", "salience", "doc_distill")
+DEFAULT_AFFECTED = ("recall", "episodic", "salience", "doc_distill", "semantic")
 
 
 class CacheInvalidationBus:

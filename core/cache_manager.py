@@ -359,6 +359,38 @@ class CacheManager:
         rows.sort(key=lambda row: (-int(row["access_count"]), str(row["key"])))
         return rows
 
+    def iter_entries(self, ns: str) -> list[tuple[str, Any]]:
+        """C17 语义输出缓存专用：遍历命名空间全部未过期条目（键, 值）。
+
+        memory 介质遍历 LRU store（跳过已过期）；lmdb 介质走 scan_prefix
+        惰性解析 JSON。ns 关闭时返回 []（与 get 的回退语义一致）。
+        只读：不改访问计数/LRU 顺序，不写指标，不删除过期条目。
+        """
+        if not self._enabled(ns):
+            return []
+        settings = self._settings(ns)
+        now = time.time()
+        items: list[tuple[str, Any]] = []
+        if settings.get("media") == "lmdb":
+            if self._kv is None:
+                return []
+            for stored_key, raw in self._kv.scan_prefix(_LMDB_BUCKET, f"{ns}:", limit=5000):
+                try:
+                    payload = json.loads(bytes(raw).decode("utf-8"))
+                except (ValueError, TypeError):
+                    continue
+                expires_at = float(payload.get("expires_at") or 0.0)
+                if expires_at > 0 and now >= expires_at:
+                    continue  # 惰性过期条目不算数（保持只读，不删除）
+                items.append((str(stored_key).split(":", 1)[-1], payload.get("value")))
+        else:
+            store = self._store(ns)
+            with self._lock:
+                for key, entry in list(store._items.items()):
+                    if not store._expired(entry, now):
+                        items.append((key, entry.value))
+        return items
+
     # ── 精确失效 ──────────────────────────────────────────────────────────
     def invalidate(self, ns: str, key_pattern: str) -> int:
         """通配失效（fnmatch，键形如 `{ns}:{key}`）；返回删除条数。"""

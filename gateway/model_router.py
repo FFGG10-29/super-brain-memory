@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -27,14 +29,38 @@ PAID = "paid"
 # C16（Q34）：只有确定性问答 intent 才写输出缓存；emotion/consolidation/media 不写
 _OUTPUT_CACHE_INTENTS = frozenset({"chat", "code", "tool_call"})
 
+# C17：时效性 prompt（答案随时间/状态变化）强制绕过语义缓存的查与写
+_SEMANTIC_BYPASS_RE = re.compile(r"今天|现在|最近|几点|\d{4}年")
+
+
+def _normalize(text: str) -> str:
+    """C16/C17 共用：去首尾空白 + 压缩连续空白 + lower。"""
+    return " ".join(str(text).split()).lower()
+
 
 def _output_cache_key(prompt: str, preference: str, intent: str) -> str:
-    """C16 键：sha256(normalize(prompt) + model偏好 + intent)，一律 str。
-    normalize = 去首尾空白 + 压缩连续空白 + lower，语义等价输入共享同一键。"""
-    normalized = " ".join(str(prompt).split()).lower()
+    """C16 键：sha256(normalize(prompt) + model偏好 + intent)，一律 str。"""
     return hashlib.sha256(
-        (normalized + "\x00" + str(preference) + "\x00" + str(intent))
+        (_normalize(prompt) + "\x00" + str(preference) + "\x00" + str(intent))
         .encode("utf-8")).hexdigest()
+
+
+def _semantic_key(prompt: str) -> str:
+    """C17 键：sha256(normalize(prompt))（不含偏好/intent，语义等价输入共享条目）。"""
+    return hashlib.sha256(_normalize(prompt).encode("utf-8")).hexdigest()
+
+
+def _cosine(a: Any, b: Any) -> float:
+    """稠密向量余弦；非法/零向量一律 0.0（宁可 miss 不可假命中）。"""
+    try:
+        num = sum(float(x) * float(y) for x, y in zip(a, b))
+        da = math.sqrt(sum(float(x) ** 2 for x in a))
+        db = math.sqrt(sum(float(y) ** 2 for y in b))
+    except (TypeError, ValueError):
+        return 0.0
+    if da <= 0.0 or db <= 0.0:
+        return 0.0
+    return num / (da * db)
 
 
 @dataclass
@@ -117,10 +143,12 @@ class ModelRouter:
         clients: list[ModelClient] | None = None,
         on_fallback: Callable[[dict[str, Any]], None] | None = None,
         local_llm: Any | None = None,
+        embedder: Any | None = None,
     ) -> None:
         self._config = config or get_config()
         self._secret_store = secret_store
         self._local_llm = local_llm
+        self._embedder = embedder
         self._injected = clients
         self._on_fallback = on_fallback
         self._pool: list[ModelClient] = []
@@ -239,6 +267,55 @@ class ModelRouter:
         self._sticky[session_id] = (best.name, intent, now + ttl, caps, chain)
         return best
 
+    # ── C17：语义输出缓存 ─────────────────────────────────────────────────
+    def _semantic_embedding(self, prompt: str, intent: str) -> list[float] | None:
+        """可做语义缓存时返回 prompt 的 embedding；跳过条件（配置关/无 embedder/
+        intent 不可缓存/时效性 prompt）返回 None。异常一律回退 None 不影响主链路。"""
+        if (not self._config.model_router.semantic_cache
+                or self._embedder is None
+                or intent not in _OUTPUT_CACHE_INTENTS
+                or _SEMANTIC_BYPASS_RE.search(str(prompt))):
+            return None
+        mgr = get_cache_manager()
+        if mgr is None:
+            return None
+        try:
+            vector = self._embedder.embed_query(_normalize(prompt))
+            return [float(x) for x in (vector or [])]
+        except Exception:  # noqa: BLE001  embedder 故障不阻断模型调用
+            return None
+
+    def _semantic_lookup(self, embedding: list[float], intent: str) -> dict[str, Any] | None:
+        """线性扫 semantic ns 按 intent 阈值取近邻；阈值缺省取最保守 0.95。"""
+        if not embedding:
+            return None
+        mgr = get_cache_manager()
+        if mgr is None:
+            return None
+        threshold = float(self._config.model_router.semantic_thresholds.get(intent, 0.95))
+        try:
+            entries = mgr.iter_entries("semantic")
+        except Exception:  # noqa: BLE001
+            return None
+        for _key, value in entries:
+            if not isinstance(value, dict) or not value.get("text"):
+                continue
+            if _cosine(embedding, value.get("embedding") or []) >= threshold:
+                return value
+        return None
+
+    def _semantic_store(self, prompt: str, embedding: list[float], text: str,
+                        model: str, memory_ids: list[str] | None) -> None:
+        mgr = get_cache_manager()
+        if mgr is None or not embedding:
+            return
+        try:
+            mgr.set("semantic", _semantic_key(prompt),
+                    {"embedding": embedding, "text": text, "model": model,
+                     "affected_ids": list(memory_ids or [])})
+        except Exception:  # noqa: BLE001  写缓存失败不影响对话
+            pass
+
     def complete(
         self,
         prompt: str,
@@ -255,6 +332,7 @@ class ModelRouter:
         缓存（sensitive 一律不读不写，防敏感内容落盘）；命中零模型调用直接返回。
         `memory_ids` 由 ChatEngine 接线传入，写进缓存值的 affected_ids，
         使 `memory_updated` 总线失效可精确命中（C0 按值匹配）。
+        C17：精确 miss 且语义可缓存时做 embedding 近邻查找（cache_kind="semantic"）。
         """
         caps = tuple(str(cap) for cap in (required_caps or ()))
         mgr = get_cache_manager()
@@ -267,6 +345,17 @@ class ModelRouter:
                 return {"ok": True, "text": str(cached["text"]),
                         "model": str(cached.get("model") or ""), "kind": "cache",
                         "fallback": False, "cache_hit": True}
+
+        # C17：精确缓存 miss 后做语义近邻查找；sensitive 一律不做语义读/写（与 C16 同纪律）。
+        # embedding 保存在 sem_embedding，成功后写入复用，避免二次编码。
+        sem_embedding = None if sensitive else self._semantic_embedding(prompt, intent)
+        if sem_embedding:
+            hit = self._semantic_lookup(sem_embedding, intent)
+            if hit is not None:
+                return {"ok": True, "text": str(hit["text"]),
+                        "model": str(hit.get("model") or ""), "kind": "cache",
+                        "fallback": False, "cache_hit": True,
+                        "cache_kind": "semantic"}
 
         first = self.route(intent, session_id, caps, sensitive=sensitive)
         # C07：sticky 已缓存同 (intent, caps) 的 fallback 链就直接复用；
@@ -301,6 +390,10 @@ class ModelRouter:
                         mgr.set("output", cache_key,
                                 {"text": text, "model": client.name,
                                  "affected_ids": list(memory_ids or [])})
+                    if sem_embedding:
+                        # C17：写 semantic ns，值含 affected_ids 供 memory_updated 失效
+                        self._semantic_store(prompt, sem_embedding, text,
+                                             client.name, memory_ids)
                     return {"ok": True, "text": text, "model": client.name,
                             "kind": client.kind, "fallback": client is not first,
                             "cache_hit": False}

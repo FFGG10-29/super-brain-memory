@@ -2,7 +2,7 @@
 
 三张表（架构 §四 + 情绪全链路 §存储）：
     pad_track(ts_ms, neuron_id, device_id, agent_id, p, a, d, source)  PAD 波动轨迹
-    access_log(ts_ms, agent_id, channel, query, hits, latency_ms, ok)   召回/写入审计
+    access_log(ts_ms, agent_id, channel, query, hits, latency_ms, ok, neuron_ids)   召回/写入审计
     decay_event(ts_ms, neuron_id, strength, stability, retrievability, tier) 衰减快照
 
 并发模型：DuckDB 单写多读，同进程多连接写同一文件会冲突 → 单连接 + 每线程 cursor
@@ -47,6 +47,8 @@ TABLE_COLUMNS: dict[TimeSeriesTable, tuple[dict[str, str], str]] = {
             "hits": "INTEGER",
             "latency_ms": "DOUBLE",
             "ok": "BOOLEAN",
+            # E3 精确归因：本次召回命中的记忆 id（JSON 数组字符串，最多 20 个）
+            "neuron_ids": "VARCHAR",
         },
         "agent_id",
     ),
@@ -112,6 +114,11 @@ class DuckDBTimeSeries(TimeSeriesRepository):
         for table, (columns, _) in TABLE_COLUMNS.items():
             cols = ", ".join(f"{name} {dtype}" for name, dtype in columns.items())
             self._conn.execute(f"CREATE TABLE IF NOT EXISTS {table}({cols})")
+        # E3 迁移：旧库 access_log 已建表无 neuron_ids 列。
+        # DuckDB 支持 ADD COLUMN IF NOT EXISTS（幂等，新库为 no-op）。
+        self._conn.execute(
+            "ALTER TABLE access_log ADD COLUMN IF NOT EXISTS neuron_ids VARCHAR"
+        )
 
     def _cursor(self) -> Any:
         """每线程一个 cursor（DuckDB 官方线程隔离手段）。"""

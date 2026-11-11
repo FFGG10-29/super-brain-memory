@@ -5,8 +5,10 @@
     L1 事实/项目层：topic 分区记忆，Bot 全量可读
     L2 会话/事件层：反馈事件驱动人格演化
 
-本模块只读写 context/persona.json（与主记忆库同一数据根、可备份、可人工编辑），
-镜像一份到 LMDB kv 供 AstrBot 侧读取；**不新增表、不改六引擎投影、不碰 Kùzu 单写锁**。
+本模块只读写 context/persona.json（与主记忆库同一数据根、可备份、可人工编辑）；
+读路径经 core.cache_manager 的进程内快照（persona ns，ttl=0：写路径精确失效 +
+外部手改文件按 mtime 自动失效重读）；**不新增表、不改六引擎投影、不碰 Kùzu 单写锁**。
+（旧 docstring 声称「镜像一份到 LMDB kv」与实现不符，LMDB 镜像并不存在，已修正。）
 
 护栏（硬边界）：
     1. 骨架字段任何反馈/微调都不可改（需 confirm_skeleton 且留审计）
@@ -33,9 +35,10 @@ __all__ = ["PersonaLayer", "get_persona_layer", "BASELINE_DOC_ID"]
 
 BASELINE_DOC_ID = "cccf1cb8fbad"
 
-# C14 人格参数进程内快照：ns="persona"，键固定 "persona_state"，
-# 值 = persona.json 完整状态 dict（params/history/guardrails/proposals/revision）。
-# ttl=0 永不过期，一致性完全靠写路径精确失效（_write 成功后 invalidate）。
+# C14/E6 人格参数进程内快照：ns="persona"，键固定 "persona_state"，
+# 值 = {"data": persona.json 完整状态 dict, "mtime": 读盘时刻 stat().st_mtime}。
+# ttl=0 永不过期；一致性靠 ①写路径精确失效（_write 成功后 invalidate）
+# ②命中前 stat 校验 mtime（外部手改文件自动作废重读回填）。
 _CACHE_NS = "persona"
 _CACHE_KEY = "persona_state"
 
@@ -115,19 +118,35 @@ class PersonaLayer:
                 })
 
     def _read(self) -> dict[str, Any]:
-        # C14：先查 persona ns 进程内快照，miss 才读盘并回填；mgr 未装配则回退直读盘。
+        # C14/E6：先查 persona ns 进程内快照。命中前 stat persona.json 的 mtime，
+        # 与快照记录不一致（外部手改 / 同步落盘）→ 快照作废，落到下方读盘回填。
+        # stat 失败（文件被原子替换的瞬间 / 已删）时保守沿用快照——磁盘源消失时
+        # 缓存是唯一可服务的数据（对齐 C14 用例 test_unchanged_read_serves_from_cache）。
+        # 局限：mtime 校验依赖 persona ns 为 memory 介质（默认即是）；若改 LMDB 介质，
+        # JSON 往返可能损失 st_mtime 浮点精度，届时需改存整型 ms 时间戳。
         mgr = get_cache_manager()
         if mgr is not None:
             cached = mgr.get(_CACHE_NS, _CACHE_KEY)
-            if isinstance(cached, dict):
-                return copy.deepcopy(cached)  # 防调用方原地改写污染缓存
+            if isinstance(cached, dict) and "data" in cached:
+                try:
+                    current_mtime: Any = self._file.stat().st_mtime
+                except OSError:
+                    current_mtime = cached.get("mtime")  # 无法核实 → 沿用快照
+                if current_mtime == cached.get("mtime"):
+                    return copy.deepcopy(cached["data"])  # 防调用方原地改写污染缓存
+            # miss / mtime 漂移 / 值形制不符（旧版裸 dict）→ 统一走读盘回填
         with self._lock:
             try:
                 data = json.loads(self._file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 return {}
         if mgr is not None and data:
-            mgr.set(_CACHE_NS, _CACHE_KEY, copy.deepcopy(data), ttl_sec=0)
+            try:
+                mtime: Any = self._file.stat().st_mtime
+            except OSError:
+                mtime = None
+            mgr.set(_CACHE_NS, _CACHE_KEY,
+                    {"data": copy.deepcopy(data), "mtime": mtime}, ttl_sec=0)
         return data
 
     def _write(self, data: dict[str, Any]) -> None:

@@ -312,6 +312,11 @@ class ModelRouterConfig(BaseSettings):
         "chat": "fast", "deep_recall": "strong", "emotion": "persona",
         "tool_call": "tools", "consolidation": "strong", "code": "fast",
     })
+    # C17 语义输出缓存：精确缓存 miss 后按 embedding 近邻命中（headless 装配时注入 embedder）
+    semantic_cache: bool = True
+    semantic_thresholds: dict[str, float] = Field(default_factory=lambda: {
+        "fact": 0.95, "code": 0.93, "chat": 0.85})
+    semantic_capacity: int = 256
 
 
 class SpreadingActivationConfig(BaseSettings):
@@ -379,6 +384,8 @@ class CacheConfig(BaseSettings):
         "doc_distill": {"enabled": True, "capacity": 1000, "ttl_sec": 0, "media": "lmdb"},
         # 语义风险最高，默认关（Q34）；C16 先做、C17 缓一档
         "output": {"enabled": False, "capacity": 1000, "ttl_sec": 86400, "media": "lmdb"},
+        # C17 语义输出缓存：条目键=sha256(normalize(prompt))，值含 embedding/text/affected_ids
+        "semantic": {"enabled": True, "capacity": 256, "ttl_sec": 86400, "media": "memory"},
         # 以下为预留位（Q28/Q31 裁决：narrative 由 W8 投影缓存承担、thalamus/safety 砍）
         "thalamus": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},
         "safety": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},

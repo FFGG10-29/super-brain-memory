@@ -21,6 +21,7 @@ E4 注入视角加权（v4.2）：
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import time
@@ -295,6 +296,8 @@ class Prefrontal:
                     "hits": len(hits),
                     "latency_ms": max(0.0, float(_now_ms() - started_ms)),
                     "ok": True,
+                    # E3 精确归因：命中的记忆 id（JSON 数组，最多 20 个）
+                    "neuron_ids": json.dumps([hit.neuron.uuid7_id for hit in hits][:20]),
                 }
             ],
         )

@@ -96,6 +96,10 @@ class HeadlessServer:
         configure_cache_manager(config=self.config, kv=self.app.storage.kv,
                                 timeseries=self.app.storage.timeseries,
                                 bus=self.cache_bus)
+        # C18：把 cache_manager 注入向量段缓存（build_app 时已包装 CachedVectorStore）
+        vector_engine = getattr(self.app.storage.vector, "set_cache_manager", None)
+        if callable(vector_engine):
+            vector_engine(self.cache_manager)
 
         # 唯一真源：v2 主库路径的兄弟目录放 v3 的 journal/inbox（不另开六引擎）
         sqlite_path = Path(self.config.storage.sqlite_path)
@@ -142,6 +146,7 @@ class HeadlessServer:
         self.chat_agent = self.registry.verify(chat_agent_token)
         self.model_router = get_model_router(
             self.config, secret_store=default_secret_store(), local_llm=self.app.llm,
+            embedder=self.app.embedder,
         )
         # W6 / C12：巩固代理复用同一模型路由；叙事重构由昼夜节律窗口触发
         self.app.neocortex._router = self.model_router
@@ -290,6 +295,10 @@ class HeadlessServer:
         configure_cache_manager(config=self.config, kv=fresh.storage.kv,
                                 timeseries=fresh.storage.timeseries,
                                 bus=self.cache_bus)
+        # C18：换核后重新注入新内核的向量段缓存
+        vector_engine = getattr(fresh.storage.vector, "set_cache_manager", None)
+        if callable(vector_engine):
+            vector_engine(self.cache_manager)
         self.app = fresh
         self.daemon.app = fresh
         self.daemon.write_gate = new_gate

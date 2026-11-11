@@ -313,13 +313,19 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
     amygdala = Amygdala(storage.kv, config)
     thalamus = Thalamus(storage.kv, config)
     extractor = RouterExtractor(llm, config)
+    # C18：向量近邻查询包一层进程内段缓存（构造后由 headless 注入 cache_manager；
+    # 未注入时全直通，行为与原实现一致）。所有持 vector 引擎的组件统一用它，
+    # 避免绕过失效钩子导致读缓存陈旧。
+    from storage.vector_cache import CachedVectorStore
+
+    vector_engine = CachedVectorStore(storage.vector)
     consolidator = MemoryConsolidator(
-        llm=llm, relational=storage.relational, vector=storage.vector,
+        llm=llm, relational=storage.relational, vector=vector_engine,
         embedder=embedder, config=config,
     )
     hippocampus = Hippocampus(
         relational=storage.relational,
-        vector=storage.vector,
+        vector=vector_engine,
         graph=storage.graph,
         timeseries=storage.timeseries,
         hypergraph=storage.hypergraph,
@@ -340,7 +346,7 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
     )
     prefrontal = Prefrontal(
         relational=storage.relational,
-        vector=storage.vector,
+        vector=vector_engine,
         graph=storage.graph,
         kv=storage.kv,
         embedder=embedder,

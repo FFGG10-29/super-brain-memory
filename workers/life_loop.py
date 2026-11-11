@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -176,9 +177,9 @@ class LifeLoop:
 
         信号构成（config.forget 可调）：
         - 可提取性：FSRS retrievability（复用 SynapticPlasticity，时间衰减主信号）；
-        - 使用度：neuron.recall_count 平滑归一化（access_log 表无 neuron_id 列，
-          query 无法反查记忆 id，故近 30 天召回只能以 recall_count 为主信号，
-          access_log 行数仅作为总量趋势放进结果）；
+        - 使用度：access_log.neuron_ids（E3）反序列化的 30 天精确召回次数平滑
+          归一化为主信号；旧格式行无 neuron_ids 时回退 neuron.recall_count
+          （access_log 行数仍作为总量趋势放进结果）；
         - 信任度：1 - 被纠正度（supersede 事件计数，血统越不稳定分越低）。
         评分 = w_retention*retention + w_usage*usage + w_trust*(1-correction)，[0,1]。
 
@@ -197,13 +198,32 @@ class LifeLoop:
             result["skipped"] = "forget disabled or relational/tier_manager missing"
             return result
 
-        # 近 30 天召回总量趋势（access_log 无记忆 id，只能做整体趋势参考）
+        # 近 30 天 access_log：整体趋势 + E3 精确归因（neuron_ids 反序列化，
+        # 统计每条记忆的精确召回次数）。旧格式行无 neuron_ids（None/空）→ 跳过不炸。
+        precise_hits: dict[str, int] = {}
         try:
             since = now - int(_MS_PER_DAY * cfg.window_days)
             rows = self._timeseries.fetch("access_log", since_ms=since, limit=100000)
             result["access_log_rows_30d"] = len(rows)
+            for row in rows:
+                raw = row.get("neuron_ids")
+                if not raw:
+                    continue
+                try:
+                    ids = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(ids, str):
+                    ids = [ids]
+                if not isinstance(ids, (list, tuple)):
+                    continue
+                for neuron_id in ids:
+                    neuron_id = str(neuron_id or "")
+                    if neuron_id:
+                        precise_hits[neuron_id] = precise_hits.get(neuron_id, 0) + 1
         except Exception:  # noqa: BLE001  时序库不可用时跳过趋势项
             pass
+        result["recall_hits_30d"] = precise_hits   # 每条记忆的 30 天精确召回次数
 
         corrections = self._supersede_counts()
         records = self._relational.query(
@@ -216,7 +236,11 @@ class LifeLoop:
                 continue  # core 不自动降级；archive 不重复处置
             result["scanned"] += 1
             retention = self._plasticity.retrievability(neuron, now_ms=now)
-            usage = neuron.recall_count / (neuron.recall_count + 5.0)   # 平滑归一化
+            hits_30d = precise_hits.get(neuron.uuid7_id, 0)
+            if hits_30d > 0:
+                usage = hits_30d / (hits_30d + 5.0)   # E3：30 天精确召回平滑归一化
+            else:
+                usage = neuron.recall_count / (neuron.recall_count + 5.0)   # 回退（原行为）
             correction = min(1.0, corrections.get(neuron.uuid7_id, 0) / 3.0)
             value = min(1.0, max(0.0, (
                 cfg.w_retention * retention
@@ -239,6 +263,7 @@ class LifeLoop:
                 result["review"].append({
                     "id": neuron.uuid7_id, "value": round(value, 4),
                     "recall_count": neuron.recall_count, "tier": neuron.tier,
+                    "recall_hits_30d": hits_30d,
                 })
         return result
 
