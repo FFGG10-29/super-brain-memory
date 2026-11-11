@@ -9,6 +9,14 @@
               + w_pad·PAD 显著性 + w_confidence·置信度        （权重全在 config）
 再乘杏仁核召回权重（好感度微调 + 冷静期折扣）。
 归档（tier=archive）不参与常规召回 —— 阶段 3 验收项。
+
+E2 元认知（v4.2）：
+    - RecallHit.confidence：动态置信度 = 通道多样性 × 新鲜度 × 冲突信号 加权合成；
+      权重经 Prefrontal.__init__ 可选参数注入（config 块主线程后补）。
+    - last_knowledge_gap：空结果 / 全部低置信时为 True，供呈现层透传。
+E4 注入视角加权（v4.2）：
+    - pad_tracker 存在且 weight_multiplier()>0 时，按当前 PAD 的 P 维符号对命中
+      做稳定微调排序（只调顺序，不改变注入内容本身）；开关 perspective_weight=0 关闭。
 """
 from __future__ import annotations
 
@@ -46,6 +54,8 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,30}|[《「\"]([^》」\"]{2,
 _ARCHIVED = "archive"
 _INJECT_TOP_N = 3
 _INJECT_SUMMARY_CHARS = 120
+# E2：主库 payload 中可能携带 supersede 痕迹的字段（memory_editor / 冲突消解落库痕迹）
+_SUPERSEDE_FIELDS = ("superseded_by", "supersede_ids", "conflict_with")
 
 
 def _summarize(text: str) -> str:
@@ -65,9 +75,14 @@ class RecallHit:
     neuron: Neuron
     score: float
     channels: tuple[str, ...]
+    # E2 动态置信度（0~1）；-1 表示未计算（向后兼容：旧构造处无需改动）
+    confidence: float = -1.0
 
 
 class Prefrontal:
+    # E2：置信度低于该值视为「知识缺口」信号（类常量，便于测试与呈现层对齐）
+    LOW_CONFIDENCE_THRESHOLD = 0.35
+
     def __init__(
         self,
         *,
@@ -81,6 +96,10 @@ class Prefrontal:
         amygdala: Amygdala,
         timeseries: TimeSeriesRepository | None = None,
         config: BrainConfig | None = None,
+        confidence_w_channel: float = 0.3,
+        confidence_w_fresh: float = 0.3,
+        confidence_w_conflict: float = 0.4,
+        perspective_weight: float = 0.1,
     ) -> None:
         self._relational = relational
         self._vector = vector
@@ -92,8 +111,15 @@ class Prefrontal:
         self._amygdala = amygdala
         self._timeseries = timeseries
         self._config = config or get_config()
+        # E2：confidence 三权重与 E4 视角强度（config 块主线程后补，先以可选参数落位）
+        self._confidence_w_channel = float(confidence_w_channel)
+        self._confidence_w_fresh = float(confidence_w_fresh)
+        self._confidence_w_conflict = float(confidence_w_conflict)
+        self._perspective_weight = float(perspective_weight)
         # 最近一次召回的通道埋点（只读快照，供 UI 解释「为什么命中」）
         self.last_audit: dict[str, Any] = {}
+        # E2：最近一次召回的知识缺口标记（呈现层直接 getattr 透传）
+        self.last_knowledge_gap: dict[str, Any] = {"gap": False, "query": "", "note": ""}
         # W5：事件骨架（整体注入，成员不单独占名次）与降级标记
         self.last_narratives: list[dict[str, Any]] = []
         self.last_degraded = False
@@ -117,6 +143,7 @@ class Prefrontal:
         # C11 召回结果短期缓存：命中则跳过整条链路（embedder/向量库/图库/精排）
         cached = self._recall_cache_get(query, namespaces, top_k)
         if cached is not None:
+            self._set_knowledge_gap(query, cached)
             return cached
 
         # ★ B 包：把 dense 通道的 cosine 相似度带回总分（旧版只以通道名次进 RRF）
@@ -134,8 +161,10 @@ class Prefrontal:
 
         rrf = self._rrf(channels)
         if not rrf:
+            self._set_knowledge_gap(query, [])
             return []
 
+        channel_total = max(1, len(channels))
         candidates: list[RecallHit] = []
         for neuron_id, rrf_score in rrf.items():
             record = self._relational.get("neuron", neuron_id)
@@ -150,15 +179,21 @@ class Prefrontal:
                                 dense_score=dense_scores.get(neuron_id, 0.0))
             score *= self._amygdala.recall_weight(agent_id, now_ms=now)
             channels_of = tuple(channel for channel, hits in channels.items() if neuron_id in hits)
-            candidates.append(RecallHit(neuron=neuron, score=score, channels=channels_of))
+            candidates.append(RecallHit(
+                neuron=neuron,
+                score=score,
+                channels=channels_of,
+                confidence=self._confidence(neuron, channels_of, channel_total, now),
+            ))
 
         candidates.sort(key=lambda hit: hit.score, reverse=True)
         reranked = self._rerank(query, candidates[:oversample], top_k)
-        result = self._apply_tier_quota(reranked, top_k)
+        result = self._apply_perspective(self._apply_tier_quota(reranked, top_k))
         self._audit(query, channels, result, agent_id, started_ms=now)
         self.last_audit["degraded"] = self.last_degraded
         self.last_audit["narratives"] = len(self.last_narratives)
         self.last_audit["spreading_note"] = note
+        self._set_knowledge_gap(query, result)
         self._recall_cache_put(query, namespaces, top_k, result)
         return result
 
@@ -199,6 +234,7 @@ class Prefrontal:
                     neuron=neuron,
                     score=float(item["score"]),
                     channels=tuple(str(channel) for channel in item["channels"]),
+                    confidence=float(item.get("confidence", -1.0)),
                 ))
         except (KeyError, TypeError, ValueError):
             return None
@@ -217,7 +253,7 @@ class Prefrontal:
             "query": query,
             "items": [
                 {"id": hit.neuron.uuid7_id, "score": float(hit.score),
-                 "channels": list(hit.channels)}
+                 "channels": list(hit.channels), "confidence": float(hit.confidence)}
                 for hit in hits
             ],
         }
@@ -512,6 +548,101 @@ class Prefrontal:
             return 0.0
         return float(gating.w6) * state.similarity(neuron.pad.as_tuple()) * weight
 
+    # ── E2：动态置信度 / 知识缺口 ─────────────────────────────────────────
+    def _confidence(
+        self,
+        neuron: Neuron,
+        channels_of: tuple[str, ...],
+        channel_total: int,
+        now_ms: int,
+    ) -> float:
+        """confidence = w_channel·通道多样性 + w_fresh·时间新鲜度 + w_conflict·冲突信号。
+
+        - 通道多样性：命中通道数 / 本次总通道数（多通道互相印证 → 更可信）；
+        - 时间新鲜度：复用可塑性的 retrievability（FSRS 幂律衰减，0~1）；
+        - 冲突信号：存在未消解的 supersede 痕迹 → 该项记 0（减分）。
+        权重经 __init__ 注入（默认 0.3/0.3/0.4，config 块主线程后补）。
+        """
+        diversity = len(channels_of) / max(1, channel_total)
+        freshness = max(0.0, min(1.0, self._plasticity.retrievability(neuron, now_ms=now_ms)))
+        conflict_free = 0.0 if self._supersede_trace(neuron.uuid7_id) else 1.0
+        value = (
+            self._confidence_w_channel * diversity
+            + self._confidence_w_fresh * freshness
+            + self._confidence_w_conflict * conflict_free
+        )
+        return max(0.0, min(1.0, value))
+
+    def _supersede_trace(self, neuron_id: str) -> bool:
+        """该 neuron 是否存在**未消解**的 supersede 痕迹（best-effort，异常一律无痕迹）。
+
+        查法（按可靠性顺序）：
+        1. 图谱 SUPERSEDES 演进边：接口未提供读取方法，仅当具体实现暴露
+           duck-typed 的 `supersede_edges_of(id)`（返回对端 id 列表）时启用；
+           对端记忆仍在召回池（is_active）才算「未消解」——已被封存即已裁决。
+        2. 主库 payload 的 supersede 相关字段（memory_editor 纠正链落库痕迹）。
+        """
+        try:
+            record = self._relational.get("neuron", neuron_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if not record:
+            return False
+        for field in _SUPERSEDE_FIELDS:
+            if record.get(field):
+                return True
+        getter = getattr(self._graph, "supersede_edges_of", None)
+        if not callable(getter):
+            return False
+        try:
+            partners = [str(item) for item in (getter(neuron_id) or [])]
+        except Exception:  # noqa: BLE001
+            return False
+        for partner in partners:
+            if not partner or partner == neuron_id:
+                continue
+            try:
+                other = self._relational.get("neuron", partner)
+            except Exception:  # noqa: BLE001
+                continue
+            if other is not None and other.get("is_active", True):
+                return True
+        return False
+
+    def _set_knowledge_gap(self, query: str, hits: list[RecallHit]) -> None:
+        """gap=True 当且仅当结果为空，或全部命中 confidence < LOW_CONFIDENCE_THRESHOLD。"""
+        if not hits:
+            self.last_knowledge_gap = {"gap": True, "query": query, "note": "召回结果为空"}
+            return
+        low = all(hit.confidence >= 0.0 and hit.confidence < self.LOW_CONFIDENCE_THRESHOLD
+                  for hit in hits)
+        note = ""
+        if low:
+            note = f"全部命中置信度低于 {self.LOW_CONFIDENCE_THRESHOLD:.2f}"
+        self.last_knowledge_gap = {"gap": low, "query": query, "note": note}
+
+    # ── E4：注入视角加权（只调顺序，不改内容）─────────────────────────────
+    def _apply_perspective(self, hits: list[RecallHit]) -> list[RecallHit]:
+        """当前 PAD 的 P 维符号为正 → 正 valence 记忆前置；为负 → 负 valence 前置。
+
+        稳定微调排序：key=(-符号匹配度, -score)，平局保持原序（Python sort 稳定）；
+        perspective_weight=0 / 无 pad_tracker / 冷启动或高负唤醒（weight=0）时关闭。
+        """
+        tracker = self.pad_tracker
+        if (self._perspective_weight <= 0.0 or tracker is None
+                or tracker.weight_multiplier() <= 0.0):
+            return hits
+        state = tracker.current()
+        if state is None:
+            return hits
+        want_positive = state.p > 0.0
+
+        def match(hit: RecallHit) -> int:
+            p = hit.neuron.pad.p
+            return 1 if p != 0.0 and (p > 0.0) == want_positive else 0
+
+        return sorted(hits, key=lambda hit: (-match(hit), -hit.score))
+
     def _rrf(self, channels: dict[str, list[str]]) -> dict[str, float]:
         constant = self._config.recall.rrf_constant
         scores: dict[str, float] = {}
@@ -569,7 +700,10 @@ class Prefrontal:
                 continue
             # 精排只调顺序，不抹掉情绪/可塑性带来的分差：取两者均值
             blended = 0.5 * hit.score + 0.5 * (1.0 - rank / max(len(order), 1))
-            reranked.append(RecallHit(neuron=hit.neuron, score=blended, channels=hit.channels))
+            reranked.append(RecallHit(
+                neuron=hit.neuron, score=blended,
+                channels=hit.channels, confidence=hit.confidence,
+            ))
         reranked.sort(key=lambda item: item.score, reverse=True)
         return reranked[: max(top_k * self._config.recall.rrf_k_oversample, top_k)]
 

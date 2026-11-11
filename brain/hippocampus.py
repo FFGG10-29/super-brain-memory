@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from config import BrainConfig, get_config
 from core.errors import EngineUnavailable, StorageError
-from core.ids import HybridLogicalClock
+from core.ids import HybridLogicalClock, new_uuid7
 from core.interfaces import (
     Embedder,
     EventLog,
@@ -54,6 +55,7 @@ class WriteResult:
     superseded: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     merge: Any | None = None  # MergeDecision：本次写入的语义裁决（add/update/merge/skip）
+    reconsolidated: bool = False  # E5/Q32：本次写入走了再巩固窗口的原地合并
 
     @property
     def event_worthy(self) -> bool:
@@ -80,6 +82,7 @@ class Hippocampus:
         event_log: EventLog | None = None,
         config: BrainConfig | None = None,
         consolidator: Any | None = None,
+        reconsolidation_window_sec: int = 1800,  # E5/Q32：再巩固窗口，默认 30min（config 块由主线程后补）
     ) -> None:
         self._relational = relational
         self._vector = vector
@@ -96,6 +99,7 @@ class Hippocampus:
         self._event_log = event_log
         self._config = config or get_config()
         self._consolidator = consolidator
+        self._reconsolidation_window_sec = int(reconsolidation_window_sec)
 
     # ── 主流程 ────────────────────────────────────────────────────────────
     def remember(
@@ -179,6 +183,21 @@ class Hippocampus:
                 return WriteResult(neuron=neuron, admission=admission, applied=False, merge=merge)
             if merge.action in ("update", "merge") and merge.content:
                 neuron = neuron.model_copy(update={"content": merge.content})
+                # ★ E5 / Q32：再巩固窗口——update（同一事件的更新，单目标）且目标记忆
+                #   满足「认知性 + 刚被召回」时，原 id 原地合并并显式产生 reconsolidate
+                #   事件，不新开版本行；任一条件不满足则回落到既有 supersede 语义。
+                if merge.action == "update" and len(merge.supersede_ids) == 1:
+                    reconsolidated = self._try_reconsolidate(
+                        merge.supersede_ids[0],
+                        neuron=neuron,
+                        merge=merge,
+                        admission=admission,
+                        extraction=extraction,
+                        emit_event=emit_event,
+                        now_ms=now_ms,
+                    )
+                    if reconsolidated is not None:
+                        return reconsolidated
 
         warnings: list[str] = []
         # 1) 事实先落主库
@@ -224,6 +243,8 @@ class Hippocampus:
                     "owner": str(cognition.get("owner") or ""),
                     "pyramid_subtype": str(cognition.get("pyramid_subtype") or ""),
                     "narrative_skeleton": cognition.get("narrative_skeleton"),
+                    # E6：Agent 视角标记（"Agent A 认为…"），供按对话对象选择视角
+                    "perspective": str(cognition.get("perspective") or ""),
                     "namespace": neuron.namespace,
                     "ts_ms": neuron.created_at_ms,
                 }
@@ -350,6 +371,99 @@ class Hippocampus:
             neuron=neuron, admission=admission, applied=True,
             superseded=superseded, warnings=warnings, merge=None,
         )
+
+    # ── E5 / Q32：再巩固窗口内的原地合并 ─────────────────────────────────
+    def _try_reconsolidate(
+        self,
+        target_id: str,
+        *,
+        neuron: Neuron,
+        merge: Any,
+        admission: Admission,
+        extraction: Extraction,
+        emit_event: bool,
+        now_ms: int | None,
+    ) -> WriteResult | None:
+        """再巩固（reconsolidation）：新写入被裁决为「同一事件的更新」（decide()
+        返回单目标 update），且目标记忆满足——
+            ① 认知性：memory_type ∈ (scenario, emotion)；
+            ② 可塑窗口：now - last_recall_ms ≤ reconsolidation_window_sec
+               （last_recall_ms=0 表示从未被召回，不在窗口内）；
+            ③ 未处于覆盖式路径（本方法只在 remember() 的认知性分支被调用）；
+        时，**不新开版本行**：原记录 id 不变，payload 原地更新（打
+        reconsolidation / reconsolidated_at_ms 标记），is_active 保持 1；
+        并向 event_log 显式写一条 reconsolidate 事件（新旧内容摘要）——
+        Q32 裁决：journal 完整性不破，绝不静默改 payload。
+
+        任一条件不满足返回 None，调用方回落既有 supersede 语义（行为不变）。
+        """
+        window_sec = self._reconsolidation_window_sec
+        if window_sec <= 0 or not target_id:
+            return None
+        try:
+            record = self._relational.get("neuron", target_id)
+        except StorageError:
+            return None
+        if not record or not record.get("is_active", False):
+            return None
+        if str(record.get("memory_type", "")) not in ("scenario", "emotion"):
+            return None
+        last_recall_ms = int(record.get("last_recall_ms") or 0)
+        if last_recall_ms <= 0:
+            return None
+        now = int(now_ms) if now_ms is not None else _now_ms()
+        if now - last_recall_ms > window_sec * 1000:
+            return None
+
+        old_content = str(record.get("content", ""))
+        new_content = str(neuron.content)
+        updated = dict(record)
+        updated["content"] = new_content
+        updated["reconsolidation"] = True
+        updated["reconsolidated_at_ms"] = now
+        updated["updated_at_ms"] = now
+        # 主库：id 不变原地更新（upsert 同 id），无 deactivate、无新版本行
+        self._relational.upsert("neuron", updated)
+        target_neuron = Neuron.from_record(updated)
+
+        # 派生库：outbox 重新投影同一 id（向量 / 图谱 / 时序 / 超图）
+        warnings: list[str] = []
+        for target in _TARGETS:
+            self._relational.outbox_enqueue(
+                event_id=target_id,
+                target=target,
+                payload={"neuron": updated, "extraction": _extraction_record(extraction)},
+            )
+        self.dispatch_outbox(warnings=warnings)
+
+        result = WriteResult(
+            neuron=target_neuron,
+            admission=admission,
+            applied=True,
+            superseded=[],
+            warnings=warnings,
+            merge=merge,
+            reconsolidated=True,
+        )
+        # 事件：payload 兼容 sync/projections._on_ingest 的 {"neuron": ...} 形状，
+        # 远端补 _on_reconsolidate 别名后即可无损重放；extra 摘要供审计。
+        if emit_event and self._event_log is not None:
+            self._event_log.append(
+                {
+                    "event_id": new_uuid7(),
+                    "agent_id": target_neuron.agent_id,
+                    "type": "reconsolidate",
+                    "hlc": self._clock.last.to_token(),
+                    "payload": {
+                        "neuron": updated,
+                        "extraction": _extraction_record(extraction),
+                        "old_content": old_content[:200],
+                        "new_content": new_content[:200],
+                        "target_id": target_id,
+                    },
+                }
+            )
+        return result
 
     def _emit_event(self, neuron: Neuron, extraction: Extraction, result: WriteResult) -> None:
         """写入事件日志：只有"跨设备值得同步"的写入才发事件（缓冲层不同步）。

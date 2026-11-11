@@ -14,10 +14,11 @@ def test_mcp_manifest_stays_66_59_6() -> None:
     assert len(manifest["resources"]) == 6
 
 
-def test_event_type_has_nine_members() -> None:
+def test_event_type_has_ten_members() -> None:
     assert set(EventType.__args__) == {
         "ingest", "supersede", "reinforce", "tier_change", "consolidate",
         "policy", "tombstone", "overwrite", "media_interaction",
+        "reconsolidate",
     }
 
 

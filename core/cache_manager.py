@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import math
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -49,45 +51,114 @@ class CacheNamespace(str, Enum):
     CONFLICT = "conflict"
 
 
+@dataclass
+class _Entry:
+    """内存缓存条目（E1：主值 + 访问统计 + 干扰暂存区）。"""
+
+    value: Any
+    expires_at: float                       # 0 = 永不过期（ttl<=0 语义）
+    set_at: float = 0.0                     # 写入时刻：衰减放大有效 TTL 的基点
+    access_count: int = 0                   # get 命中次数（LTP 类比：越常用越久活）
+    last_access: float = 0.0
+    superseded: list[tuple[Any, float]] = field(default_factory=list)  # (旧值, 被覆盖时刻)
+
+    def effective_ttl_base(self) -> float:
+        """本次写入时的固定 TTL（base_ttl）。"""
+        return max(0.0, self.expires_at - self.set_at)
+
+
 class _MemoryLRU:
-    """单命名空间的内存 LRU + TTL。capacity<=0 视为不设上限。"""
+    """单命名空间的内存 LRU + 衰减 TTL + 认知性干扰暂存。capacity<=0 视为不设上限。
 
-    def __init__(self, capacity: int) -> None:
+    衰减（E1）：过期判定不再用固定 expires_at，而是
+        effective_ttl = base_ttl * (1 + log1p(access_count))
+    高频命中的条目活得更久（长时程增强 LTP 的类比）；decay_enabled=False 时
+    退回固定 TTL 语义。expires_at<=0 的条目仍永久。
+    干扰（E1）：仅认知性命名空间——同 key 覆写时旧值进 superseded 暂存区，
+    grace 期内可经 recall_superseded 取回，过 grace 惰性清除；get 永远返回新值。
+    """
+
+    def __init__(self, capacity: int, *, decay_enabled: bool = True,
+                 cognitive: bool = False, grace_sec: float = 300.0) -> None:
         self._capacity = max(0, int(capacity))
-        self._items: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+        self._items: OrderedDict[str, _Entry] = OrderedDict()
         self.evictions = 0
+        self._decay = bool(decay_enabled)
+        self._cognitive = bool(cognitive)
+        self._grace = max(0.0, float(grace_sec))
 
+    # ── 过期判定 ──────────────────────────────────────────────────────────
+    def _expired(self, entry: _Entry, now: float) -> bool:
+        if entry.expires_at <= 0:
+            return False  # ttl<=0 永久
+        if not self._decay:
+            return now >= entry.expires_at
+        effective = entry.effective_ttl_base() * (1.0 + math.log1p(entry.access_count))
+        return now >= entry.set_at + effective
+
+    def _purge_superseded(self, entry: _Entry, now: float) -> None:
+        if entry.superseded:
+            entry.superseded = [(value, at) for value, at in entry.superseded
+                                if now - at <= self._grace]
+
+    # ── 读写 ──────────────────────────────────────────────────────────────
     def get(self, key: str, now: float) -> Any | None:
-        item = self._items.pop(key, None)
-        if item is None:
+        entry = self._items.get(key)
+        if entry is None:
             return None
-        value, expires_at = item
-        if expires_at and now >= expires_at:
-            return None  # 已过期：不回填，等价 miss
-        self._items[key] = item
-        return value
+        if self._expired(entry, now):
+            self._items.pop(key, None)
+            return None  # 已过期：等价 miss
+        entry.access_count += 1
+        entry.last_access = now
+        self._items.move_to_end(key)
+        return entry.value
 
-    def set(self, key: str, value: Any, expires_at: float) -> None:
+    def set(self, key: str, value: Any, expires_at: float, now: float) -> None:
         if self._capacity <= 0:
             return
-        self._items.pop(key, None)
-        self._items[key] = (value, expires_at)
+        previous = self._items.pop(key, None)
+        entry = _Entry(value=value, expires_at=expires_at, set_at=now, last_access=now)
+        if previous is not None:
+            entry.access_count = previous.access_count  # 覆写延续访问热度
+            if self._cognitive:
+                # 认知性命名空间：旧值进暂存区而非立即消失（干扰效应）
+                self._purge_superseded(previous, now)
+                if not self._expired(previous, now):
+                    entry.superseded = previous.superseded + [(previous.value, now)]
+        self._items[key] = entry
         while self._capacity and len(self._items) > self._capacity:
             self._items.popitem(last=False)
             self.evictions += 1
+
+    def recall_superseded(self, key: str, now: float) -> list[Any]:
+        """grace 期内被覆盖的旧值（新到旧，最近被覆盖的先看到）。"""
+        entry = self._items.get(key)
+        if entry is None:
+            return []
+        self._purge_superseded(entry, now)  # 过 grace 期惰性清除
+        return [value for value, _at in reversed(entry.superseded)]
 
     def delete(self, key: str) -> bool:
         return self._items.pop(key, None) is not None
 
     def delete_matching(self, predicate: Callable[[str, Any], bool]) -> int:
-        victims = [key for key, (value, _expires) in self._items.items()
-                   if predicate(key, value)]
+        victims = [key for key, entry in self._items.items()
+                   if predicate(key, entry.value)]
         for key in victims:
             self._items.pop(key, None)
         return len(victims)
 
     def size(self) -> int:
         return len(self._items)
+
+    def hot_entries(self, min_access: int) -> list[dict[str, Any]]:
+        """晋升候选：access_count ≥ 阈值的键（按热度降序）。"""
+        rows = [{"key": key, "access_count": entry.access_count}
+                for key, entry in self._items.items()
+                if entry.access_count >= min_access]
+        rows.sort(key=lambda row: (-int(row["access_count"]), str(row["key"])))
+        return rows
 
 
 class CacheManager:
@@ -112,6 +183,34 @@ class CacheManager:
             bus.subscribe(self.invalidate_by_event)
 
     # ── 配置 ──────────────────────────────────────────────────────────────
+    def _cache_block(self) -> Any:
+        return getattr(self._config, "cache", None)
+
+    def _decay_enabled(self) -> bool:
+        block = self._cache_block()
+        if block is None:
+            return True
+        return bool(getattr(block, "decay_enabled", True))
+
+    def _cognitive_namespaces(self) -> list[str]:
+        block = self._cache_block()
+        if block is None:
+            return ["output"]
+        return list(getattr(block, "cognitive_namespaces", None) or ["output"])
+
+    def _interference_grace(self) -> float:
+        block = self._cache_block()
+        if block is None:
+            return 300.0
+        try:
+            return max(0.0, float(getattr(block, "interference_grace_sec", 300)))
+        except (TypeError, ValueError):
+            return 300.0
+
+    def _is_cognitive(self, ns: str) -> bool:
+        """认知性命名空间才做干扰暂存；其余（事务性）ns 直接覆盖。"""
+        return ns in self._cognitive_namespaces()
+
     def _settings(self, ns: str) -> dict[str, Any]:
         block = getattr(self._config, "cache", None)
         defaults: dict[str, Any] = {"enabled": True, "capacity": 512,
@@ -131,7 +230,12 @@ class CacheManager:
         with self._lock:
             store = self._stores.get(ns)
             if store is None:
-                store = _MemoryLRU(int(self._settings(ns).get("capacity", 512)))
+                store = _MemoryLRU(
+                    int(self._settings(ns).get("capacity", 512)),
+                    decay_enabled=self._decay_enabled(),
+                    cognitive=self._is_cognitive(ns),
+                    grace_sec=self._interference_grace(),
+                )
                 self._stores[ns] = store
             return store
 
@@ -154,17 +258,36 @@ class CacheManager:
     def _lmdb_get(self, ns: str, key: str) -> Any | None:
         if self._kv is None:
             return None
-        raw = self._kv.get(_LMDB_BUCKET, f"{ns}:{key}")
+        stored = f"{ns}:{key}"
+        raw = self._kv.get(_LMDB_BUCKET, stored)
         if not raw:
             return None
         try:
             payload = json.loads(bytes(raw).decode("utf-8"))
         except (ValueError, TypeError):
-            self._kv.delete(_LMDB_BUCKET, f"{ns}:{key}")
+            self._kv.delete(_LMDB_BUCKET, stored)
             return None
-        if payload.get("expires_at") and time.time() >= float(payload["expires_at"]):
-            self._kv.delete(_LMDB_BUCKET, f"{ns}:{key}")  # 惰性过期
-            return None
+        expires_at = float(payload.get("expires_at") or 0.0)
+        now = time.time()
+        access_count = int(payload.get("access_count") or 0)
+        if expires_at > 0:
+            if self._decay_enabled():
+                # 惰性过期同样应用衰减：高频条目有效 TTL 按 log1p 放大
+                base = max(0.0, expires_at - float(payload.get("set_at") or expires_at))
+                effective = base * (1.0 + math.log1p(access_count))
+                expired = now >= float(payload.get("set_at") or expires_at) + effective
+            else:
+                expired = now >= expires_at
+            if expired:
+                self._kv.delete(_LMDB_BUCKET, stored)  # 惰性过期
+                return None
+        # 命中：access_count +1 写回（E1：LMDB 介质的访问计数）
+        payload["access_count"] = access_count + 1
+        try:
+            self._kv.put(_LMDB_BUCKET, stored, json.dumps(
+                payload, ensure_ascii=False, default=str).encode("utf-8"))
+        except Exception:  # noqa: BLE001  计数写回失败不影响读路径
+            pass
         return payload.get("value")
 
     def set(self, ns: str, key: str, value: Any, *, ttl_sec: float | None = None) -> None:
@@ -172,14 +295,18 @@ class CacheManager:
             return
         settings = self._settings(ns)
         ttl = settings.get("ttl_sec", 600) if ttl_sec is None else float(ttl_sec)
-        expires_at = (time.time() + float(ttl)) if ttl and float(ttl) > 0 else 0.0
+        now = time.time()
+        expires_at = (now + float(ttl)) if ttl and float(ttl) > 0 else 0.0
         if settings.get("media") == "lmdb":
             if self._kv is not None:
+                # E1：LMDB 介质本期不做干扰暂存（superseded 不落盘），
+                # 只记录 set_at / access_count 供惰性衰减过期使用。
                 self._kv.put(_LMDB_BUCKET, f"{ns}:{key}", json.dumps(
-                    {"expires_at": expires_at, "value": value},
+                    {"expires_at": expires_at, "set_at": now,
+                     "access_count": 0, "value": value},
                     ensure_ascii=False, default=str).encode("utf-8"))
         else:
-            self._store(ns).set(str(key), value, expires_at)
+            self._store(ns).set(str(key), value, expires_at, now)
         self._ops_since_flush += 1
         self._maybe_flush()
 
@@ -189,6 +316,48 @@ class CacheManager:
             self._kv.delete(_LMDB_BUCKET, f"{ns}:{key}")
         else:
             self._store(ns).delete(str(key))
+
+    def recall_superseded(self, ns: str, key: str) -> list[Any]:
+        """干扰效应纠错口：grace 期内被同 key 覆盖的旧值（新到旧）。
+
+        仅对认知性命名空间（config.cache.cognitive_namespaces）生效；
+        其余 ns 覆写即丢（返回 []）。get 永远只返回新值，旧值只从这里取。
+        LMDB 介质本期不做干扰暂存（恒返回 []）。
+        """
+        if not self._enabled(ns) or not self._is_cognitive(ns):
+            return []
+        settings = self._settings(ns)
+        if settings.get("media") == "lmdb":
+            return []  # LMDB 介质不做干扰（注释占位，本期不实现）
+        return self._store(ns).recall_superseded(str(key), time.time())
+
+    def hot_entries(self, ns: str, *, min_access: int) -> list[dict[str, Any]]:
+        """E1 晋升：access_count ≥ min_access 的键与计数（热度降序）。
+
+        内存介质从条目 access_count 读取；LMDB 介质惰性扫描 JSON 里的
+        access_count。命名空间级聚合指标（hits）没有 per-key 粒度，故
+        不混入；调用方如需 ns 总命中量走 cache_metrics 表。
+        """
+        if not self._enabled(ns) or min_access <= 0:
+            return []
+        settings = self._settings(ns)
+        rows: list[dict[str, Any]] = []
+        if settings.get("media") == "lmdb":
+            if self._kv is None:
+                return []
+            for stored_key, raw in self._kv.scan_prefix(_LMDB_BUCKET, f"{ns}:", limit=5000):
+                try:
+                    payload = json.loads(bytes(raw).decode("utf-8"))
+                except (ValueError, TypeError):
+                    continue
+                count = int(payload.get("access_count") or 0)
+                if count >= min_access:
+                    rows.append({"key": str(stored_key).split(":", 1)[-1],
+                                 "access_count": count})
+        else:
+            rows = self._store(ns).hot_entries(min_access)
+        rows.sort(key=lambda row: (-int(row["access_count"]), str(row["key"])))
+        return rows
 
     # ── 精确失效 ──────────────────────────────────────────────────────────
     def invalidate(self, ns: str, key_pattern: str) -> int:

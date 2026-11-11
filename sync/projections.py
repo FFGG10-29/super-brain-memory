@@ -241,3 +241,14 @@ class EventProjector(Projector):
                 tx_to=HLCStamp.from_token(str(event.get("hlc", f"{_now_ms()}:0:replay"))),
             )
             self._vector.delete([neuron_id])
+
+    # ── W2/E5 新事件类型的重放兜底 ───────────────────────────────────────
+    # Q3 裁决：overwrite / media_interaction 不写 sync journal（事务性内容不跨设备
+    # 同步），这里只是防御性别名——万一重放流里出现，按最终态投影 / 跳过，而不是
+    # 进 failed 报告。reconsolidate 的 payload 与 ingest 同形（E5 已保证）。
+    _on_overwrite = _on_ingest
+    _on_reconsolidate = _on_ingest
+
+    def _on_media_interaction(self, payload: dict, event: dict) -> None:
+        """meta_only 事件：六引擎零投影，幂等跳过。"""
+        return None

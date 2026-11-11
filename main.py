@@ -333,6 +333,10 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
         event_log=journal,
         config=config,
         consolidator=consolidator,
+        # E5 / Q32：认知性记忆召回后的可塑窗口；0=关闭（窗口外行为不变）
+        reconsolidation_window_sec=(
+            int(config.reconsolidation.window_sec) if config.reconsolidation.enabled else 0
+        ),
     )
     prefrontal = Prefrontal(
         relational=storage.relational,
@@ -345,6 +349,11 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
         amygdala=amygdala,
         timeseries=storage.timeseries,
         config=config,
+        # E2/E4：动态召回置信度权重与视角加权开关（参数有默认值，按配置传入）
+        confidence_w_channel=float(config.recall.confidence_w_channel),
+        confidence_w_fresh=float(config.recall.confidence_w_fresh),
+        confidence_w_conflict=float(config.recall.confidence_w_conflict),
+        perspective_weight=float(config.recall.perspective_weight),
     )
     tier_manager = MemoryTierManager(
         storage.relational, plasticity, event_log=journal, config=config
@@ -385,6 +394,7 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
         tier_manager=tier_manager,
         config=config,
         save_memory=_distill_save,
+        event_log=journal,           # E3：supersede 事件源（被纠正次数统计）
     )
     circadian = Circadian()
 
@@ -403,6 +413,15 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
                   count=narrative.get("reconstructed", 0),
                   degraded=narrative.get("degraded", 0))
         sweep_report = tier_manager.sweep()
+        # E3：预测价值扫描（主动遗忘）——低价值 fact/scenario 降 archive，
+        # 高价值低访问列 review 供人审；结果进结构化日志
+        predictive = life_loop.predictive_value_sweep()
+        log_event("predictive_value_sweep", agent_id="consolidator",
+                  scanned=predictive.get("scanned", 0),
+                  archived=len(predictive.get("archived", [])),
+                  review=len(predictive.get("review", [])),
+                  events=predictive.get("events_emitted", 0),
+                  access_log_rows_30d=predictive.get("access_log_rows_30d", 0))
         scanned = int(getattr(sweep_report, "scanned", 0) or 0)
         return len(consolidations), len(summaries), scanned
 

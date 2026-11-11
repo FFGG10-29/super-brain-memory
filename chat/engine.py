@@ -210,6 +210,11 @@ class ChatEngine:
         injection = str(recall.get("injection") or "") if isinstance(recall, dict) else ""
         parts = [injection, "【最近对话】", *history, f"用户：{text}", "请回复："]
         prompt = "\n".join(part for part in parts if part)
+        # E2 元认知：召回带 knowledge_gap.gap=True 时在 prompt 末尾追加坦承指令。
+        # fast 投影路径可能不带该字段——防御式读，没有就原样放行。
+        gap = recall.get("knowledge_gap") if isinstance(recall, dict) else None
+        if isinstance(gap, dict) and gap.get("gap"):
+            prompt += "\n（记忆库中没有与该问题直接相关的记录：请坦承你不确定，并询问对方补充信息，不要编造。）"
 
         # ③ 模型路由（进程内函数，不是 RPC）
         # C16：把本轮召回片段 id 传给输出缓存，使 memory_updated 能精确失效缓存的回复
@@ -339,6 +344,8 @@ class ChatEngine:
         await self._push(session_id, "deep_recall_ready", {
             "hits": deep.get("hits", []) if isinstance(deep, dict) else [],
             "injection": deep.get("injection", "") if isinstance(deep, dict) else "",
+            # E2 元认知：deep 召回同样透传知识缺口标记（fast/deep 未带时为 None）
+            "knowledge_gap": deep.get("knowledge_gap") if isinstance(deep, dict) else None,
         })
         await self._push(session_id, "typing", {"state": False})
 

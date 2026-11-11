@@ -127,6 +127,17 @@ class KuzuGraphDB(GraphRepository):
             {"new": new_id, "old": old_id, "tx": tx_from.to_token()},
         )
 
+    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[Record]:
+        """E2：以该 neuron 为一端的 SUPERSEDES 边对端（双向匹配）。"""
+        result = self._pool.get().execute(
+            "MATCH (a:Entity)-[s:SUPERSEDES]-(b:Entity) "
+            "WHERE a.id = $id OR b.id = $id "
+            "RETURN (CASE WHEN a.id = $id THEN b.id ELSE a.id END) AS counterpart "
+            f"LIMIT {int(limit)}",
+            {"id": neuron_id},
+        )
+        return [{"counterpart": str(row["counterpart"])} for row in self._rows(result)]
+
     def _ensure_entities(self, *entity_ids: str) -> None:
         """关系边要求两端存在；缺失先建占位节点（name=id），后续 upsert 会补全。"""
         conn = self._pool.get()

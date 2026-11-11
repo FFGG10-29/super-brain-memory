@@ -48,6 +48,55 @@ class MCPToolkit:
         self._config = config or get_config()
         # 未命中内置工具时转发给 v3 RPC：所有扩展能力自动成为 MCP 工具
         self._rpc_fallback = rpc_fallback
+        # E6：_agent_brief 的进程内缓存（agent_id -> (time, brief)），TTL 300s。
+        # 写路径不做失效——brief 只是低风险摘要，最坏 5 分钟后过期重建，不追实时性。
+        self._agent_brief_cache: dict[str, tuple[float, str]] = {}
+
+    # ── E2 呈现层：来源可信度 / E6 Agent 心智模型 ─────────────────────────
+    _AGENT_BRIEF_TTL_SEC = 300
+
+    def _source_trust(self, source: str) -> float:
+        """hit 来源可信度：按 `config.recall.source_trust` 的键做 source 前缀匹配，缺省 0.8。"""
+        for key, weight in self._config.recall.source_trust.items():
+            if source and str(source).startswith(str(key)):
+                return float(weight)
+        return 0.8
+
+    def _trust_note(self) -> str:
+        """injection 末尾的「记忆来源可信度」行（值来自 config，供模型选择性提及出处）。"""
+        weights = " ".join(
+            f"{key}={weight}" for key, weight in self._config.recall.source_trust.items())
+        return f"记忆来源可信度：{weights}"
+
+    def _agent_brief(self, agent_id: str) -> str:
+        """E6 Agent 心智模型：拼「与该 Agent 的既往协作要点」块（无匹配返回空串）。
+
+        数据源是画像（memory_type=profile）神经元，按 payload 的 agent_id 匹配该 Agent
+        取最近 3 条。结果缓存进 _agent_brief_cache（TTL 300s）：brief 是低风险摘要，
+        写路径失效不做——最坏 5 分钟后过期重建（见 __init__ 注释）。
+        """
+        now = time.time()
+        cached = self._agent_brief_cache.get(agent_id)
+        if cached is not None and now - cached[0] < self._AGENT_BRIEF_TTL_SEC:
+            return cached[1]
+        try:
+            rows = self._relational.query("neuron", memory_types=("profile",), limit=20)
+        except Exception:  # noqa: BLE001  brief 失败不阻断召回
+            rows = []
+        lines: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("agent_id") or "") != agent_id:
+                continue
+            text = str(row.get("content") or "").strip()
+            if text:
+                lines.append(f"- {text[:120]}")
+            if len(lines) >= 3:
+                break
+        brief = "【与该 Agent 的既往协作要点】\n" + "\n".join(lines) if lines else ""
+        self._agent_brief_cache[agent_id] = (now, brief)
+        return brief
 
     def authenticate(self, headers: dict) -> Agent:
         authorization = str(headers.get("authorization") or headers.get("Authorization") or "")
@@ -186,6 +235,12 @@ class MCPToolkit:
             #   merge_cognition_enabled 可关）。不传 cognition 时行为与旧版完全一致。
             if cognition_raw is not None and cognition is None:
                 raise ValueError("cognition 必须是对象")
+            # E6 社会认知：cognition.perspective（如 "Agent A 认为…"）整体随 cognition
+            # 透传给 hippocampus.remember，不在本层拆改。落点差距：hippocampus 的
+            # 旁路 meta 白名单（brain/hippocampus.py _remember 的 meta 块）当前不含
+            # perspective 键，故该字段暂不落旁路索引，需 hippocampus 侧增补后才落盘；
+            # 本层只保证 cognition 字段原样可达 + 响应回显，便于上层观察。
+            perspective = str((cognition or {}).get("perspective") or "")
             result = self._hippocampus.remember(
                 content, agent_id=agent.agent_id, namespace=namespace,
                 cognition=cognition,
@@ -202,6 +257,7 @@ class MCPToolkit:
                 "namespace": namespace,
                 "topic": topic,
                 "layer": str((cognition or {}).get("layer") or "fact"),
+                "perspective": perspective or None,
             }
 
         if tool == "recall_memory":
@@ -243,6 +299,9 @@ class MCPToolkit:
                         "score": round(hit.score, 4),
                         "pad": hit.neuron.pad.as_tuple(),
                         "channels": list(hit.channels),
+                        # E2：来源追溯——source=写入者，trust 按 source 前缀查 config.recall.source_trust
+                        "source": str(hit.neuron.agent_id or ""),
+                        "trust": self._source_trust(str(hit.neuron.agent_id or "")),
                     }
                     for hit in hits
                 ]
@@ -260,6 +319,10 @@ class MCPToolkit:
                         "score": float(row.get("score", 0.0)),
                         "pad": list(row.get("pad") or []),
                         "channels": list(row.get("channels") or []),
+                        # E2：fast 投影行可能缺 agent_id（v3 daemon recall 不带），缺省 source="" → trust=0.8
+                        "source": str(row.get("agent_id") or row.get("source") or ""),
+                        "trust": self._source_trust(
+                            str(row.get("agent_id") or row.get("source") or "")),
                     }
                     for row in raw_hits if isinstance(row, dict)
                 ]
@@ -292,6 +355,20 @@ class MCPToolkit:
             projection = self._compose_with_prefix_cache(layers, query, channel)
             if projection:
                 injection = (injection + "\n\n" + projection).strip()
+            # E2 元认知：六通道模式透传前额叶的知识缺口标记（getattr 防御——
+            # prefrontal.last_knowledge_gap 由计算层并行接线，未就绪时取 None 不报错）
+            knowledge_gap = (
+                getattr(self._prefrontal, "last_knowledge_gap", None)
+                if mode == "six-channel" else None
+            )
+            # E6：Agent 心智模型注入头部（仅当非空）；结果已按 agent_id 缓存（TTL 300s）
+            brief = self._agent_brief(agent.agent_id)
+            if brief:
+                injection = (brief + "\n\n" + injection).strip() if injection else brief
+            # E2：injection 末尾固定追加来源可信度行（值来自 config，供模型选择性
+            # 提及「根据之前记录…」）；injection 为空（无命中）时不追
+            if injection:
+                injection = injection + "\n" + self._trust_note()
             return {
                 "hits": rows,
                 "injection": injection,
@@ -300,6 +377,7 @@ class MCPToolkit:
                 "channel": channel,
                 "namespaces": list(ns_filter),
                 "narratives": narratives,
+                "knowledge_gap": knowledge_gap,
                 "degraded": bool(getattr(self._prefrontal, "last_degraded", False)),
             }
 

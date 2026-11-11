@@ -125,6 +125,15 @@ class RecallConfig(BaseSettings):
     rerank_enabled: bool = True                          # False=跳过交叉编码精排（省时省电，低配设备）
     rerank_top_n: int = 20                               # W5 / C3：精排候选硬上限压到 20
     rerank_timeout_ms: int = 8000                        # W5 / C3：端到端 deep 15s 预算内给精排 8s 硬超时
+    # E2：动态召回置信度三权重 + E4 视角加权开关（prefrontal 构造参数的后补配置）
+    confidence_w_channel: float = 0.3                    # 通道多样性权重
+    confidence_w_fresh: float = 0.3                      # FSRS 新鲜度权重
+    confidence_w_conflict: float = 0.4                   # 无未消解冲突权重
+    perspective_weight: float = 0.1                      # E4：0=关闭，>0 按 PAD 符号微调排序
+    # E2 呈现层：来源可信度表——键按前缀匹配 hit 的 source（写入者 agent_id / source 字段），
+    # 未命中任何键时缺省 0.8；injection 末尾据此追加「记忆来源可信度」一行。
+    source_trust: dict[str, float] = Field(
+        default_factory=lambda: {"user": 1.0, "agent": 0.9, "document": 0.8})
 
 
 class PlasticityConfig(BaseSettings):
@@ -349,6 +358,14 @@ class CacheConfig(BaseSettings):
 
     enabled: bool = True                       # 总开关；false 时全部回退无缓存路径
     flush_every_ops: int = 500                 # 指标攒批写 DuckDB 的阈值
+    # E1 类脑化衰减：高频命中条目按 log1p(access_count) 放大有效 TTL（LTP 类比）；
+    # false 时退回固定 TTL 语义。ttl_sec<=0 的命名空间不受影响（仍永久）。
+    decay_enabled: bool = True
+    # E1 干扰效应：同 key 覆写时旧值进 superseded 暂存区，宽限期内可经
+    # recall_superseded 取回（"我刚才是不是记错了"的纠错场景）；过期后清除。
+    interference_grace_sec: int = 300
+    # 只对认知性命名空间做干扰暂存；其余命名空间仍直接覆盖（事务语义优先）。
+    cognitive_namespaces: list[str] = Field(default_factory=lambda: ["output"])
     namespaces: dict[str, dict[str, Any]] = Field(default_factory=lambda: {
         # media: memory（LRU）| lmdb；ttl_sec<=0 = 永不过期（靠精确失效）
         "recall": {"enabled": True, "capacity": 512, "ttl_sec": 600, "media": "memory"},
@@ -384,6 +401,14 @@ class NarrativeReconstructConfig(BaseSettings):
     skeleton_chars: int = 200                # A4：叙事故事骨架前缀长度
 
 
+class ReconsolidationConfig(BaseSettings):
+    """E5：认知性记忆召回后的可塑窗口（窗口内合并必须产生 reconsolidate 事件）。"""
+    model_config = SettingsConfigDict(env_prefix="RECONSOLIDATION_")
+
+    enabled: bool = True
+    window_sec: int = 1800                    # 30min；0 = 关闭窗口（行为与旧行为一致）
+
+
 class HyperedgeBackfillConfig(BaseSettings):
     """W4 / P4.0：从既有记忆补 hyperedge + MEMBER 边，给 W5 的激活扩散铺图。"""
     model_config = SettingsConfigDict(env_prefix="BACKFILL_")
@@ -409,6 +434,26 @@ class ChatConfig(BaseSettings):
     max_history_turns: int = 20                 # 会话缓冲只留最近 N 轮原文
     deep_async: bool = True                     # deep 结果从 8769 异步推，不阻塞回复
     persona_channel: str = "bot"                # A5/Q19：聊天必须注入 L0 人格层
+
+
+class ForgetConfig(BaseSettings):
+    """E3 / 主动遗忘：夜间预测价值扫描的评分权重与判据（全部可调）。"""
+    model_config = SettingsConfigDict(env_prefix="FORGET_")
+
+    enabled: bool = True                       # 总开关；false 时 sweep 直接跳过
+    window_days: int = 30                      # access_log 趋势统计窗口
+    scan_limit: int = 500                      # 单次扫描的 active fact/scenario 上限
+    memory_types: list[str] = Field(
+        default_factory=lambda: ["fact", "scenario"]
+    )                                          # 参与评分的记忆类型
+    # 评分 = w_retention*可提取性 + w_usage*近30天使用度 + w_trust*(1-被纠正度)，归一化到 [0,1]
+    w_retention: float = 0.4                   # FSRS retrievability 权重
+    w_usage: float = 0.4                       # recall_count 平滑使用度权重
+    w_trust: float = 0.2                       # 未被纠正占比权重（被纠正越多分越低）
+    archive_value_threshold: float = 0.2       # 预测价值低于此值 → 降 archive
+    max_recall_count_archive: int = 1          # 且 recall_count 不高于此值才归档
+    review_value_threshold: float = 0.7        # 高价值低访问 → 保持 recall 层并列入人审清单
+    review_max_recall_count: int = 1
 
 
 class AccountPoolConfig(BaseSettings):
@@ -455,9 +500,11 @@ class BrainConfig(BaseSettings):
     hyperedge_backfill: HyperedgeBackfillConfig = Field(default_factory=HyperedgeBackfillConfig)
     spreading_activation: SpreadingActivationConfig = Field(default_factory=SpreadingActivationConfig)
     pad_gating: PadGatingConfig = Field(default_factory=PadGatingConfig)
+    reconsolidation: ReconsolidationConfig = Field(default_factory=ReconsolidationConfig)
     narrative_reconstruct: NarrativeReconstructConfig = Field(default_factory=NarrativeReconstructConfig)
     media_service: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    forget: ForgetConfig = Field(default_factory=ForgetConfig)
     account_pool: AccountPoolConfig = Field(default_factory=AccountPoolConfig)
 
 

@@ -20,7 +20,9 @@ def _manager(storage, config: BrainConfig | None = None,
 
 # ── 内存 LRU：命中 / TTL / 容量淘汰 ─────────────────────────────────────
 def test_memory_lru_hit_miss_and_expiry(storage) -> None:
-    manager = _manager(storage)
+    # E1 衰减默认开：单次命中会把 effective_ttl 拉长，本用例验证固定 TTL 契约故显式关闭
+    config = BrainConfig(_env_file=None, cache=CacheConfig(decay_enabled=False))
+    manager = _manager(storage, config)
     manager.set("recall", "k1", "v1", ttl_sec=0.05)
     assert manager.get("recall", "k1") == "v1"
     time.sleep(0.06)

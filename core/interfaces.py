@@ -65,6 +65,7 @@ EventType = Literal[
     "tombstone",          # 合规级删除标记
     "overwrite",          # W2：事务性内容覆盖式更新（只记最终态，带新 payload）
     "media_interaction",  # W2：媒体交互 meta（不产生 neuron）
+    "reconsolidate",      # E5/Q32：再巩固窗口内原地合并（id 不变 + payload 原地更新，必须产生事件）
 ]
 TimeSeriesTable = Literal["pad_track", "access_log", "decay_event", "consolidation_failures"]
 
@@ -367,6 +368,14 @@ class GraphRepository(HealthCheckable, ABC):
 
     @abstractmethod
     def supersede(self, new_id: str, old_id: str, *, tx_from: HLCStamp) -> None: ...
+
+    def supersede_edges_of(self, neuron_id: str, *, limit: int = 20) -> list[Record]:
+        """E2：读取以该 neuron 为一端的 SUPERSEDES 边（对端 id）。
+
+        非抽象默认实现：返回空列表（表示"无痕迹"）。具体实现可选覆写——
+        KuzuGraphDB 已覆写；无法读边的实现静默返回空，调用方按"无冲突"处理。
+        """
+        return []
 
     @abstractmethod
     def neighbors(self, entity_id: str, *, hops: int = 1, limit: int = 20) -> list[Record]: ...
