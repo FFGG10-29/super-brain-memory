@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any
 
 __all__ = ["RpcExtension"]
@@ -836,6 +837,143 @@ class RpcExtension:
         except OSError as exc:
             return {"ok": False, "error": f"启动失败：{exc}"}
 
+    def _pool_login_url(self, url: str = "", **_: Any) -> dict[str, Any]:
+        """浏览器登录：用系统默认浏览器打开厂商登录页（wbmod 同款做法）。"""
+        url = str(url or "")
+        if not url.startswith(("http://", "https://")):
+            return {"ok": False, "error": "非法 URL"}
+        try:
+            import os
+
+            os.startfile(url)  # noqa: S606  Windows 默认浏览器
+            return {"ok": True, "url": url,
+                    "hint": "登录完成后点「重新扫描凭证」"}
+        except OSError as exc:
+            return {"ok": False, "error": f"打开浏览器失败：{exc}"}
+
+    def _pool_import_accounts(self, text: str = "", **_: Any) -> dict[str, Any]:
+        """导入 xdpool/兄弟工具的账号转移文件（多账号来源，支持 {accounts:[...]} 包装）。"""
+        from gateway.account_pool import store
+
+        try:
+            result = store.import_transfer(text)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        pool = self._account_pool()
+        if pool is not None:
+            try:
+                pool.discover()  # 导入即入池
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, **result}
+
+    def _pool_provider_registry(self, **_: Any) -> dict[str, Any]:
+        """77 家云供应商注册表（xdpool providers-registry.json 移植）。"""
+        from gateway.account_pool import catalog
+
+        return {"ok": True, "providers": catalog.provider_registry()}
+
+    def _pool_export_accounts(self, **_: Any) -> dict[str, Any]:
+        """导出账号转移文件（xdpool accounts.json 原样，含凭证，注意保密）。"""
+        pool = self._account_pool()
+        path = getattr(pool, "_accounts_path", None)
+        try:
+            target = path() if callable(path) else None
+            if target is not None and Path(str(target)).is_file():
+                return {"ok": True,
+                        "json": Path(str(target)).read_text(encoding="utf-8")}
+            return {"ok": False, "error": "accounts.json 尚未生成（先入池一个账号）"}
+        except OSError as exc:
+            return {"ok": False, "error": f"读取失败：{exc}"}
+
+    # ── 模型配置页：云供应商 CRUD + 内部消费者路由 ────────────────────────
+    def _router_config(self, **_: Any) -> dict[str, Any]:
+        """供应商列表（key 只回传是否已存）+ 内部消费者路由 + 本地模型。"""
+        router = self._router()
+        cfg = self._daemon._config.model_router
+        overlay = router._providers_overlay()
+        providers = overlay or list(cfg.providers or [])
+        rows = []
+        for item in providers:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            name = str(item["name"])
+            has_key = bool(self._secret_value(f"model_router.{name}"))
+            rows.append({"name": name, "endpoint": str(item.get("endpoint") or ""),
+                         "kind": str(item.get("kind") or "cloud"),
+                         "model": str(item.get("model") or ""),
+                         "caps": [str(c) for c in (item.get("caps") or ["chat"])],
+                         "weight": item.get("weight", 1.0), "has_key": has_key})
+        return {"ok": True, "enabled": bool(cfg.enabled),
+                "local_endpoint": str(cfg.local_endpoint),
+                "local_model": str(cfg.local_model),
+                "providers": rows,
+                "task_routes": router._task_routes_overlay()
+                               or dict(cfg.task_routes or {})}
+
+    def _router_provider_set(self, name: str = "", endpoint: str = "",
+                             kind: str = "cloud", model: str = "",
+                             caps: list[str] | None = None,
+                             api_key: str = "", **_: Any) -> dict[str, Any]:
+        """新增/更新云供应商（key 存 secret store，明文不落配置）。"""
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "error": "缺少 name"}
+        router = self._router()
+        cfg = self._daemon._config.model_router
+        providers = router._providers_overlay() or list(cfg.providers or [])
+        row = {"name": name, "endpoint": str(endpoint), "kind": str(kind or "cloud"),
+               "model": str(model), "caps": caps or ["chat"], "weight": 1.0}
+        providers = [p for p in providers if not (isinstance(p, dict) and p.get("name") == name)]
+        providers.append(row)
+        router.save_providers_overlay(providers)
+        if api_key:
+            self._secret_set(f"model_router.{name}", str(api_key))
+        router.reload()
+        return {"ok": True, "name": name}
+
+    def _router_provider_delete(self, name: str = "", **_: Any) -> dict[str, Any]:
+        router = self._router()
+        providers = router._providers_overlay() or list(
+            self._daemon._config.model_router.providers or [])
+        providers = [p for p in providers if not (isinstance(p, dict) and p.get("name") == name)]
+        router.save_providers_overlay(providers)
+        router.reload()
+        return {"ok": True, "name": name}
+
+    def _router_route_set(self, task: str = "", spec: str = "", **_: Any) -> dict[str, Any]:
+        """内部消费者路由：extract/rerank/... → pool:模型 | free:模型 | provider:名 | 空(本地)。"""
+        task = str(task or "").strip()
+        if not task:
+            return {"ok": False, "error": "缺少 task"}
+        router = self._router()
+        routes = router._task_routes_overlay() or dict(
+            self._daemon._config.model_router.task_routes or {})
+        if str(spec or "").strip():
+            routes[task] = str(spec).strip()
+        else:
+            routes.pop(task, None)
+        router.save_task_routes_overlay(routes)
+        return {"ok": True, "task": task, "spec": routes.get(task, "")}
+
+    def _router(self) -> Any:
+        from gateway.model_router import get_model_router
+
+        return get_model_router()
+
+    def _secret_value(self, key: str) -> str:
+        try:
+            from core.desktop_features import default_secret_store
+
+            return default_secret_store().get(key) or ""
+        except Exception:  # noqa: BLE001  无桌面能力时无 key
+            return ""
+
+    def _secret_set(self, key: str, value: str) -> None:
+        from core.desktop_features import default_secret_store
+
+        default_secret_store().set(key, value)
+
     def _cache_metrics(self, **_: Any) -> dict[str, Any]:
         from core.cache_manager import get_cache_manager
 
@@ -876,82 +1014,169 @@ class RpcExtension:
             return {"ok": False, "error": "缺少 session_id"}
         return {"ok": True, "messages": engine.history(session_id, limit=int(limit))}
 
-    # ── AI 空间（QQ 风格个人主页：资料/签名/动态/日记，数据源=超大脑本体）──
-    def _ai_narratives(self, limit: int = 30, **_: Any) -> list[dict[str, Any]]:
-        """owner=ai_narrative 的叙事 neuron（AI 的日记与动态数据源）。"""
-        app = self._daemon.app
+    # ── AI 空间（QQ 空间环境：全字段资料 / AI 自写日记 / 说说·配图）───────
+    # 与「叙事洞察」严格分离：日记是 AI 自己想写的东西（kv ai_space/diary/*），
+    # 画像是 AI 的自我资料（kv ai_space/profile），说说带图（kv ai_space/moment/*）。
+
+    _AI_PROFILE_DEFAULTS: dict[str, str] = {
+        "nickname": "大肥鱼", "avatar_emoji": "🐟", "signature": "",
+        "age": "", "school": "", "gender": "", "city": "", "hobby": "",
+    }
+
+    def _ai_space_app(self) -> Any:
+        return self._daemon.app
+
+    def _ai_kv_json(self, key: str) -> Any:
+        app = self._ai_space_app()
+        if app is None:
+            return None
+        try:
+            raw = app.storage.kv.get("ai_space", key)
+            if not raw:
+                return None
+            import json as _json
+
+            return _json.loads(bytes(raw).decode("utf-8"))
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _ai_kv_put_json(self, key: str, value: Any) -> bool:
+        app = self._ai_space_app()
+        if app is None:
+            return False
+        try:
+            import json as _json
+
+            app.storage.kv.put("ai_space", key,
+                               _json.dumps(value, ensure_ascii=False).encode("utf-8"))
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _ai_profile(self, **_: Any) -> dict[str, Any]:
+        profile = dict(self._AI_PROFILE_DEFAULTS)
+        stored = self._ai_kv_json("profile")
+        if isinstance(stored, dict):
+            profile.update({str(k): str(v) for k, v in stored.items()})
+        diary_count = len(self._ai_diary_entries(limit=500))
+        moment_count = len(self._ai_moment_entries(limit=500))
+        return {"ok": True, **profile,
+                "diary_count": diary_count, "moment_count": moment_count}
+
+    def _ai_profile_write(self, fields: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+        """全字段资料编辑（头像/昵称/年龄/学校/性别/城市/爱好/签名…）。"""
+        if not isinstance(fields, dict) or not fields:
+            return {"ok": False, "error": "缺少 fields"}
+        profile = dict(self._AI_PROFILE_DEFAULTS)
+        stored = self._ai_kv_json("profile")
+        if isinstance(stored, dict):
+            profile.update({str(k): str(v) for k, v in stored.items()})
+        allowed = set(self._AI_PROFILE_DEFAULTS) | {"avatar_image"}
+        for key, value in fields.items():
+            if key in allowed:
+                profile[str(key)] = str(value)[:200]
+        if self._ai_kv_put_json("profile", profile):
+            return {"ok": True, "profile": profile}
+        return {"ok": False, "error": "后端内核未就绪或写入失败"}
+
+    def _ai_signature_write(self, signature: str = "", **_: Any) -> dict[str, Any]:
+        """兼容旧入口：写 profile.signature。"""
+        result = self._ai_profile_write(fields={"signature": str(signature)[:120]})
+        if result.get("ok"):
+            return {"ok": True, "signature": str(signature)[:120]}
+        return result
+
+    def _ai_diary_entries(self, limit: int = 30) -> list[dict[str, Any]]:
+        """AI 自写日记（kv ai_space/diary/<ts>），按时间倒序。"""
+        app = self._ai_space_app()
         out: list[dict[str, Any]] = []
         if app is None:
             return out
-        import json as _json
-
         try:
-            for key, raw in app.storage.kv.scan_prefix("meta", "", limit=3000):
+            for key, raw in app.storage.kv.scan_prefix("ai_space", "diary/",
+                                                       limit=2000):
                 try:
-                    meta = _json.loads(bytes(raw).decode("utf-8"))
+                    import json as _json
+
+                    row = _json.loads(bytes(raw).decode("utf-8"))
                 except (ValueError, TypeError):
                     continue
-                if meta.get("owner") != "ai_narrative":
-                    continue
-                record = app.storage.relational.get("neuron", key)
-                if record is None:
-                    continue
-                out.append({
-                    "id": str(key),
-                    "text": str(record.get("content") or ""),
-                    "ts_ms": int(meta.get("ts_ms") or 0),
-                    "topic": str(meta.get("topic") or ""),
-                })
+                if isinstance(row, dict):
+                    row["id"] = str(key)
+                    out.append(row)
         except Exception:  # noqa: BLE001
             pass
-        out.sort(key=lambda item: item["ts_ms"], reverse=True)
+        out.sort(key=lambda item: int(item.get("ts_ms") or 0), reverse=True)
         return out[: max(1, int(limit))]
 
-    def _ai_profile(self, **_: Any) -> dict[str, Any]:
-        app = self._daemon.app
-        signature = ""
-        if app is not None:
-            try:
-                raw = app.storage.kv.get("ai_space", "signature")
-                signature = bytes(raw).decode("utf-8", "replace") if raw else ""
-            except (OSError, TypeError, ValueError):
-                signature = ""
-        entries = self._ai_narratives(limit=200)
-        return {
-            "ok": True,
-            "nickname": "大肥鱼",
-            "avatar_emoji": "🐟",
-            "signature": signature,
-            "diary_count": len(entries),
-        }
-
     def _ai_diary(self, limit: int = 30, **_: Any) -> dict[str, Any]:
-        """日记 = AI 第一人称叙事 neuron（巩固窗口产出，真实记忆）。"""
-        return {"ok": True, "entries": self._ai_narratives(limit=limit)}
+        return {"ok": True, "entries": self._ai_diary_entries(limit=limit)}
 
-    def _ai_moments(self, limit: int = 10, **_: Any) -> dict[str, Any]:
-        """动态 = 最近的事件骨架时间线（hyperedge 真实事件）。"""
-        app = self._daemon.app
-        rows: list[dict[str, Any]] = []
-        if app is not None:
-            try:
-                from storage.hypergraph_db import GraphHypergraph
+    def _ai_diary_write(self, text: str = "", mood: str = "", **_: Any) -> dict[str, Any]:
+        """AI 自己写日记（想写点什么的时候用；MCP/聊天侧都可调）。"""
+        text = str(text or "").strip()
+        if not text:
+            return {"ok": False, "error": "日记内容为空"}
+        import time as _time
 
-                view = GraphHypergraph(app.storage.graph,
-                                       relational=app.storage.relational)
-                for row in app.storage.relational.query(
-                        "hyperedge", limit=int(limit), since_ms=0):
-                    hid = str(row.get("id") or "")
-                    rows.append({
-                        "id": hid,
-                        "label": str(row.get("label") or "一件事"),
-                        "ts_ms": int(row.get("occurred_at_ms") or 0),
-                        "text": view.get_event_skeleton(hid),
-                    })
-            except Exception:  # noqa: BLE001
-                pass
-        rows.sort(key=lambda item: item["ts_ms"], reverse=True)
-        return {"ok": True, "moments": rows[: max(1, int(limit))]}
+        ts = int(_time.time() * 1000)
+        entry = {"text": text[:2000], "mood": str(mood or "")[:20], "ts_ms": ts}
+        if self._ai_kv_put_json(f"diary/{ts}", entry):
+            return {"ok": True, "entry": entry}
+        return {"ok": False, "error": "后端内核未就绪或写入失败"}
+
+    def _ai_moment_entries(self, limit: int = 20) -> list[dict[str, Any]]:
+        """说说（kv ai_space/moment/<ts>），按时间倒序。"""
+        app = self._ai_space_app()
+        out: list[dict[str, Any]] = []
+        if app is None:
+            return out
+        try:
+            for key, raw in app.storage.kv.scan_prefix("ai_space", "moment/",
+                                                       limit=2000):
+                try:
+                    import json as _json
+
+                    row = _json.loads(bytes(raw).decode("utf-8"))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(row, dict):
+                    row["id"] = str(key)
+                    out.append(row)
+        except Exception:  # noqa: BLE001
+            pass
+        out.sort(key=lambda item: int(item.get("ts_ms") or 0), reverse=True)
+        return out[: max(1, int(limit))]
+
+    def _ai_moments(self, limit: int = 20, **_: Any) -> dict[str, Any]:
+        return {"ok": True, "moments": self._ai_moment_entries(limit=limit)}
+
+    def _ai_moment_write(self, text: str = "", image: str = "", **_: Any) -> dict[str, Any]:
+        """发说说（可配图，image=后端生成的图片绝对路径）。"""
+        text = str(text or "").strip()
+        if not text and not image:
+            return {"ok": False, "error": "说说内容为空"}
+        import time as _time
+
+        ts = int(_time.time() * 1000)
+        row = {"text": text[:2000], "image": str(image or "")[:500], "ts_ms": ts}
+        if self._ai_kv_put_json(f"moment/{ts}", row):
+            return {"ok": True, "moment": row}
+        return {"ok": False, "error": "后端内核未就绪或写入失败"}
+
+    def _ai_gen_image(self, prompt: str = "", **_: Any) -> dict[str, Any]:
+        """说说配图：经媒体服务生成，返回绝对路径（前端 Image.file 渲染）。"""
+        media = getattr(self._daemon, "media_service", None)
+        if media is None:
+            return {"ok": False, "error": "媒体服务未装配"}
+        try:
+            result = media.generate("image", {"prompt": str(prompt or "")[:500]})
+            path = str((result or {}).get("path") or "")
+            if not path:
+                return {"ok": False, "error": "生成失败：无输出路径"}
+            return {"ok": True, "path": path}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def _ai_signature_write(self, signature: str = "", **_: Any) -> dict[str, Any]:
         app = self._daemon.app

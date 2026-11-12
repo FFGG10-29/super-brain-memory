@@ -186,6 +186,172 @@ def _credential_from_xdpool(entry: dict, source: str) -> WorkBuddyCredential:
     )
 
 
+# ── 账号转移文件（xdpool 导入/导出，transfer.ts 移植）─────────────────────
+_TRANSFER_WRAPPERS = ("accounts", "data", "records")
+
+
+def parse_transfer_file(text: str) -> list[dict[str, Any]]:
+    """解析转移文件：裸数组或 {accounts|data|records:[...]}（再包一层 data/result）。
+
+    剥掉兄弟工具塞进来的 *_raw 快照（auth_raw 除外——它带 billing uin，
+    是 re-import 收敛同一 vault id 的依据）。畸形文件报错时带上顶层形状，
+    让用户能自行修复而不是瞎猜。
+    """
+    text = str(text or "").strip()
+    if not text:
+        raise AccountPoolError("转移文件为空")
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        raise AccountPoolError(f"转移文件不是 JSON：{exc}") from exc
+
+    def records_of(node: Any, depth: int = 0) -> list[Any] | None:
+        if isinstance(node, list):
+            return node
+        if not isinstance(node, dict):
+            return None
+        for key in _TRANSFER_WRAPPERS:
+            value = node.get(key)
+            if isinstance(value, list):
+                return value
+        if depth >= 1:
+            return None
+        for key in ("data", "result"):
+            inner = records_of(node.get(key), depth + 1) if isinstance(node.get(key), dict) else None
+            if inner is not None:
+                return inner
+        return None
+
+    records = records_of(parsed)
+    if records is None:
+        shape = "数组" if isinstance(parsed, list) else (
+            f"对象（keys={list(parsed)[:6]}）" if isinstance(parsed, dict) else type(parsed).__name__)
+        raise AccountPoolError(
+            f"转移文件须是账号记录数组；实际是 {shape}。"
+            f"接受的包装键：{_TRANSFER_WRAPPERS}")
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            raise AccountPoolError(f"转移文件第 {index + 1} 项不是账号对象")
+        out.append({k: v for k, v in item.items()
+                    if k == "auth_raw" or not str(k).endswith("_raw")})
+    return out
+
+
+def _region_of_domain(domain: str) -> str:
+    lowered = str(domain or "").lower()
+    if lowered.endswith(("workbuddy.ai", "codebuddy.ai")):
+        return "global"
+    if lowered.endswith(("workbuddy.cn", "codebuddy.cn", "copilot.tencent.com")):
+        return "cn"
+    return ""  # 未知：拒绝（域名必须能正面归类，防止误入别区金库）
+
+
+def import_transfer(text: str, *, accounts_file: str = "") -> dict[str, int]:
+    """导入转移记录：按 account_id 去重合并进 accounts.json，凭证保留原样。"""
+    records = parse_transfer_file(text)
+    path = Path(accounts_file) if accounts_file else (
+        Path(os.environ.get("XDPOOL_ACCOUNTS_FILE", ""))
+        if os.environ.get("XDPOOL_ACCOUNTS_FILE") else
+        Path.home() / ".dsh" / ".xdpool" / "accounts.json")
+    existing: dict[str, WorkBuddyCredential] = {}
+    meta = load_meta(path)
+    if path.is_file():
+        try:
+            for credential in discover_accounts(accounts_file=str(path)):
+                existing[credential.account_id()] = credential
+        except Exception:  # noqa: BLE001  已有文件解析失败也允许导入
+            existing = {}
+    added, skipped = 0, 0
+    for record in records:
+        access_token = str(record.get("access_token") or record.get("accessToken") or "")
+        if not access_token:
+            skipped += 1
+            continue
+        domain = str(record.get("domain") or "")
+        region = _region_of_domain(domain)
+        if not region:
+            skipped += 1
+            continue
+        auth_raw = record.get("auth_raw") if isinstance(record.get("auth_raw"), dict) else {}
+        account_block = auth_raw.get("account") if isinstance(auth_raw.get("account"), dict) else {}
+        uin = str(account_block.get("uin") or record.get("uin") or "")
+        uid = str(account_block.get("uid") or record.get("uid") or "")
+        nickname = str(record.get("nickname") or account_block.get("nickname") or "")
+        enterprise_id = str(record.get("enterprise_id")
+                            or record.get("enterpriseId")
+                            or account_block.get("enterpriseId") or "")
+        expires_at = record.get("expiresAt") or record.get("expiresAtMs") or 0
+        refresh_expires = record.get("refreshExpiresAt") or record.get("refreshExpiresAtMs") or 0
+        credential = WorkBuddyCredential(
+            access_token=access_token,
+            refresh_token=str(record.get("refresh_token") or record.get("refreshToken") or ""),
+            expires_at_ms=_to_ms(expires_at),
+            refresh_expires_at_ms=_to_ms(refresh_expires),
+            nickname=nickname, uin=uin, uid=uid,
+            enterprise_id=enterprise_id, domain=domain, region=region,
+            source_path=str(path))
+        account_id = credential.account_id()
+        if account_id in existing:
+            existing[account_id] = credential  # 覆盖为新凭证（token 会滚动）
+            continue
+        existing[account_id] = credential
+        added += 1
+    ignored = {str(item) for item in meta.get("ignored", [])}
+    save_accounts_atomic(
+        path, list(existing.values()),
+        ignored=ignored,
+        disabled_models=meta.get("disabled_models"),
+        default_model=meta.get("default_model", ""),
+        model_prefs=meta.get("model_prefs"))
+    return {"records": len(records), "added": added,
+            "total": len(existing), "skipped": skipped}
+
+
+# ── 登录态监听快照（多账号核心：换号登录先capture再被覆盖）─────────────────
+def capture_auth_snapshot(*, accounts_file: str = "", auth_file: str = "") -> dict[str, int]:
+    """把当前 WorkBuddy 登录态快照进 accounts.json（按 account_id 去重合并）。
+
+    用户在桌面端/浏览器登录另一个账号 → 凭证文件被覆盖 → 若不先快照，
+    旧账号就丢了。xdpool 的「浏览器登录…自动入池」就是这个机制：
+    监听凭证文件变化，每次变化把当前登录态合并进 accounts.json（多账号并存）。
+    """
+    auth_path = discover_auth_file(auth_file)
+    if auth_path is None or not auth_path.is_file():
+        return {"captured": 0, "reason": "无登录态文件"}
+    try:
+        credential = load_workbuddy_auth(auth_path)
+    except Exception as exc:  # noqa: BLE001  加密/损坏不计入
+        return {"captured": 0, "reason": f"登录态不可用：{exc}"}
+    if not credential.access_token:
+        return {"captured": 0, "reason": "空 token"}
+    path = Path(accounts_file) if accounts_file else (
+        Path(os.environ.get("XDPOOL_ACCOUNTS_FILE", ""))
+        if os.environ.get("XDPOOL_ACCOUNTS_FILE") else
+        Path.home() / ".dsh" / ".xdpool" / "accounts.json")
+    existing: dict[str, WorkBuddyCredential] = {}
+    meta = load_meta(path)
+    if path.is_file():
+        try:
+            for item in discover_accounts(accounts_file=str(path)):
+                existing[item.account_id()] = item
+        except Exception:  # noqa: BLE001
+            existing = {}
+    account_id = credential.account_id()
+    changed = account_id not in existing or \
+        existing[account_id].access_token != credential.access_token
+    existing[account_id] = credential
+    save_accounts_atomic(
+        path, list(existing.values()),
+        ignored=meta.get("ignored"),
+        disabled_models=meta.get("disabled_models"),
+        default_model=meta.get("default_model", ""),
+        model_prefs=meta.get("model_prefs"))
+    return {"captured": 1 if changed else 0,
+            "total": len(existing), "account_id": account_id,
+            "changed": changed}
+
+
 def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[WorkBuddyCredential]:
     """xdpool accounts.json + WorkBuddy 登录态，按 account_id 去重（先出现者优先）。"""
     found: list[WorkBuddyCredential] = []

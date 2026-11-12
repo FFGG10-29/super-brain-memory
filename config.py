@@ -316,6 +316,10 @@ class ModelRouterConfig(BaseSettings):
     semantic_cache: bool = True
     semantic_thresholds: dict[str, float] = Field(default_factory=lambda: {
         "fact": 0.95, "code": 0.93, "chat": 0.85})
+    # 内部消费者 → 供应商路由（用户可在"模型配置"页设置，持久化 task_routes.json）：
+    #   extract=记忆抽取 LLM（报名/登记）；rerank=精排（预留，当前 ONNX 本地）；
+    #   consolidation=巩固。spec："pool:<model>" | "free:<model>" | "provider:<name>" | ""（本地）
+    task_routes: dict[str, str] = Field(default_factory=dict)
     semantic_capacity: int = 256
 
 

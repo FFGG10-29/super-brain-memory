@@ -221,6 +221,10 @@ class AccountPool:
         # per-model 偏好：{id: {enabled, ctx_budget, image, thinking}}
         # thinking ∈ off/minimal/low/medium/high/xhigh/max（None=上游默认）
         self.model_prefs: dict[str, dict[str, Any]] = {}
+        # 免密 lane 开关：config 可能是 BrainConfig（free_lane 在 .account_pool 上）
+        # 也可能直接是 AccountPoolConfig——两种都兼容
+        lane_source = getattr(config, "account_pool", config)
+        self.free_lane_enabled = bool(getattr(lane_source, "free_lane", False))
         self._timeout = float(getattr(config, "request_timeout_sec", 20.0))
         self._max_attempts = int(getattr(config, "max_attempts", 3))
         self._credential_dead_sec = float(getattr(config, "credential_dead_sec", 3600.0))
@@ -238,6 +242,44 @@ class AccountPool:
             accounts_file=getattr(self.config, "accounts_file", "") or "",
             auth_file=getattr(self.config, "auth_file", "") or "")
         self._load_ignored()
+        self._ensure_auth_watch()
+
+    # ── 登录态监听（多账号自动入库：换号登录先快照再被覆盖）───────────────
+    def _ensure_auth_watch(self) -> None:
+        if getattr(self, "_auth_watch_started", False):
+            return
+        self._auth_watch_started = True
+        thread = threading.Thread(target=self._auth_watch_loop,
+                                  name="pool-auth-watch", daemon=True)
+        thread.start()
+
+    def _auth_watch_loop(self) -> None:
+        """每 3s 看登录态文件指纹；变化 = 用户换了号登录 → 快照进 accounts.json。"""
+        import time as _time
+
+        last_fingerprint = ""
+        while True:
+            _time.sleep(3.0)
+            try:
+                auth_path = store.discover_auth_file(
+                    getattr(self.config, "auth_file", "") or "")
+                if auth_path is None or not auth_path.is_file():
+                    continue
+                stat = auth_path.stat()
+                fingerprint = f"{auth_path}:{stat.st_mtime_ns}:{stat.st_size}"
+                if fingerprint == last_fingerprint:
+                    continue
+                if last_fingerprint == "":
+                    last_fingerprint = fingerprint  # 首轮只记基线
+                    continue
+                last_fingerprint = fingerprint
+                result = store.capture_auth_snapshot(
+                    accounts_file=getattr(self.config, "accounts_file", "") or "",
+                    auth_file=getattr(self.config, "auth_file", "") or "")
+                if result.get("captured"):
+                    self.discover()
+            except Exception:  # noqa: BLE001  监听失败静默重试
+                continue
 
     def _accounts_path(self) -> Path:
         raw = getattr(self.config, "accounts_file", "") or ""
@@ -533,8 +575,10 @@ class AccountPool:
             headers["X-Domain"] = account.domain
         else:
             headers["X-No-Department-Info"] = "1"
+        # 上游硬门（实测 11101）：Non-stream chat request is currently not
+        # supported —— 必须流式；SSE 解析器本就兼容（transport 读完整 body）。
         payload = json.dumps({"model": model, "messages": messages,
-                              "stream": False}).encode("utf-8")
+                              "stream": True}).encode("utf-8")
         # 思考档位落线（xdpool off-thinking/default-effort 移植）：
         # 声明过的档位随体注入；off 撞硬墙（REFUSES_OFF_MODEL_IDS）已在上游剔除。
         effort = self._reasoning_effort_for(model)
@@ -588,8 +632,8 @@ class AccountPool:
     # -- 免密 lane ----------------------------------------------------------
 
     def free_chat(self, prompt: str, *, model: str) -> str:
-        if not getattr(self.config, "free_lane", False):
-            raise AccountPoolError("免密 lane 默认关闭")
+        if not self.free_lane_enabled:
+            raise AccountPoolError("免密 lane 未开启（.env POOL_FREE_LANE=true 后重启后端）")
         if model.startswith("muse-spark"):
             path, payload = "/inference/v1/responses", {
                 "model": model, "input": prompt, "stream": True}
@@ -616,8 +660,12 @@ class AccountPool:
         status, resp_headers, body = self._request(
             "POST", FREE_BASE + path, headers, json.dumps(payload).encode("utf-8"))
         if status != 200:
-            raise AccountPoolError(
-                f"免密 lane HTTP {status}: {_snippet(body)}")
+            snippet = _snippet(body)
+            if status == 429 and "FreeUsageLimit" in snippet:
+                raise AccountPoolError(
+                    "免费额度已用尽（OpenCode 免费模型有使用限额）——"
+                    "明天再试，或从模型菜单换 WorkBuddy 模型")
+            raise AccountPoolError(f"免密 lane HTTP {status}: {snippet}")
         return _parse_chat_payload(body, resp_headers)
 
 
@@ -647,5 +695,5 @@ class PoolClient:
             self.failures += 1
         self.latency_ms = 0.7 * self.latency_ms + 0.3 * max(1.0, latency_ms)
 
-    def complete(self, prompt: str) -> str:
-        return self.pool.complete(prompt, model=getattr(self.config, "default_model", ""))
+    def complete(self, prompt: str, model: str | None = None) -> str:
+        return self.pool.complete(prompt, model=model or getattr(self.config, "default_model", ""))

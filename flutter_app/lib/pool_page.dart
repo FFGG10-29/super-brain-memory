@@ -41,6 +41,8 @@ class _PoolPageState extends State<PoolPage> {
 
   Map<String, dynamic> _data = <String, dynamic>{};
   Map<String, dynamic> _catalog = <String, dynamic>{};
+  List<Map<String, dynamic>> _registry = <Map<String, dynamic>>[];
+  bool _showDisabled = false;
   String _message = '';
   bool _busy = false;
   String _acting = '';
@@ -61,6 +63,17 @@ class _PoolPageState extends State<PoolPage> {
             <String, dynamic>{'force': forceCatalog});
         if (result is Map<String, dynamic>) catalog = result;
       } catch (_) {}
+      if (_registry.isEmpty) {
+        try {
+          final reg = await widget.client.call('pool.provider_registry', <String, dynamic>{});
+          if (reg is Map && reg['ok'] == true) {
+            _registry = (reg['providers'] as List<dynamic>? ?? <dynamic>[])
+                .whereType<Map>()
+                .map(Map<String, dynamic>.from)
+                .toList();
+          }
+        } catch (_) {}
+      }
       if (!mounted) return;
       setState(() {
         _data = status;
@@ -106,16 +119,40 @@ class _PoolPageState extends State<PoolPage> {
   }
 
   Future<void> _toggleModel(String modelId, bool enabled) async {
-    setState(() => _acting = 'toggle-$modelId');
+    // 乐观更新：开关立即变，不打断交互（后台失败才回滚提示）
+    final disabledList = ((_catalog['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+        .map((e) => e.toString())
+        .toSet();
+    if (enabled) {
+      disabledList.remove(modelId);
+    } else {
+      disabledList.add(modelId);
+    }
+    setState(() {
+      _catalog['disabled_models'] = disabledList.toList();
+      _message = enabled ? '已启用 $modelId' : '已禁用 $modelId';
+    });
     try {
-      await widget.client
+      final result = await widget.client
           .call('pool.model_toggle', <String, dynamic>{'model_id': modelId, 'enabled': enabled});
       if (!mounted) return;
-      setState(() => _message = enabled ? '已启用 $modelId' : '已禁用 $modelId');
+      if (!(result is Map && result['ok'] == true)) {
+        // 失败回滚
+        final rollback = ((_catalog['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+            .map((e) => e.toString())
+            .toSet();
+        if (enabled) {
+          rollback.add(modelId);
+        } else {
+          rollback.remove(modelId);
+        }
+        setState(() {
+          _catalog['disabled_models'] = rollback.toList();
+          _message = '开关失败：${result is Map ? (result['error'] ?? '未知原因') : '响应异常'}';
+        });
+      }
     } catch (error) {
       if (mounted) setState(() => _message = '开关失败：$error');
-    } finally {
-      if (mounted) setState(() => _acting = '');
     }
   }
 
@@ -268,7 +305,7 @@ class _PoolPageState extends State<PoolPage> {
             flex: 6,
             child: Row(children: <Widget>[
               Flexible(
-                child: Text(name,
+                child: Text((model['display'] ?? name).toString(),
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                         color: disabled ? _hint : Colors.white, fontSize: 12)),
@@ -520,6 +557,26 @@ class _PoolPageState extends State<PoolPage> {
         if (pa != pb) return pa - pb;
         return (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString());
       });
+    // 禁用的不显示（原版行为）；需要恢复时点「显示已禁用」
+    final disabledSet = _disabled;
+    final visibleWb = _showDisabled
+        ? wbModels
+        : wbModels.where((m) => !disabledSet.contains((m['id'] ?? '').toString())).toList();
+    // 同名变体（hy3/hy3-b/hy3-c… 上游名字都叫 Hy3）：重名时后缀 id 区分
+    final nameCounts = <String, int>{};
+    for (final m in visibleWb) {
+      final n = (m['name'] ?? '').toString();
+      nameCounts[n] = (nameCounts[n] ?? 0) + 1;
+    }
+    for (final m in visibleWb) {
+      final n = (m['name'] ?? '').toString();
+      final id = (m['id'] ?? '').toString();
+      if ((nameCounts[n] ?? 0) > 1 && id != n) {
+        m['display'] = '$n · $id';
+      } else {
+        m['display'] = n;
+      }
+    }
     final freeModels = (free['models'] as List<dynamic>? ?? <dynamic>[])
         .whereType<Map>()
         .map(Map<String, dynamic>.from)
@@ -543,6 +600,14 @@ class _PoolPageState extends State<PoolPage> {
                   fontWeight: FontWeight.w600)),
           const SizedBox(width: 8),
           _pill(live ? '上游实时' : '静态兜底', live ? _ok : _hint),
+          const SizedBox(width: 6),
+          // 原版行为：禁用即从列表消失；这里留恢复口
+          InkWell(
+            onTap: () => setState(() => _showDisabled = !_showDisabled),
+            child: Text(
+                _showDisabled ? '隐藏已禁用' : '显示已禁用（${disabledSet.length}）',
+                style: const TextStyle(color: _hint, fontSize: 10)),
+          ),
           const Spacer(),
           // 原版「同步模型表」：强制重拉 /v3/config + 免密 listing
           _actionButton('同步模型表', Icons.sync, 'catalog',
@@ -566,7 +631,7 @@ class _PoolPageState extends State<PoolPage> {
             child: Text('WorkBuddy 目录未取到（账号未入池或上游不可达）。',
                 style: TextStyle(color: _hint, fontSize: 12)),
           )
-        else ...wbModels.map(_modelRow),
+        else ...visibleWb.map(_modelRow),
         const Divider(color: _border, height: 14),
         // 免密 lane：70+ 免费模型（实时 listing，静态兜底保底）
         ExpansionTile(
@@ -602,6 +667,152 @@ class _PoolPageState extends State<PoolPage> {
         ),
       ]),
     );
+  }
+
+  // ── 浏览器登录 · 添加账号：77 家 API 供应商（xdpool 原版布局移植）──────
+  // 每行：名称（N 模型）+ 模型下拉 + API key 输入 + 保存（存系统凭据库并热重载）
+  final Map<String, String> _registryModelPick = <String, String>{};
+  final Map<String, TextEditingController> _registryKeyControllers =
+      <String, TextEditingController>{};
+
+  Widget _registryCard() {
+    if (_registry.isEmpty) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _panel, borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+        const Text('浏览器登录 · 添加账号（云供应商 API key）',
+            style: TextStyle(color: Colors.white, fontSize: 14,
+                fontWeight: FontWeight.w600)),
+        const SizedBox(height: 4),
+        const Text(
+            'WorkBuddy 新账号点右上「多账号 → 浏览器登录」扫码确认，凭证自动入池（多账号并存）；'
+            '下面 77 家是 API key 供应商：填 key 保存即热重载进聊天路由。',
+            style: TextStyle(color: _hint, fontSize: 11)),
+        const SizedBox(height: 6),
+        ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          childrenPadding: EdgeInsets.zero,
+          iconColor: _hint, collapsedIconColor: _hint,
+          title: Text('云供应商 · ${_registry.length} 家',
+              style: const TextStyle(color: Colors.white, fontSize: 13,
+                  fontWeight: FontWeight.w600)),
+          children: <Widget>[
+            for (final reg in _registry) _registryRow(reg),
+          ],
+        ),
+      ]),
+    );
+  }
+
+  Widget _registryRow(Map reg) {
+    final id = (reg['id'] ?? '').toString();
+    final name = (reg['name'] ?? id).toString();
+    final baseUrl = (reg['base_url'] ?? '').toString();
+    final models = (reg['models'] as List<dynamic>? ?? <dynamic>[])
+        .whereType<Map>()
+        .map(Map<String, dynamic>.from)
+        .toList();
+    final picked = _registryModelPick[id] ??
+        (models.isNotEmpty ? (models.first['id'] ?? '').toString() : '');
+    final controller = _registryKeyControllers.putIfAbsent(
+        id, () => TextEditingController());
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(children: <Widget>[
+        Expanded(
+          flex: 4,
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+            Text(name, style: const TextStyle(color: _accent, fontSize: 12)),
+            Text('$baseUrl · ${reg['model_count']} 模型',
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: _hint, fontSize: 9)),
+          ]),
+        ),
+        const SizedBox(width: 8),
+        // 模型下拉
+        SizedBox(
+          width: 150,
+          child: DropdownButtonFormField<String>(
+            initialValue: picked.isEmpty ? null : picked,
+            isDense: true,
+            dropdownColor: _panel,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+            decoration: InputDecoration(
+              isDense: true, contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 8, vertical: 6),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
+                  borderSide: const BorderSide(color: _border)),
+            ),
+            items: <DropdownMenuItem<String>>[
+              for (final m in models)
+                DropdownMenuItem<String>(
+                    value: (m['id'] ?? '').toString(),
+                    child: Text((m['name'] ?? '').toString(),
+                        overflow: TextOverflow.ellipsis)),
+            ],
+            onChanged: (value) =>
+                setState(() => _registryModelPick[id] = value ?? picked),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          flex: 3,
+          child: TextField(
+            controller: controller,
+            obscureText: true,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+            decoration: InputDecoration(
+              hintText: '粘贴 API key', hintStyle: const TextStyle(
+                  color: _hint, fontSize: 10),
+              isDense: true, contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 8, vertical: 8),
+              filled: true, fillColor: _bg,
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6),
+                  borderSide: const BorderSide(color: _border)),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        TextButton(
+          onPressed: _acting.isNotEmpty || picked.isEmpty || controller.text.trim().isEmpty
+              ? null
+              : () => unawaited(_saveRegistryProvider(
+                  id: id, baseUrl: baseUrl, model: picked,
+                  apiKey: controller.text.trim())),
+          style: TextButton.styleFrom(
+            backgroundColor: _accent.withValues(alpha: 0.14),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          ),
+          child: const Text('保存', style: TextStyle(color: _accent, fontSize: 12)),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> _saveRegistryProvider({required String id, required String baseUrl,
+      required String model, required String apiKey}) async {
+    setState(() => _acting = 'reg-$id');
+    try {
+      final result = await widget.client.call('router.provider_set', <String, dynamic>{
+        'name': id, 'endpoint': baseUrl, 'kind': 'openai',
+        'model': model, 'api_key': apiKey,
+      });
+      if (!mounted) return;
+      setState(() => _message = (result is Map && result['ok'] == true)
+          ? '$id 已保存并热重载（聊天路由可用 provider:$id）'
+          : '保存失败：${result is Map ? (result['error'] ?? '') : ''}');
+    } catch (error) {
+      if (mounted) setState(() => _message = '保存失败：$error');
+    } finally {
+      if (mounted) setState(() => _acting = '');
+    }
   }
 
   @override
@@ -686,10 +897,12 @@ class _PoolPageState extends State<PoolPage> {
                     () => unawaited(_rpc('pool.checkin', <String, dynamic>{}, 'checkin',
                         okMessage: '签到完成'))),
                 const SizedBox(width: 6),
-                // 浏览器/桌面端登录：拉起 WorkBuddy，登录态落盘后重扫入池
+                // 浏览器登录：直接跳系统默认浏览器登录页；登录后换号会被
+                // 凭证监听自动快照入池（多账号并存）
                 _actionButton('拉起登录', Icons.open_in_new, 'login',
-                    () => unawaited(_rpc('pool.login_start', <String, dynamic>{}, 'login',
-                        okMessage: 'WorkBuddy 已启动'))),
+                    () => unawaited(_rpc('pool.login_url',
+                        <String, dynamic>{'url': 'https://www.workbuddy.cn/'}, 'login',
+                        okMessage: '已在浏览器打开登录页；登录后自动入池（多账号并存）'))),
               ]),
               const SizedBox(height: 6),
               const Row(children: <Widget>[
@@ -718,6 +931,8 @@ class _PoolPageState extends State<PoolPage> {
             ]),
           ),
           _catalogCard(),
+          // ── 浏览器登录 · 添加账号（77 家云供应商，xdpool 原版布局）────────
+          _registryCard(),
           // ── 能力说明 ──────────────────────────────────────────────────
           Container(
             margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),

@@ -372,8 +372,15 @@ class RpcHandler(RpcExtension):
     def _config_get(self, **_: Any) -> dict[str, Any]:
         config = self._daemon._config
         sections = {}
+        # 全量 BrainConfig 分组（§15/§16 新增块随版本自动出现）：
+        # 类脑缓存 / 媒体生成 / 模型路由 / 号池网关 / 聊天 / 事件回填 /
+        # 扩散激活 / PAD 门控 / 再巩固 / 叙事重建 / 主动遗忘
         for name in ("storage", "model", "recall", "plasticity", "tier", "thalamus",
-                     "amygdala", "sync", "gateway", "merge", "activation", "ui"):
+                     "amygdala", "sync", "gateway", "merge", "activation", "ui",
+                     "cache", "media_service", "model_router", "account_pool",
+                     "chat", "hyperedge_backfill", "spreading_activation",
+                     "pad_gating", "reconsolidation", "narrative_reconstruct",
+                     "forget"):
             section = getattr(config, name, None)
             if section is None or not hasattr(section, "model_dump"):
                 continue

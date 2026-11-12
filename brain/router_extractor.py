@@ -115,6 +115,19 @@ class RouterExtractor:
         # 而导入内容本来就是用户自己的正文，不需要再让模型"理解"一遍。
         if not use_llm:
             return self._rule_extract(content)
+        # task_routes["extract"] 配了远程供应商（模型配置页）→ 先走远程；
+        # 失败/未配置回落本地 0.6B，规则抽取仍是最后防线。
+        route = str((self._config.model_router.task_routes or {}).get("extract") or "")
+        if route:
+            try:
+                from gateway.model_router import get_model_router
+
+                raw = get_model_router().complete_task(
+                    "extract", f"Agent={agent_id}\n内容：{content}")
+                payload = self._json_from_text(raw)
+                return self._from_payload(payload)
+            except Exception:  # noqa: BLE001  远程失败回落本地，绝不阻塞登记
+                pass
         try:
             payload = self._llm.complete_json(
                 _SYSTEM_PROMPT,
@@ -125,6 +138,22 @@ class RouterExtractor:
             return self._from_payload(payload)
         except (EngineUnavailable, ValueError, KeyError, TypeError):
             return self._rule_extract(content)
+
+    @staticmethod
+    def _json_from_text(raw: str) -> dict[str, Any]:
+        """远程模型返回文本 → JSON payload（容忍 ```json 围栏与前后杂文）。"""
+        import json as _json
+
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("json").strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("远程抽取结果不含 JSON 对象")
+        payload = _json.loads(text[start:end + 1])
+        if not isinstance(payload, dict):
+            raise ValueError("远程抽取结果不是对象")
+        return payload
 
     # ── LLM 结果 → Extraction ────────────────────────────────────────────
     def _from_payload(self, payload: dict[str, Any]) -> Extraction:

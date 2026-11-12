@@ -171,6 +171,43 @@ class HeadlessServer:
         self.cache_bus.subscribe(self.chat_engine._on_memory_updated)
         # chat.history 等 RPC 需要从 daemon 侧够到 8769 引擎
         self.daemon.chat_engine = self.chat_engine
+        # AI 空间配图：RPC 侧够到媒体服务
+        self.daemon.media_service = self.media_service
+
+        def _ai_write_diary(text: str, mood: str = "") -> dict[str, Any]:
+            app = self.daemon.app
+            if app is None:
+                return {"ok": False, "error": "内核未就绪"}
+            import json as _json
+            import time as _time
+
+            ts = int(_time.time() * 1000)
+            app.storage.kv.put("ai_space", f"diary/{ts}",
+                               _json.dumps({"text": str(text)[:2000],
+                                            "mood": str(mood)[:20], "ts_ms": ts},
+                                           ensure_ascii=False).encode("utf-8"))
+            return {"ok": True}
+
+        def _ai_write_moment(text: str, image: str = "") -> dict[str, Any]:
+            app = self.daemon.app
+            if app is None:
+                return {"ok": False, "error": "内核未就绪"}
+            import json as _json
+            import time as _time
+
+            ts = int(_time.time() * 1000)
+            app.storage.kv.put("ai_space", f"moment/{ts}",
+                               _json.dumps({"text": str(text)[:2000],
+                                            "image": str(image)[:500], "ts_ms": ts},
+                                           ensure_ascii=False).encode("utf-8"))
+            return {"ok": True}
+
+        # 聊天里「写日记：…」「发说说：…」→ AI 空间自我表达
+        from types import SimpleNamespace as _NS
+
+        self.chat_engine.ai_space = _NS(
+            write_diary=lambda text, mood="": _ai_write_diary(text, mood),
+            write_moment=lambda text, image="": _ai_write_moment(text, image))
 
     def _rpc_via_daemon(self, method: str, args: dict[str, Any]) -> dict[str, Any]:
         """MCP 扩展工具 → v3 RPC。这样 v3 的全部独特能力无需在传输层重复实现。"""

@@ -27,6 +27,21 @@ class _ChatPageState extends State<ChatPage> {
   ChatLinkState _link = ChatLinkState.disconnected;
   String _tokenError = '';
   String _sessionId = '';
+  // 模型选择：'' = 跟随路由；free:* = 免密；其余 = WorkBuddy 模型
+  String _selectedModel = '';
+  bool _showEmojiPanel = false;
+
+  /// 表情包（emoji 面板）：点击插入输入框，长按直接发送。
+  static const List<String> _emojiSet = <String>[
+    '😊', '😂', '🤣', '😍', '😘', '😎', '🤔', '😴', '😭', '😡',
+    '🥳', '😱', '🤗', '🤫', '🤩', '😈', '🙃', '😐', '🙄', '😶',
+    '👍', '👎', '👏', '🙏', '💪', '🤝', '✌️', '🤙', '👌', '🫶',
+    '❤️', '💔', '💖', '💘', '🌸', '🌹', '🌻', '🎁', '🎉', '🎂',
+    '🐟', '🐬', '🐳', '🐠', '🐡', '🦈', '🐙', '🦀', '🌊', '⭐',
+    '🍅', '🍜', '🍚', '🍰', '🍵', '🍺', '🀄', '🎮', '😴', '💤',
+  ];
+  List<Map<String, dynamic>> _wbModels = <Map<String, dynamic>>[];
+  List<Map<String, dynamic>> _freeModels = <Map<String, dynamic>>[];
   bool _typing = false;
   StreamSubscription<Map<String, dynamic>>? _framesSub;
   StreamSubscription<ChatLinkState>? _stateSub;
@@ -72,6 +87,7 @@ class _ChatPageState extends State<ChatPage> {
     if (type == 'hello_ack') {
       _sessionId = (frame['session_id'] ?? '').toString();
       unawaited(_loadHistory());
+      unawaited(_loadModels());
     } else if (type == 'typing') {
       final state = frame['state'];
       if (mounted) setState(() => _typing = state != false);
@@ -97,6 +113,58 @@ class _ChatPageState extends State<ChatPage> {
         });
         unawaited(_scrollDown());
       }
+    }
+  }
+
+  /// 模型清单（号池目录：WorkBuddy 启用模型 + 免费模型），进页面拉一次。
+  Future<void> _loadModels() async {
+    try {
+      final data = await widget.client.call('pool.catalog', <String, dynamic>{});
+      if (!mounted || data is! Map) return;
+      final disabled = ((data['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+          .map((e) => e.toString())
+          .toSet();
+      final wb = (data['wb'] as Map? ?? {});
+      final free = (data['free'] as Map? ?? {});
+      String nameOf(dynamic row) {
+        if (row is! Map) return '';
+        final n = (row['name'] ?? '').toString();
+        final mult = row['multiplier'];
+        final tag = mult is num ? '（x${mult.toStringAsFixed(2)}）' : '';
+        return '$n$tag';
+      }
+      // 不同供应商同名模型不去重，加 id 标识区分（hy3/hy3-b…）
+      final wbRows = <Map<String, dynamic>>[
+        for (final row in (wb['models'] as List<dynamic>? ?? <dynamic>[]))
+          if (row is Map && !disabled.contains((row['id'] ?? '').toString()))
+            <String, dynamic>{
+              'id': (row['id'] ?? '').toString(),
+              'name': nameOf(row),
+            },
+      ];
+      final nameCounts = <String, int>{};
+      for (final m in wbRows) {
+        nameCounts[m['name'] as String] =
+            (nameCounts[m['name'] as String] ?? 0) + 1;
+      }
+      for (final m in wbRows) {
+        if ((nameCounts[m['name'] as String] ?? 0) > 1) {
+          m['name'] = '${m['name']} · ${m['id']}';
+        }
+      }
+      setState(() {
+        _wbModels = wbRows;
+        _freeModels = <Map<String, dynamic>>[
+          for (final row in (free['models'] as List<dynamic>? ?? <dynamic>[]))
+            if (row is Map)
+              <String, dynamic>{
+                'id': 'free:${(row['id'] ?? '').toString()}',
+                'name': nameOf(row),
+              },
+        ];
+      });
+    } catch (_) {
+      // 目录拉不到也能聊天（跟随路由）
     }
   }
 
@@ -206,7 +274,7 @@ class _ChatPageState extends State<ChatPage> {
   void _send() {
     final text = _input.text.trim();
     if (text.isEmpty || _service == null) return;
-    _service!.sendMessage(text);
+    _service!.sendMessage(text, model: _selectedModel.isEmpty ? null : _selectedModel);
     setState(() {
       _messages.add(_Msg(text: text, mine: true, model: '', kind: '', fallback: null));
       _typing = true;
@@ -313,6 +381,66 @@ class _ChatPageState extends State<ChatPage> {
               style: TextStyle(color: _linkColor(), fontSize: 10)),
         ]),
         iconTheme: const IconThemeData(color: _text),
+        actions: <Widget>[
+          // 模型选择（AstrBot 式）：跟随路由 / WorkBuddy 模型 / 免费模型
+          PopupMenuButton<String>(
+            tooltip: '选择回复模型',
+            onSelected: (value) => setState(() => _selectedModel = value),
+            color: Colors.white,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Row(mainAxisSize: MainAxisSize.min, children: <Widget>[
+                Icon(Icons.smart_toy_outlined,
+                    size: 16, color: _selectedModel.isEmpty
+                        ? const Color(0xFF07C160)
+                        : const Color(0xFF4A90D9)),
+                const SizedBox(width: 4),
+                Text(
+                  _selectedModel.isEmpty
+                      ? '跟随路由'
+                      : (_selectedModel.startsWith('free:')
+                          ? '免费:${_selectedModel.split(':')[1]}'
+                          : _selectedModel),
+                  style: const TextStyle(color: _text, fontSize: 11),
+                ),
+                const Icon(Icons.arrow_drop_down, size: 16, color: _hint),
+              ]),
+            ),
+            itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+              const PopupMenuItem<String>(value: '', height: 36,
+                  child: Text('跟随路由（本地 → 号池自动兜底）',
+                      style: TextStyle(color: _text, fontSize: 12))),
+              if (_wbModels.isNotEmpty) ...<PopupMenuEntry<String>>[
+                const PopupMenuDivider(),
+                const PopupMenuItem<String>(enabled: false, height: 28,
+                    child: Text('WorkBuddy 模型',
+                        style: TextStyle(color: _hint, fontSize: 10))),
+                for (final m in _wbModels)
+                  PopupMenuItem<String>(value: m['id'] as String, height: 34,
+                      child: Text(m['name'] as String,
+                          style: TextStyle(
+                              color: _selectedModel == m['id']
+                                  ? const Color(0xFF07C160)
+                                  : _text,
+                              fontSize: 12))),
+              ],
+              if (_freeModels.isNotEmpty) ...<PopupMenuEntry<String>>[
+                const PopupMenuDivider(),
+                const PopupMenuItem<String>(enabled: false, height: 28,
+                    child: Text('免密免费模型',
+                        style: TextStyle(color: _hint, fontSize: 10))),
+                for (final m in _freeModels)
+                  PopupMenuItem<String>(value: m['id'] as String, height: 34,
+                      child: Text(m['name'] as String,
+                          style: TextStyle(
+                              color: _selectedModel == m['id']
+                                  ? const Color(0xFF07C160)
+                                  : _text,
+                              fontSize: 12))),
+              ],
+            ],
+          ),
+        ],
       ),
       body: Column(children: <Widget>[
         Expanded(
@@ -342,6 +470,28 @@ class _ChatPageState extends State<ChatPage> {
             ],
           ),
         ),
+        // 表情包面板（emoji 网格：点选插入输入框）
+        if (_showEmojiPanel)
+          Container(
+            height: 180,
+            color: Colors.white,
+            child: GridView.builder(
+              padding: const EdgeInsets.all(8),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 10, mainAxisSpacing: 4, crossAxisSpacing: 4),
+              itemCount: _emojiSet.length,
+              itemBuilder: (BuildContext context, int index) => InkWell(
+                onTap: () {
+                  _input.text += _emojiSet[index];
+                  _input.selection = TextSelection.fromPosition(
+                      TextPosition(offset: _input.text.length));
+                },
+                child: Center(
+                    child: Text(_emojiSet[index],
+                        style: const TextStyle(fontSize: 22))),
+              ),
+            ),
+          ),
         // 底部输入栏（微信风：白底 + 绿色发送按钮）
         Container(
           color: const Color(0xFFF7F7F7),
@@ -349,6 +499,14 @@ class _ChatPageState extends State<ChatPage> {
               left: 10, right: 10, top: 6,
               bottom: 6 + MediaQuery.of(context).padding.bottom),
           child: Row(children: <Widget>[
+            // 表情包开关
+            IconButton(
+              tooltip: '表情包',
+              onPressed: () => setState(() => _showEmojiPanel = !_showEmojiPanel),
+              icon: Icon(Icons.emoji_emotions_outlined,
+                  size: 22,
+                  color: _showEmojiPanel ? const Color(0xFF07C160) : _hint),
+            ),
             Expanded(
               child: TextField(
                 controller: _input,

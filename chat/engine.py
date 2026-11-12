@@ -70,6 +70,10 @@ class ChatEngine:
         self._queues: dict[str, asyncio.Queue] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._history: dict[str, deque] = {}
+        # 会话级模型选择（message 帧可选 model 字段；空 = 跟随路由）
+        self._session_models: dict[str, str] = {}
+        # AI 空间写入口（headless 注入：AI 自己写日记/发说说）
+        self.ai_space: Any | None = None
         self._tasks: set[asyncio.Task] = set()
         self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
@@ -146,6 +150,11 @@ class ChatEngine:
                 if kind == "message":
                     text = str(frame.get("text") or "")
                     if text.strip():
+                        model = str(frame.get("model") or "").strip()
+                        if model:
+                            self._session_models[session_id] = model
+                        elif "model" in frame:
+                            self._session_models.pop(session_id, None)
                         await queue.put((text, device_id))
                 else:
                     await ws.send(encode("error", message="unknown frame type"))
@@ -183,6 +192,20 @@ class ChatEngine:
         sensitive = self._is_sensitive(text)
         channel = cfg.persona_channel
         self._persist_message(session_id, "user", text)
+
+        # AI 自我表达：聊天里"写日记/发说说" → 直接进 AI 空间（不经模型）
+        if self.ai_space is not None and (text.startswith(("写日记", "记日记"))
+                                          or text.startswith(("发说说", "发条说说"))):
+            reply = await asyncio.to_thread(self._ai_self_post, text)
+            self._history[session_id].append(f"用户：{text}")
+            self._history[session_id].append(f"助手：{reply}")
+            await self._push(session_id, "typing", {"state": False})
+            await self._push(session_id, "reply", {
+                "text": reply, "intent": "chat", "model": "ai-space",
+                "provider_kind": "local", "fallback": False,
+            })
+            self._persist_message(session_id, "assistant", reply)
+            return
 
         # W8 / P6.1：媒体意图先回文本 + typing，后台异步生成，不阻塞对话流
         if intent == "media":
@@ -226,6 +249,7 @@ class ChatEngine:
             self._router.complete, prompt,
             intent=intent, session_id=session_id, sensitive=sensitive,
             memory_ids=memory_ids or None,
+            model=self._session_models.get(session_id, ""),
         )
         reply = str(result.get("text") or "")
         self._history[session_id].append(f"用户：{text}")
@@ -254,6 +278,28 @@ class ChatEngine:
         # ⑤ 只有「值得记住」的消息才写长期记忆，且必须经统一 WriteGate
         if self._worth_remembering(text, intent):
             await asyncio.to_thread(self._remember, text, intent)
+
+    # ── AI 自我表达（写日记/发说说，落 AI 空间 kv）────────────────────────
+    def _ai_self_post(self, text: str) -> str:
+        if self.ai_space is None:
+            return "AI 空间还没接好，稍后再试。"
+        try:
+            if text.startswith(("发说说", "发条说说")):
+                body = text.split("说说", 1)[-1].lstrip("：:，, ").strip()
+                image = ""
+                if not body:
+                    return "说说内容是空的，说点什么再发。"
+                result = self.ai_space.write_moment(text=body, image=image)
+                return "说说已发到我的空间。" if result.get("ok") \
+                    else f"发说说失败：{result.get('error', '未知原因')}"
+            body = text.split("日记", 1)[-1].lstrip("：:，, ").strip()
+            if not body:
+                return "想让我写点什么呢？说一句「写日记：今天…」试试。"
+            result = self.ai_space.write_diary(text=body)
+            return "写好了，收进我的日记本了。" if result.get("ok") \
+                else f"写日记失败：{result.get('error', '未知原因')}"
+        except Exception as exc:  # noqa: BLE001  自我表达失败不影响聊天
+            return f"AI 空间写入失败：{type(exc).__name__}: {exc}"
 
     # ── 聊天记录持久化（sessions.db messages 表，v2）─────────────────────
     def _persist_message(self, session_id: str, role: str, text: str) -> None:

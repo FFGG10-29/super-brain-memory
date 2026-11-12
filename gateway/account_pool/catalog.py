@@ -327,6 +327,33 @@ def fetch_workbuddy_models(region: str, access_token: str = "",
 
 
 # ── 目录持久化 ────────────────────────────────────────────────────────────
+# ── 云供应商注册表（xdpool providers-registry.json 原样移植，77 家）────────
+def provider_registry() -> list[dict[str, Any]]:
+    """77 家 API 供应商：{id,name,url,baseUrl,model_count,first_model,models}。"""
+    path = Path(__file__).with_name("providers_registry.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = data if isinstance(data, list) else data.get("providers") or []
+    out: list[dict[str, Any]] = []
+    for row in items:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        models = row.get("models") or []
+        out.append({
+            "id": str(row["id"]),
+            "name": str(row.get("name") or row["id"]),
+            "url": str((row.get("auth") or {}).get("url") or ""),
+            "base_url": str(row.get("baseUrl") or ""),
+            "format": str(row.get("format") or "openai-chat"),
+            "model_count": len(models),
+            "models": [{"id": str(m.get("id") or ""), "name": str(m.get("name") or m.get("id") or "")}
+                       for m in models if isinstance(m, dict) and m.get("id")],
+        })
+    return out
+
+
 def catalog_path() -> Path:
     return user_dir() / "pool" / "catalog.json"
 

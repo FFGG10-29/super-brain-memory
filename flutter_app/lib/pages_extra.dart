@@ -644,15 +644,37 @@ class _FullConfigPageState extends State<FullConfigPage> {
     });
   }
 
+  Timer? _autoSaveTimer;
+  bool _autoSaving = false;
+
   void _put(String section, String field, dynamic value) {
     _draft.putIfAbsent(section, () => <String, dynamic>{})[field] = value;
+    // 自动保存：停止输入 800ms 后落盘（用户点了没反应=没保存，这里修掉）
+    _autoSaveTimer?.cancel();
+    _autoSaveTimer = Timer(const Duration(milliseconds: 800), () {
+      unawaited(_save(auto: true));
+    });
   }
 
-  Future<void> _save() async {
-    final result = await widget.client.setConfig(_draft);
-    if (!mounted) return;
-    setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已保存');
-    await _load();
+  Future<void> _save({bool auto = false}) async {
+    if (_autoSaving || _draft.isEmpty) return;
+    _autoSaving = true;
+    try {
+      final result = await widget.client.setConfig(
+          Map<String, Map<String, dynamic>>.from(_draft));
+      if (!mounted) return;
+      setState(() {
+        if (result['ok'] == true || result['error'] == null) {
+          _message = auto ? '已自动保存' : (result['message']?.toString() ?? '已保存');
+          _draft.clear();
+        } else {
+          _message = result['error']?.toString() ?? '保存失败';
+        }
+      });
+      if (!auto) await _load();
+    } finally {
+      _autoSaving = false;
+    }
   }
 
   Future<void> _restart() async {

@@ -110,9 +110,12 @@ class ChatService {
     });
   }
 
-  /// 发送一条用户消息（{"type":"message","text":...}）。
-  void sendMessage(String text) {
-    _send(<String, dynamic>{'type': 'message', 'text': text});
+  /// 发送一条用户消息（{"type":"message","text":...}；model 非空时指定回复模型）。
+  void sendMessage(String text, {String? model}) {
+    _send(<String, dynamic>{
+      'type': 'message', 'text': text,
+      if (model != null && model.isNotEmpty) 'model': model,
+    });
   }
 
   /// 心跳保活。

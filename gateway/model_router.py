@@ -164,6 +164,56 @@ class ModelRouter:
         on_change(self._on_config_change)
 
     # ── 配置热重载（C8）───────────────────────────────────────────────────
+
+    @staticmethod
+    def _providers_overlay() -> list[dict[str, Any]]:
+        """前端"模型配置"页写入的供应商覆盖（user_dir/model_providers.json）。"""
+        import json
+
+        from core.runtime_paths import user_dir
+
+        path = user_dir() / "model_providers.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    @staticmethod
+    def save_providers_overlay(providers: list[dict[str, Any]]) -> None:
+        import json
+
+        from core.runtime_paths import user_dir
+
+        path = user_dir() / "model_providers.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(providers, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
+    @staticmethod
+    def _task_routes_overlay() -> dict[str, str]:
+        """内部消费者路由覆盖（user_dir/task_routes.json，优先于 config）。"""
+        import json
+
+        from core.runtime_paths import user_dir
+
+        path = user_dir() / "task_routes.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def save_task_routes_overlay(routes: dict[str, str]) -> None:
+        import json
+
+        from core.runtime_paths import user_dir
+
+        path = user_dir() / "task_routes.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(routes, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
     def _on_config_change(self, patches: dict[str, Any]) -> None:
         if "model_router" in patches:
             self.reload()
@@ -199,7 +249,8 @@ class ModelRouter:
                 self._account_pool = None
         if not cfg.enabled:
             return  # B1/Q15：默认不把云供应商放进候选池
-        for item in cfg.providers or []:
+        providers = self._providers_overlay() or list(cfg.providers or [])
+        for item in providers:
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             name = str(item["name"])
@@ -325,6 +376,7 @@ class ModelRouter:
         required_caps: tuple[str, ...] | list[str] = (),
         sensitive: bool = False,
         memory_ids: list[str] | None = None,
+        model: str = "",
     ) -> dict[str, Any]:
         """调用并按 providers 顺序 fallback；429/超时/异常都记事件，不抛给 ChatEngine。
 
@@ -358,6 +410,11 @@ class ModelRouter:
                         "cache_kind": "semantic"}
 
         first = self.route(intent, session_id, caps, sensitive=sensitive)
+        # 用户显式指定模型（聊天页模型选择）：定向调用，不走 intent 路由链。
+        # free:* / 免密 id → 免密 lane；其余 → 号池 failover。失败如实报错，
+        # 不静默换成别的模型（用户点名的是这一个）。
+        if model:
+            return self._complete_explicit(prompt, model, session_id)
         # C07：sticky 已缓存同 (intent, caps) 的 fallback 链就直接复用；
         # 链上每个客户端仍要重跑 _eligible（供应商健康/能力可能变化）。
         now = time.time()
@@ -408,6 +465,59 @@ class ModelRouter:
                     self._on_fallback(event)
         return {"ok": False, "text": "暂时无法生成回复（模型服务不可用）",
                 "model": "", "kind": LOCAL, "fallback": True, "cache_hit": False}
+
+    def complete_task(self, task: str, prompt: str) -> str:
+        """内部消费者（抽取/精排/巩固）按 task_routes 定向调用远程供应商。
+
+        spec："pool:<model>" 走号池 failover；"free:<model>" 走免密 lane；
+        "provider:<name>" 走配置的云供应商。无路由/失败抛异常，由调用方回落本地。
+        """
+        spec = str((self._task_routes_overlay()
+                    or self._config.model_router.task_routes or {}).get(task) or "")
+        if not spec:
+            raise RuntimeError(f"任务 {task} 未配置远程路由")
+        if spec.startswith("pool:"):
+            pool = self._account_pool
+            if pool is None:
+                raise RuntimeError("号池未装配")
+            return pool.complete(prompt, model=spec.split(":", 1)[1])
+        if spec.startswith("free:"):
+            pool = self._account_pool
+            if pool is None:
+                raise RuntimeError("号池未装配")
+            return pool.free_chat(prompt, model=spec.split(":", 1)[1])
+        if spec.startswith("provider:"):
+            name = spec.split(":", 1)[1]
+            for client in self._pool:
+                if client.name == name:
+                    return client.complete(prompt)
+            raise RuntimeError(f"供应商不存在：{name}")
+        raise RuntimeError(f"非法路由 spec：{spec}")
+
+    def _complete_explicit(self, prompt: str, model: str, session_id: str) -> dict[str, Any]:
+        """定向调用用户点名的模型（free:*/免密 id → 免密 lane；其余 → 号池）。"""
+        from gateway.account_pool.catalog import is_free_lane
+
+        pool = self._account_pool
+        if pool is None:
+            return {"ok": False, "text": "号池未装配（.env 设 POOL_ENABLED=true 并重启后端）",
+                    "model": model, "kind": "pool", "fallback": True, "cache_hit": False}
+        base = model.split(":", 1)[1] if model.startswith("free:") else model
+        started = time.perf_counter()
+        try:
+            if model.startswith("free:") or is_free_lane(base):
+                text = pool.free_chat(prompt, model=base)
+                kind = "free"
+            else:
+                text = pool.complete(prompt, model=base)
+                kind = "pool"
+            return {"ok": True, "text": text, "model": base, "kind": kind,
+                    "fallback": False, "cache_hit": False,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+        except Exception as exc:  # noqa: BLE001  定向失败如实报错，不换模型
+            return {"ok": False, "text": f"调用 {base} 失败：{exc}",
+                    "model": base, "kind": "pool", "fallback": True,
+                    "cache_hit": False}
 
 
 _router: ModelRouter | None = None
