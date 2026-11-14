@@ -25,8 +25,7 @@ from config import BrainConfig, ChatConfig
 from gateway.mcp_server import MCPToolkit
 from models.neuron import Neuron
 
-GAP_INSTRUCTION = ("（记忆库中没有与该问题直接相关的记录："
-                   "请坦承你不确定，并询问对方补充信息，不要编造。）")
+GAP_INSTRUCTION = ("（记忆库中没有与该问题直接相关的记录：如实说明不确定，不要编造具体细节。）")
 TRUST_NOTE = "记忆来源可信度：user=1.0 agent=0.9 document=0.8"
 
 
@@ -78,6 +77,17 @@ class FakeHippocampus:
             admission=SimpleNamespace(reason="new", duplicate_of=""),
             neuron=Neuron(agent_id=agent_id, content=content, namespace="topic:default"),
         )
+
+    def remember_bundle(self, bundle, *, agent_id: str = "", namespace: str = ""):
+        self.cognitions.append({"content": "|".join(i.content for i in bundle.items),
+                                "agent_id": agent_id, "namespace": namespace,
+                                "bundle": True, "complexity": getattr(bundle, "complexity", "")})
+        return {"applied": len(bundle.items), "total": len(bundle.items),
+                "neuron_ids": ["n-mock"], "handled": True,
+                "complexity": getattr(bundle, "complexity", "")}
+
+    def _defer_orphan(self, content, agent_id, cognition=None):
+        self.cognitions.append({"content": content, "deferred": True, "agent_id": agent_id})
 
 
 class FakeRegistry:
@@ -136,9 +146,10 @@ def test_recall_fast_path_knowledge_gap_is_none() -> None:
         assert method == "recall"
         return {"hits": [{"id": "n1", "content": "投影记忆", "score": 0.5}]}
 
+    # v4.1 默认已走六通道；要测 fast 兼容路径必须显式 deep=false。
     result = _call(
         _toolkit(pf, FakeRelational(), rpc_fallback=fake_rpc),
-        "recall_memory", {"query": "q"},
+        "recall_memory", {"query": "q", "deep": False},
     )
     assert result["recall_mode"] == "projection"
     assert result["knowledge_gap"] is None
@@ -161,9 +172,10 @@ def test_fast_hits_without_agent_id_default_trust() -> None:
     def fake_rpc(method: str, args: dict) -> dict:
         return {"hits": [{"id": "n1", "content": "投影记忆", "score": 0.5}]}
 
+    # v4.1 默认六通道；fast 兼容路径需显式 deep=false。
     result = _call(
         _toolkit(FakePrefrontal(), FakeRelational(), rpc_fallback=fake_rpc),
-        "recall_memory", {"query": "q"},
+        "recall_memory", {"query": "q", "deep": False},
     )
     assert result["hits"][0]["source"] == ""
     assert result["hits"][0]["trust"] == 0.8
@@ -299,16 +311,30 @@ def _engine(tmp_path, toolkit, router) -> tuple[ChatEngine, WriteGate, SessionRe
     return engine, gate, sessions
 
 
-def test_chat_engine_appends_gap_instruction_to_prompt_end(tmp_path) -> None:
+def test_chat_engine_chat_intent_is_persona_first_without_gap(tmp_path) -> None:
+    """聊天意图：完整人格剧本置顶、不追加 gap 指令、不塞检索硬约束（否则大肥鱼变机械）。"""
     toolkit, router = GapToolkit(), PromptCapturingRouter()
     engine, gate, sessions = _engine(tmp_path, toolkit, router)
     asyncio.run(engine._handle_message("s1", "你好", "d1"))
-    assert router.prompts and router.prompts[0].endswith(GAP_INSTRUCTION)
+    prompt = router.prompts[0]
+    assert prompt.startswith("【大肥鱼人格"), "人格剧本必须置顶"
+    assert "说话方式" in prompt, "必须带完整行为剧本而非 263 字元数据"
+    assert GAP_INSTRUCTION not in prompt, "闲聊不得追加 gap 指令"
+    assert "未命中的细节按未知处理" not in prompt, "闲聊必须剥离检索硬约束"
+    assert "注入文本" in prompt, "记忆片段仍要保留做回忆背景"
+    gate.shutdown(timeout=5)
+    sessions.close()
 
-    # 无 gap（fast 路径未带字段）时不追加
-    toolkit.gap = False
-    asyncio.run(engine._handle_message("s1", "你好", "d1"))
-    assert not router.prompts[1].endswith(GAP_INSTRUCTION)
+
+def test_chat_engine_factual_intent_appends_gap_to_prompt_end(tmp_path) -> None:
+    """事实/回忆意图：保留 gap 指令防编造（人格仍置顶当风格层）。"""
+    toolkit, router = GapToolkit(), PromptCapturingRouter()
+    engine, gate, sessions = _engine(tmp_path, toolkit, router)
+    asyncio.run(engine._handle_message("s1", "三个月前我们聊过的那件事", "d1"))
+    prompt = router.prompts[0]
+    assert prompt.startswith("【大肥鱼人格")
+    assert GAP_INSTRUCTION in prompt, "事实查询应追加 gap 指令"
+    assert prompt.index(GAP_INSTRUCTION) < prompt.index("用户："), "gap 指令应在本轮用户消息之前"
     gate.shutdown(timeout=5)
     sessions.close()
 

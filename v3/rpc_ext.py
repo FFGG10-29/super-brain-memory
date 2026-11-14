@@ -746,6 +746,12 @@ class RpcExtension:
                         and _time.time() * 1000 - (cached.get("saved_at_ms") or 0) < 3_600_000)
         if cached is not None and fresh_enough:
             cached["cached"] = True
+            # ★ 设置类数据（模型开关/偏好）绝不走缓存：缓存只承载上游模型目录。
+            #   disabled_models/model_prefs 一律取 pool 实时持久态（accounts.json），
+            #   否则 1h 旧缓存会把用户刚改的开关"弹回去"。
+            pool = self._account_pool()
+            cached["disabled_models"] = sorted(getattr(pool, "disabled_models", None) or ())
+            cached["model_prefs"] = dict(getattr(pool, "model_prefs", None) or {})
             return cached
         pool = self._account_pool()
         account = next((a for a in (getattr(pool, "accounts", None) or [])
@@ -785,6 +791,8 @@ class RpcExtension:
                 ctx_budget=None if ctx_budget in (None, 0) else int(ctx_budget),
                 image=None if image is None else bool(image),
                 thinking=thinking)
+            # 设置走 accounts.json 持久层 + pool 内存实时态；目录缓存不再承载设置，
+            # _pool_catalog 缓存命中时也会实时覆盖 disabled_models/model_prefs。
             return {"ok": True, "model_id": model_id, "pref": pref}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -817,6 +825,77 @@ class RpcExtension:
         ok_count = sum(1 for r in results if r.get("ok"))
         return {"ok": ok_count > 0, "results": results,
                 "ok_count": ok_count, "total": len(results)}
+
+    # ── 浏览器 OAuth 闭环（复用 wbmod 号池网关 :8750，经 7741 代理）───────
+    _WBMOD_POOL_BASE = "http://127.0.0.1:7741/xdpool/api"
+
+    def _pool_oauth_start(self, region: str = "cn", **_: Any) -> dict[str, Any]:
+        """★ 浏览器扫码登录（超级大脑缺的闭环，现补上）。
+
+        直接复用 wbmod 号池网关的 oauth/start：拿 state + authUrl，用系统默认浏览器
+        打开 codebuddy.cn 让用户扫码。凭证由网关落进共享 vault（vendor/xdpool-gateway/vault），
+        Python 号池 discover 已扫该目录（store.discover_accounts extra_auth_dirs）。
+        不重复实现 OAuth 加密/落盘，两边共享一份凭证。
+        """
+        import json as _json
+        import os as _os
+        import urllib.request as _urllib
+
+        region = "global" if str(region).lower() == "global" else "cn"
+        try:
+            req = _urllib.Request(
+                f"{self._WBMOD_POOL_BASE}/oauth/start",
+                data=b'{"region":"' + region.encode() + b'"}',
+                headers={"Content-Type": "application/json"}, method="POST")
+            with _urllib.urlopen(req, timeout=40) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False,
+                    "error": f"OAuth 启动失败（需 wbmod 号池网关在 :8750 运行）："
+                             f"{type(exc).__name__}: {exc}"}
+        auth_url = str(data.get("authUrl") or "")
+        login_id = str(data.get("loginId") or "")
+        if not auth_url or not login_id:
+            return {"ok": False, "error": f"网关未返回登录会话：{data}"}
+        try:
+            _os.startfile(auth_url)  # noqa: S606  Windows 默认浏览器扫码
+            opened = True
+        except OSError:
+            opened = False  # 仍返回 url，前端可提示手动打开
+        return {"ok": True, "loginId": login_id, "authUrl": auth_url,
+                "opened": opened, "expiresIn": data.get("expiresIn", 300),
+                "hint": "浏览器已打开，扫码确认后点「完成登录」；凭证自动入池"
+                        + ("" if opened else "（自动打开失败，请手动复制链接）")}
+
+    def _pool_oauth_poll(self, login_id: str = "", **_: Any) -> dict[str, Any]:
+        """轮询 OAuth 扫码结果；成功后触发 Python 号池 rescan 让新账号立即出现。"""
+        import json as _json
+        import urllib.parse as _parse
+        import urllib.request as _urllib
+
+        login_id = str(login_id or "")
+        if not login_id:
+            return {"ok": False, "done": True, "error": "缺少 loginId"}
+        try:
+            url = f"{self._WBMOD_POOL_BASE}/oauth/poll?loginId={_parse.quote(login_id)}"
+            with _urllib.urlopen(url, timeout=40) as resp:
+                out = _json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "done": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        done = bool(out.get("done"))
+        if done and out.get("account"):
+            pool = self._account_pool()
+            if pool is not None:
+                try:
+                    pool.discover()  # 凭证已落共享 vault → 重新扫描入池
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"ok": True, "done": True, "account": out["account"],
+                    "hint": "登录成功，账号已入池"}
+        if done and out.get("error"):
+            return {"ok": False, "done": True, "error": out["error"]}
+        return {"ok": True, "done": False}  # 用户还在扫码，继续轮询
 
     def _pool_login_start(self, **_: Any) -> dict[str, Any]:
         """拉起 WorkBuddy 桌面端完成登录；登录态落盘后「重新扫描凭证」入池。"""
@@ -915,7 +994,12 @@ class RpcExtension:
                              kind: str = "cloud", model: str = "",
                              caps: list[str] | None = None,
                              api_key: str = "", **_: Any) -> dict[str, Any]:
-        """新增/更新云供应商（key 存 secret store，明文不落配置）。"""
+        """新增/更新云供应商（key 存 secret store，明文不落配置）。
+
+        2026-11-12：保存供应商后自动打开 model_router.enabled 并即时 reload——
+        否则默认 enabled=False 会让填了 key 的供应商永远不进候选池，
+        前端却提示"已保存可用"造成假成功。这是"填 key 就能用"的兑现点。
+        """
         name = str(name or "").strip()
         if not name:
             return {"ok": False, "error": "缺少 name"}
@@ -929,8 +1013,14 @@ class RpcExtension:
         router.save_providers_overlay(providers)
         if api_key:
             self._secret_set(f"model_router.{name}", str(api_key))
+        # 填了 key 就自动启用云路由（写 config.json + 触发 on_change → router.reload）
+        if not cfg.enabled:
+            from core.user_config import apply_overrides, save_overrides
+            merged = save_overrides({"model_router": {"enabled": True}})
+            apply_overrides(self._daemon._config, merged)
         router.reload()
-        return {"ok": True, "name": name}
+        return {"ok": True, "name": name, "router_enabled": bool(
+            self._daemon._config.model_router.enabled)}
 
     def _router_provider_delete(self, name: str = "", **_: Any) -> dict[str, Any]:
         router = self._router()
@@ -980,7 +1070,33 @@ class RpcExtension:
         manager = get_cache_manager()
         if manager is None:
             return {"ok": True, "available": False}
-        return {"ok": True, "available": True, **manager.snapshot_metrics()}
+        snapshot = dict(manager.snapshot_metrics())
+        # ★ 聊天记忆缓冲伪 ns 卡片（2026-11-12 用户裁决：缓冲必须看得见）——
+        #   它不是 CacheManager 命名空间，是 ChatEngine 的内存批量缓冲（满 8 条
+        #   且静默 ≥3 分钟 / 最长 30 分钟兜底才批量落库），进缓存页统一展示。
+        engine = getattr(self._daemon, "chat_engine", None)
+        if engine is not None and hasattr(engine, "mem_status"):
+            try:
+                st = engine.mem_status()
+                snapshot.setdefault("namespaces", {})["chat_mem_buffer"] = {
+                    "enabled": True, "entries": int(st.get("buffer_len") or 0),
+                    "capacity": int(st.get("batch") or 8),
+                    "hit_rate": 0.0, "hits": 0, "misses": 0,
+                    "evictions": 0, "invalidations": 0, "avg_latency_us": 0,
+                    "media": "内存",
+                    "consumer": (
+                        "聊天记忆缓冲（大肥鱼聊天）——攒满 "
+                        f"{st.get('batch')} 条且你静默 ≥{int((st.get('silence_sec') or 0)/60)} 分钟，"
+                        f"或最长 {int((st.get('max_idle_sec') or 0)/60)} 分钟兜底，"
+                        "才批量提炼成叙事存进记忆（不是逐条存）"),
+                    "buffer_since": st.get("buffer_since") or 0,
+                    "last_message_ts": st.get("last_message_ts") or 0,
+                    "last_flush_ts": st.get("last_flush_ts") or 0,
+                    "flushing": bool(st.get("flushing")),
+                }
+            except Exception:  # noqa: BLE001  聊天引擎没起就不加这张卡
+                pass
+        return {"ok": True, "available": True, **snapshot}
 
     def _cache_toggle(self, ns: str = "", enabled: bool = True, **_: Any) -> dict[str, Any]:
         """缓存页运行时开关：per-ns 覆盖，不落盘（重启回到 config）。"""

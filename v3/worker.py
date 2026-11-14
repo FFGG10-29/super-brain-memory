@@ -87,26 +87,64 @@ class V3Worker:
             # ★ A 包：把 journal 里的 namespace 一路带到落库，
             #   否则 handle_event 收到的 topic:<id> 会在 worker 丢失、全落 private。
             _ns = str(payload.get("namespace") or row.get("namespace") or "topic:default")
-            result = self._execute(lambda: self._app.hippocampus.remember(
-                str(row["content"]), agent_id=str(row["agent_id"]),
-                namespace=_ns, emit_event=False, use_llm=self._use_llm,
-            ))
+            # ★ 一进多出铁律（2026-11-12 漏网修补）：worker 是 RPC save_memory 的异步落地口，
+            #   此前直接 remember() 单条裸写，绕过拆分。现统一过 ingest_guard：
+            #   - 前置 bundle 事件（WorkBuddy 侧已拆）→ 白名单校验后直接 remember_bundle；
+            #   - 带结构化 cognition 的单条（已判密度=1，如迁移/系统契约）→ 带 _from_bundle 放行；
+            #   - 原始输入（裸文本 / 原始对话）→ extract_multi 兜底拆分，失败留项目档案。
+            from brain.ingest_guard import classify as _classify
+            from brain.router_extractor import RouterExtractor
+            from engine.local_llm import DisabledLLM
+            from config import get_config
+
+            _cognition = payload.get("cognition") or row.get("cognition")
+            _cognition = _cognition if isinstance(_cognition, dict) else None
+            _pre_bundle = payload.get("bundle") or row.get("bundle")
+            _pre_bundle = _pre_bundle if isinstance(_pre_bundle, dict) else None
+            plan = _classify(cognition=_cognition, bundle=_pre_bundle,
+                             content=str(row["content"]))
+            extractor = RouterExtractor(DisabledLLM(), get_config())
+
+            def do_ingest() -> dict[str, Any]:
+                if plan.mode == "bundle":
+                    bundle = extractor.bundle_from_payload(plan.bundle or {})
+                elif plan.mode == "single":
+                    # 单条认知契约：进程内派生/迁移，语义上已是 bundle 的一个成员
+                    self._app.hippocampus.remember(
+                        str(row["content"]), agent_id=str(row["agent_id"]),
+                        namespace=_ns, cognition=plan.cognition, _from_bundle=True,
+                        emit_event=False,
+                    )
+                    return {"_single": True}
+                else:
+                    bundle = extractor.extract_multi(
+                        str(row["content"]), agent_id=str(row["agent_id"]))
+                return self._app.hippocampus.remember_bundle(
+                    bundle, agent_id=str(row["agent_id"]),
+                    namespace=_ns, emit_event=False,
+                )
+
+            br = self._execute(do_ingest)
+            if isinstance(br, dict) and not br.get("_single") \
+                    and not br.get("handled", br.get("applied", 0) > 0):
+                # 不合规/抽取失败 → 留项目档案待夜间重试，绝不降级单条裸写
+                try:
+                    self._app.hippocampus._defer_orphan(
+                        str(row["content"]), str(row["agent_id"]), _cognition)
+                except Exception:  # noqa: BLE001
+                    pass
             ok = self._inbox.finish(event_id, self.worker_id, ok=True)
             if not ok:
                 return  # 租约被抢，丢弃结果，防双花
             self.processed += 1
             if self._hub is not None:
                 payload = {
-                    "type": "node_created" if result.applied else "node_rejected",
+                    "type": "ingested",
                     "event_id": event_id,
-                    "id": result.neuron.uuid7_id,
-                    "content": result.neuron.content,
-                    "memory_type": result.neuron.memory_type,
-                    "tier": result.neuron.tier,
-                    "pad": result.neuron.pad.as_tuple(),
-                    "reason": result.admission.reason,
-                    "superseded": result.superseded,
-                    "merge": (result.merge.action if result.merge else "add"),
+                    "mode": plan.mode,
+                    "applied": (br.get("applied", 0) if isinstance(br, dict) else 1),
+                    "complexity": (br.get("complexity") if isinstance(br, dict) else None),
+                    "content": str(row["content"])[:120],
                 }
                 self._hub.broadcast(payload)
         except FutureTimeout:

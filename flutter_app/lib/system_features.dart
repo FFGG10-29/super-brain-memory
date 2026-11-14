@@ -8,8 +8,9 @@ import 'win32.dart';
 
 const Color _hint = Color(0xFF8FA6C4);
 
-/// 桌面能力：托盘驻留 / 开机自启 / 密钥保管 / 数据目录一键迁移。
-/// 这四项全部由后端 core.* RPC 提供，Flutter 完全等价。
+/// 桌面能力：托盘驻留 / 开机自启 / 数据目录一键迁移。
+/// 密钥已拆分：GitHub PAT→「同步与备份」，模型 API Key→「模型配置」，均存系统钥匙串。
+/// 这三项全部由后端 core.* RPC 提供，Flutter 完全等价。
 class SystemFeaturesPage extends StatefulWidget {
   const SystemFeaturesPage({super.key, required this.client});
   final BrainClient client;
@@ -20,23 +21,11 @@ class SystemFeaturesPage extends StatefulWidget {
 
 class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
   final TextEditingController _target = TextEditingController();
-  final Map<String, TextEditingController> _secretInputs = <String, TextEditingController>{
-    'github_pat': TextEditingController(),
-    'deepseek_api_key': TextEditingController(),
-    'openai_api_key': TextEditingController(),
-  };
   Map<String, dynamic> _tray = <String, dynamic>{};
   Map<String, dynamic> _autostart = <String, dynamic>{};
-  Map<String, dynamic> _secrets = <String, dynamic>{};
   Map<String, dynamic> _data = <String, dynamic>{};
   String _message = '—';
   bool _busy = false;
-
-  static const Map<String, String> _secretLabels = <String, String>{
-    'github_pat': 'GitHub PAT（同步仓库用）',
-    'deepseek_api_key': 'DeepSeek API Key',
-    'openai_api_key': 'OpenAI / 兼容端点 API Key',
-  };
 
   @override
   void initState() {
@@ -47,9 +36,6 @@ class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
   @override
   void dispose() {
     _target.dispose();
-    for (final controller in _secretInputs.values) {
-      controller.dispose();
-    }
     super.dispose();
   }
 
@@ -58,15 +44,13 @@ class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
     final results = await Future.wait<dynamic>(<Future<dynamic>>[
       widget.client.trayStatus(),
       widget.client.autostartStatus(),
-      widget.client.secretsStatus(),
       widget.client.dataStatus(),
     ]);
     if (!mounted) return;
     setState(() {
       _tray = _map(results[0]);
       _autostart = _map(results[1]);
-      _secrets = _map(results[2]);
-      _data = _map(results[3]);
+      _data = _map(results[2]);
       _busy = false;
       _message = '状态已刷新';
     });
@@ -95,24 +79,6 @@ class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
   Future<void> _toggleAutostart(bool enabled) async {
     final result = await widget.client.setAutostart(enabled, Platform.resolvedExecutable);
     _say(result['message']?.toString() ?? result['error']?.toString() ?? '自启状态已更新');
-    await _loadAll();
-  }
-
-  Future<void> _saveSecret(String account) async {
-    final value = _secretInputs[account]?.text.trim() ?? '';
-    if (value.isEmpty) {
-      _say('输入为空，未改动 $account');
-      return;
-    }
-    final result = await widget.client.writeSecret(account, value);
-    _secretInputs[account]?.clear();
-    _say('${result['ok'] == true ? '已保存' : '保存失败'} $account · 后端 ${result['backend'] ?? '—'}');
-    await _loadAll();
-  }
-
-  Future<void> _deleteSecret(String account) async {
-    await widget.client.deleteSecret(account);
-    _say('已删除 $account');
     await _loadAll();
   }
 
@@ -202,64 +168,7 @@ class _SystemFeaturesPageState extends State<SystemFeaturesPage> {
                   style: TextStyle(color: Color(0xFF5D7690), fontSize: 10, height: 1.6)),
             ]),
             const SizedBox(height: 12),
-            _card('密钥保管', <Widget>[
-              _row('后端', _secrets['backend']?.toString() ?? '—'),
-              const SizedBox(height: 6),
-              const Text('优先系统钥匙串，不可用则 DPAPI 加密文件（仅当前 Windows 用户可解）。'
-                  ' 页面只显示「是否已保存」，绝不回显明文。',
-                  style: TextStyle(color: Color(0xFF5D7690), fontSize: 10, height: 1.6)),
-              const SizedBox(height: 10),
-              for (final entry in _secretInputs.entries) ...<Widget>[
-                Builder(builder: (context) {
-                  final saved = ((_secrets['accounts'] as Map<String, dynamic>? ?? <String, dynamic>{})[entry.key] == true);
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: Row(
-                      children: <Widget>[
-                        SizedBox(
-                          width: 190,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: <Widget>[
-                              Text(_secretLabels[entry.key] ?? entry.key,
-                                  style: const TextStyle(color: _hint, fontSize: 11)),
-                              Text(saved ? '● 已保存' : '○ 未保存',
-                                  style: TextStyle(color: saved ? const Color(0xFF3DDC84) : const Color(0xFF5D7690), fontSize: 10)),
-                            ],
-                          ),
-                        ),
-                        Expanded(
-                          child: TextField(
-                            controller: entry.value,
-                            obscureText: true,
-                            style: const TextStyle(color: Colors.white, fontSize: 12),
-                            decoration: const InputDecoration(
-                              hintText: '输入新值（留空不修改）',
-                              hintStyle: TextStyle(color: Color(0xFF5D7690), fontSize: 10),
-                              border: OutlineInputBorder(),
-                              isDense: true,
-                              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: () => _saveSecret(entry.key),
-                          child: const Text('保存'),
-                        ),
-                        const SizedBox(width: 6),
-                        IconButton(
-                          tooltip: '删除',
-                          onPressed: () => _deleteSecret(entry.key),
-                          icon: const Icon(Icons.delete_outline, color: _hint, size: 18),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-              ],
-            ]),
-            const SizedBox(height: 12),
+            // 密钥保管已拆分：GitHub PAT 在「同步与备份」页；模型 API Key 在「模型配置」页。
             _card('数据目录一键迁移', <Widget>[
               _row('当前目录', _data['current']?.toString() ?? '—'),
               _row('文件 / 大小', '${_data['files'] ?? '—'} 个 / ${_data['size_mb'] ?? '—'} MB'),

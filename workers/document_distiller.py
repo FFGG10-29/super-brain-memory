@@ -70,6 +70,10 @@ def _extract_neuron_ids(result: Any) -> list[str]:
         for key in ("id", "memory_id", "neuron_id"):
             if result.get(key):
                 ids.append(str(result[key]))
+        # 一进多出 bundle 结果：applied 计数 + neuron_ids 列表（一拆多产出）
+        for nid in (result.get("neuron_ids") or []):
+            if nid:
+                ids.append(str(nid))
         for item in (result.get("event_ids") or []):
             if item:
                 ids.append(str(item))
@@ -87,6 +91,12 @@ def distill_one(doc_id: str, save_memory_fn: Callable[..., Any], *,
     if not full.get("ok"):
         return {"ok": False, "error": full.get("error")}
     content = full.get("content", "")
+    # ★ 系统文档绝不蒸馏（2026-11-12 用户裁决）：[待重试 是"一进多出失败留档"
+    #   （蒸馏必然再失败→再留档→死循环）；[人格基线 是 L0 人格骨架只读档案。
+    #   它们"已前置拆分/永不入池"的语义由标题标记，不靠 doc_distill 缓存。
+    if str(full.get("title") or "").startswith(("[待重试", "[人格基线")):
+        return {"ok": True, "written": 0, "skipped": 0, "cache_hits": 0,
+                "archived": False, "skipped_system_doc": True}
     cache_key = _content_hash(content)
     mgr = get_cache_manager()
     # C02：同内容文档二次蒸馏直接命中缓存，跳过 LLM 提炼（written=0, skipped=0）
@@ -201,6 +211,15 @@ def _invalidate_doc_cache(doc_id: str) -> int:
 
 
 def enqueue_document(doc_id: str) -> None:
+    # ★ [待重试 档案禁止蒸馏（2026-11-12）：它们是"一进多出失败留档"，蒸馏必然
+    #   再失败 → 再留档 → 死循环。双保险：context_layers 触发侧已拦一道。
+    try:
+        from core.context_layers import get_context_layers
+        doc = get_context_layers().documents_read(str(doc_id))
+        if str(doc.get("title") or "").startswith("[待重试"):
+            return
+    except Exception:  # noqa: BLE001  读不到就放行（后续 distill_one 还有一道）
+        pass
     # 文档内容已变化：先精确失效旧内容 hash 的缓存条目（防内容回退 A→B→A 时命中过期产出），
     # 再投递后台队列重新提炼
     _invalidate_doc_cache(doc_id)

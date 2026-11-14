@@ -132,6 +132,36 @@ def test_recall_for_agent_exposes_narratives_and_degraded(brain_factory) -> None
     assert isinstance(result["narratives"], list)
 
 
+def test_recall_defaults_to_six_channel_without_explicit_deep(brain_factory) -> None:
+    """v4.1：全入口默认六通道。不传 deep 也必须走 six-channel（快速投影退出主路径）。"""
+    brain, ids, _ = _prepared(brain_factory)
+    registry = AgentRegistry(brain.storage.kv, timeseries=brain.storage.timeseries,
+                             config=brain.config)
+    _, token = registry.register("default-deep")
+    agent = registry.verify(token)
+    toolkit = MCPToolkit(
+        registry=registry, hippocampus=brain.hippocampus,
+        prefrontal=brain.prefrontal, relational=brain.storage.relational,
+        config=brain.config,
+    )
+    # 关键：不传 deep 键
+    result = toolkit.recall_for_agent(agent, {"query": "项目发版 缓存方案", "channel": "workbuddy"})
+    assert result.get("recall_mode") == "six-channel", (
+        f"默认应走六通道，实际={result.get('recall_mode')}")
+    assert "narratives" in result and "knowledge_gap" in result
+    # 显式 deep=false 且装配了 rpc_fallback 时才降级快速投影（兼容路径仍在）。
+    # 注意：无 fallback 时即使 deep=false 也会强制六通道（见 mcp_server 的
+    # `if deep or self._rpc_fallback is None`），这是"快速投影退出主路径"的兜底。
+    fast_toolkit = MCPToolkit(
+        registry=registry, hippocampus=brain.hippocampus,
+        prefrontal=brain.prefrontal, relational=brain.storage.relational,
+        config=brain.config,
+        rpc_fallback=lambda method, args: {"hits": [{"id": "n", "content": "投影", "score": 0.5}]},
+    )
+    fast = fast_toolkit.recall_for_agent(agent, {"query": "项目发版 缓存方案", "deep": False})
+    assert fast.get("recall_mode") == "projection"
+
+
 # ── C3：精排预算 ─────────────────────────────────────────────────────────
 def test_rerank_budget_matches_15s_target(brain_config) -> None:
     assert brain_config.recall.rerank_top_n == 20

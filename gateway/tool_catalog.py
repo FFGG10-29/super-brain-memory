@@ -88,14 +88,51 @@ _COGNITION_SCHEMA: dict[str, Any] = {
     },
 }
 
+# ★ 前置拆分契约（与「前置 PAD 注入」同款，WorkBuddy 侧完成认知判定）：
+# 对话大模型按 router_extractor._MULTI_SYSTEM_PROMPT 把一条输入拆成一组后随
+# save_memory 的 bundle 入参提交；后端 bundle_from_payload 白名单校验后直接
+# remember_bundle，跳过 extract_multi（本地 0.6B / 远程抽取模型），零拆分开销。
+_BUNDLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": "★ WorkBuddy 侧前置拆分结果（可选）：提供后端跳过 extract_multi，直接按信息密度落组。items 最多 5 条，按信息密度 1~N 条（light 1~2 / heavy 3~5）；事务性填 transactional=true，寒暄填 ephemeral=true。不提供则后端兜底拆分。",
+    "properties": {
+        "complexity": {"type": "string", "enum": ["none", "light", "heavy"],
+                       "description": "信息密度分级，决定拆解粒度"},
+        "transactional": {"type": "boolean", "description": "事务性（代码/配置/路径）→覆盖式，不进认知池"},
+        "ephemeral": {"type": "boolean", "description": "寒暄/系统指令→不进长期记忆"},
+        "summary": {"type": "string", "description": "事务性摘要"},
+        "raw_content": {"type": "string", "description": "事务性原文（overwrite 用）"},
+        "media_attachments": {"type": "array", "items": {"type": "string"},
+                              "description": "媒体附件路径"},
+        "items": {"type": "array", "description": "拆出的记忆组",
+                  "items": {"type": "object", "properties": {
+                      "memory_type": {"type": "string",
+                                      "enum": ["fact", "code", "scenario", "emotion", "profile"]},
+                      "content": {"type": "string", "description": "规范化陈述（第三人称，非原文照抄）"},
+                      "pad": {"type": "object", "properties": {
+                          "p": {"type": "number"}, "a": {"type": "number"}, "d": {"type": "number"}}},
+                      "confidence": {"type": "number"},
+                      "entities": {"type": "array", "items": {"type": "object", "properties": {
+                          "name": {"type": "string"}, "type": {"type": "string"}}}},
+                      "requires_hyperedge": {"type": "boolean"},
+                  }, "required": ["memory_type", "content"]}},
+        "event": {"type": "object", "description": "事件骨架 {event_summary, members:[实体名]}；仅交互 scenario ≥2 主体时给",
+                  "properties": {
+                      "event_summary": {"type": "string"},
+                      "members": {"type": "array", "items": {"type": "string"}}}},
+    },
+    "required": ["items"],
+}
+
 
 # ── 原有 6 个核心工具（保持名字与契约不变）────────────────────────────────
 CORE_TOOL_DEFS: list[dict[str, Any]] = [
-    _t("save_memory", "写入一条记忆：自动分类、SimHash 去重、PAD 情绪标注、六引擎落库；同事项演进自动语义合并裁决（add/update/merge/skip，收敛为单条不无限追加版本）；可传 cognition 认知契约由调用方直接供给 PAD/分类/实体/主题分区（跳过本地 0.6B 抽取，合并裁决仍执行）",
+    _t("save_memory", "写入记忆：一进多出铁律（按信息密度拆 1~5 条+事件超边，不符合原文留项目档案待重试）。★ WorkBuddy 侧可前置拆分整组随 bundle 提交，后端跳过 extract_multi 零开销落组（与前置 PAD 同款）；也可只传 cognition 单条契约（已判密度=1）；两者都不传则后端兜底拆分。SimHash 去重 + PAD + 六引擎落库；同事项演进语义合并裁决（add/update/merge/skip）。category=qq_chat/user_chat/chat 的原始对话即便带 cognition 也强制拆分",
        {"content": _d("content", "记忆正文"), "agent_id": _d("agent_id", "调用方标识"),
         "topic": _d("topic", "主题分区 id（也可写在 cognition.topic）"),
         "persona_write": _d("persona_write", "L0 人格层写入显式授权，默认 false", _B),
-        "cognition": _COGNITION_SCHEMA}, ["content"]),
+        "cognition": _COGNITION_SCHEMA,
+        "bundle": _BUNDLE_SCHEMA}, ["content"]),
     _t("recall_memory", "召回记忆：默认走只读投影的 2-gram 召回（毫秒级）；deep=true 才走六通道精排。topics 可下推按类召回省开销；channel=bot 时全量可读并注入 L0 人格层",
        {"query": _d("query", "查询语句"), "limit": _d("limit", "返回条数，默认 3", _I),
         "deep": _d("deep", "是否启用六通道精排，默认 false", _B),

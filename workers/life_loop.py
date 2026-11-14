@@ -86,6 +86,7 @@ class LifeLoop:
         save_memory: Callable[..., Any] | None = None,
         event_log: EventLog | None = None,
         plasticity: SynapticPlasticity | None = None,
+        ingest_bundle: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> None:
         self._timeseries = timeseries
         self._relational = relational
@@ -95,6 +96,8 @@ class LifeLoop:
         self._save_memory = save_memory
         self._event_log = event_log      # E3：读 supersede 事件统计被纠正次数
         self._plasticity = plasticity or SynapticPlasticity(config=self._config)
+        # 一进多出夜间重试：注入 (content, agent_id) -> {"ok": bool} 的重 ingest 回调
+        self._ingest_bundle = ingest_bundle
 
     def emotional_review(self, *, since_ms: int | None = None, agent_id: str | None = None) -> EmotionalReview:
         since = _now_ms() - int(_MS_PER_DAY * 1000) if since_ms is None else int(since_ms)
@@ -295,6 +298,59 @@ class LifeLoop:
         return _distill_documents(
             self._save_memory, limit=limit, agent_id=agent_id, namespace=namespace
         )
+
+    def retry_pending_ingest(self, *, limit: int = 100) -> dict[str, Any]:
+        """夜间空闲窗口：把「待重试·一进多出」项目档案里的原文重新一进五。
+
+        成功条目从文档移除（已入池），失败条目保留等下一轮；全部成功则归档该文档。
+        不物理删除任何记忆/档案，符合"清洗/重试可回退"纪律。
+        """
+        if self._ingest_bundle is None:
+            return {"ok": False, "error": "未注入 ingest_bundle，跳过一进多出重试"}
+        from core.context_layers import get_context_layers
+
+        otm = getattr(self._config, "one_to_many", None)
+        title = getattr(otm, "retry_doc_title", "[待重试·一进多出] 未入池的对话原文")
+        layers = get_context_layers()
+        doc = next((d for d in layers.documents_list(keyword=title)
+                    if d.get("title") == title and not d.get("archived")), None)
+        if doc is None:
+            return {"ok": True, "pending": 0, "retried": 0, "succeeded": 0}
+        full = layers.documents_read(doc["id"]).get("content", "")
+        # 按 --- 分隔条目；首段是标题行（# 待重试...），跳过
+        chunks = [c.strip() for c in full.split("\n---\n") if c.strip()]
+        entries = [c for c in chunks if not c.startswith("#")]
+        header = chunks[0] if chunks and chunks[0].startswith("#") else "# 待重试（一进多出）"
+        pending_entries: list[str] = []
+        succeeded = 0
+        for entry in entries[:max(1, limit)]:
+            # 去掉首行 [stamp] agent=... topic=... 元信息，取原文
+            lines = entry.splitlines()
+            meta = lines[0] if lines and lines[0].startswith("[") else ""
+            content = "\n".join(lines[1:]).strip() if meta else entry.strip()
+            agent = "chat-bot"
+            if "agent=" in meta:
+                try:
+                    agent = meta.split("agent=", 1)[1].split()[0]
+                except Exception:  # noqa: BLE001
+                    pass
+            if not content:
+                continue
+            try:
+                res = self._ingest_bundle(content, agent)
+                if isinstance(res, dict) and res.get("ok", res.get("applied", 0)):
+                    succeeded += 1
+                    continue
+            except Exception:  # noqa: BLE001  单条失败保留，不影响其它条目
+                pass
+            pending_entries.append(entry)
+        if pending_entries:
+            layers.documents_mutate("update", doc_id=doc["id"],
+                                    content=header + "\n---\n" + "\n---\n".join(pending_entries))
+        else:
+            layers.documents_mutate("archive", doc_id=doc["id"])
+        return {"ok": True, "pending": len(entries), "retried": min(len(entries), limit),
+                "succeeded": succeeded, "remaining": len(pending_entries)}
 
     def nightly(self, *, consolidations: int = 0, agent_id: str | None = None) -> NightlyReport:
         report = NightlyReport(emotional=self.emotional_review(agent_id=agent_id))

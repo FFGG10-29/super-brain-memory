@@ -101,3 +101,41 @@ def test_weighted_score_tracks_success_rate() -> None:
     router = _router([flaky, stable])
     # 两者其它条件相同，失败多的 flaky 分数应更低
     assert router.route("chat", "s-weight").name == "stable"
+
+
+# ── 多模态（2026-11-12）：聊天带图 → OpenAI content 数组透传 ─────────────
+def test_multimodal_content_array() -> None:
+    from gateway.model_router import _multimodal_content
+
+    # 无图：纯字符串（老链路零变化）
+    assert _multimodal_content("你好", None) == "你好"
+    assert _multimodal_content("你好", []) == "你好"
+    # 有图：text + image_url 数组；data URL / http URL 直接透传
+    parts = _multimodal_content("看这图", ["data:image/png;base64,AAA", "https://x/1.jpg"])
+    assert isinstance(parts, list) and len(parts) == 3
+    assert parts[0] == {"type": "text", "text": "看这图"}
+    assert parts[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+    assert parts[2] == {"type": "image_url", "image_url": {"url": "https://x/1.jpg"}}
+    # 纯图无文字：只有 image_url
+    only_img = _multimodal_content("", ["data:image/png;base64,AAA"])
+    assert isinstance(only_img, list) and len(only_img) == 1
+
+
+def test_complete_with_images_skips_cache_and_passes_images() -> None:
+    class ImageCapFake(FakeClient):
+        last_images: list[str] | None = None
+
+        def complete(self, prompt, *, images=None):  # noqa: ANN001
+            ImageCapFake.last_images = images
+            return f"ok:{prompt}"
+
+    fake = ImageCapFake("vision")
+    router = _router([fake])
+    router._account_pool = None
+    result = router.complete("看这图", intent="chat", session_id="s-img",
+                             model="", images=["data:image/png;base64,AAA"])
+    assert result["ok"] is True
+    assert ImageCapFake.last_images == ["data:image/png;base64,AAA"]
+    # 无图时 images 不传（fake 旧签名兼容）
+    router.complete("纯文本", intent="chat", session_id="s-img", model="")
+    assert ImageCapFake.last_images is None

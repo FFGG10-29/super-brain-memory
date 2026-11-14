@@ -156,32 +156,66 @@ def _dispatch_local(app: Any, name: str, arguments: dict[str, Any]) -> dict[str,
         namespace = str(arguments.get("namespace") or "topic:default")
         cognition = arguments.get("cognition")
         cognition = cognition if isinstance(cognition, dict) else None
-        result = _get_write_gate().submit(WriteRequest(
-            fn=lambda: app.hippocampus.remember(
-                str(arguments["content"]), agent_id=agent_id,
-                namespace=namespace, cognition=cognition,
+        content = str(arguments.get("content") or "").strip()
+
+        def do_write() -> dict[str, Any]:
+            # 一进多出铁律统一判定（brain.ingest_guard，与 HTTP MCP 路径同源）：
+            # bundle(WorkBuddy 前置已拆) > single(单条认知契约) > extract(后端兜底拆)。
+            from brain.ingest_guard import classify as _classify
+
+            bundle_raw = arguments.get("bundle")
+            plan = _classify(
+                cognition=cognition,
+                bundle=bundle_raw if isinstance(bundle_raw, dict) else None,
+                content=content,
             )
-        )).result(timeout=30)
-        return {
-            "applied": result.applied,
-            "id": result.neuron.uuid7_id,
-            "reason": result.admission.reason,
-            "memory_type": result.neuron.memory_type,
-            "pad": result.neuron.pad.as_tuple(),
-            "namespace": result.neuron.namespace,
-            "superseded": result.superseded,
-            "merge": (result.merge.action if result.merge is not None else None),
-        }
+            if plan.mode == "single":
+                r = app.hippocampus.remember(
+                    content, agent_id=agent_id, namespace=namespace,
+                    cognition=plan.cognition, _from_bundle=True,
+                )
+                return {"applied": r.applied, "id": r.neuron.uuid7_id,
+                        "reason": r.admission.reason, "memory_type": r.neuron.memory_type,
+                        "pad": r.neuron.pad.as_tuple(), "namespace": r.neuron.namespace,
+                        "superseded": r.superseded,
+                        "merge": (r.merge.action if r.merge is not None else None)}
+            from brain.router_extractor import RouterExtractor
+            from engine.local_llm import DisabledLLM
+
+            extractor = RouterExtractor(DisabledLLM(), get_config())
+            if plan.mode == "bundle":
+                bundle = extractor.bundle_from_payload(plan.bundle or {})
+                src = "workbuddy-presplit"
+            else:
+                bundle = extractor.extract_multi(content, agent_id=agent_id)
+                src = "local"
+            br = app.hippocampus.remember_bundle(bundle, agent_id=agent_id, namespace=namespace)
+            if not br.get("handled", br.get("applied", 0) > 0):
+                app.hippocampus._defer_orphan(content, agent_id, cognition)
+                return {"applied": False, "id": "", "reason": "一进多出失败，原文留项目档案待重试",
+                        "memory_type": "scenario", "pad": (0, 0, 0),
+                        "namespace": namespace, "superseded": [], "merge": None}
+            return {"applied": True, "written": br.get("applied", 0),
+                    "complexity": br.get("complexity"), "source": src,
+                    "id": (br.get("neuron_ids") or [""])[0],
+                    "reason": f"一进多出 {br.get('applied')}/{br.get('total')}",
+                    "memory_type": "scenario", "pad": (0, 0, 0),
+                    "namespace": namespace, "superseded": [], "merge": None,
+                    "bundle": br}
+
+        return _get_write_gate().submit(WriteRequest(fn=do_write)).result(timeout=30)
     if name == "recall_memory":
         query = str(arguments.get("query", ""))
         limit = int(arguments.get("limit") or arguments.get("top_k") or 3)
-        deep = bool(arguments.get("deep", False))
+        # v4.1：独占 stdio 模式默认也走六通道（与 HTTP 桥接路径全面对齐）；
+        # 仅显式 deep=false 才走轻量投影（<0.05s）作兼容降级。
+        deep = bool(arguments.get("deep", True))
         from core.context_layers import get_context_layers
         from core.fast_recall import convergence_injection, fast_recall
 
         layers = get_context_layers()
         if not deep:
-            # 独占模式默认也走轻量投影（<0.05s），与 HTTP 桥接路径对齐。
+            # 兼容降级路径：显式 deep=false 时用轻量投影（不再是默认）。
             rows = app.storage.relational.query("neuron", active_only=True, limit=500)
             result = fast_recall([dict(row) for row in rows], query, limit)
             hits = result["hits"]

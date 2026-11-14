@@ -211,3 +211,124 @@ def test_free_chat_disabled_by_default(tmp_path):
     with pytest.raises(AccountPoolError):
         pool.free_chat("hi", model="some-model")
     assert pool._transport.calls == []  # 未发出任何请求
+
+
+# ── 9. 上游业务码分类（照抄 wbmod，issue #56/#127）────────────────────────────
+
+def test_model_busy_14003_cools_model_not_account(tmp_path):
+    """14003 是模型全局负载，只冷该模型 2 分钟，绝不把账号冷 30 分钟（issue #56）。"""
+    def script(method, url, headers, body):
+        if headers.get("Authorization") == "Bearer tok-a":
+            return 429, {"Content-Type": "application/json"}, \
+                json.dumps({"code": 14003, "msg": "模型繁忙"}).encode()
+        return 200, {"Content-Type": "text/event-stream"}, sse_body("你好")
+
+    config = PoolConfig(accounts_file=str(tmp_path / "accounts.json"), default_model="m1")
+    pool = AccountPool(config, transport=FakeTransport(script))
+    pool.accounts = [make_account("tok-a", "甲", "10001", "uid-a"),
+                     make_account("tok-b", "乙", "10002", "uid-b")]
+    out = pool.complete("hi", model="m1")
+    assert out == "你好"  # 换 B 成功
+    a = pool.accounts[0]
+    assert 0 < a.cooldowns["m1"] - time.time() <= 130  # 冷模型约 2 分钟，不是 1800s
+    assert a.dead_until == 0.0                          # 账号没被判死
+
+
+def test_account_rate_limit_6004_parses_body_reset(tmp_path):
+    """6004 账号限流：恢复时间从响应体文案解析，不依赖 Retry-After 头。"""
+    from datetime import datetime, timedelta
+
+    reset = (datetime.now() + timedelta(seconds=45)).strftime("%Y-%m-%d %H:%M:%S")
+    body = json.dumps({"code": 6004, "msg": f"使用量超限，将在 {reset} UTC+8 重置"},
+                      ensure_ascii=False).encode()
+    transport = FakeTransport((429, {"Content-Type": "application/json"}, body))
+    config = PoolConfig(accounts_file=str(tmp_path / "accounts.json"), default_model="m1")
+    pool = AccountPool(config, transport=transport)
+    account = make_account("tok-a", "甲", "10001", "uid-a")
+    pool.accounts = [account]
+    with pytest.raises(AccountPoolError):
+        pool.complete("hi", model="m1")
+    remaining = account.cooldowns["m1"] - time.time()
+    assert 30 < remaining <= 50  # 解析出的 ~45s，而非默认 60s
+
+
+def test_credits_exhausted_14018_switches_account(tmp_path):
+    """14018 / 欠费文案：额度耗尽换号可救，不该刷新 token 重试本号。"""
+    def script(method, url, headers, body):
+        if headers.get("Authorization") == "Bearer tok-a":
+            return 200, {"Content-Type": "application/json"}, \
+                json.dumps({"code": 14018, "msg": "Credits exhausted."}).encode()
+        return 200, {"Content-Type": "text/event-stream"}, sse_body("你好")
+
+    config = PoolConfig(accounts_file=str(tmp_path / "accounts.json"), default_model="m1")
+    pool = AccountPool(config, transport=FakeTransport(script))
+    pool.accounts = [make_account("tok-a", "甲", "10001", "uid-a"),
+                     make_account("tok-b", "乙", "10002", "uid-b")]
+    assert pool.complete("hi", model="m1") == "你好"
+    # A 只有一次 chat 请求，没有强制刷新（欠费刷新 token 无意义）
+    assert sum(1 for c in pool._transport.calls
+               if c[2].get("Authorization") == "Bearer tok-a") == 1
+    assert all("refresh" not in c[1] for c in pool._transport.calls)
+
+
+def test_business_code_read_from_nested_shapes():
+    """业务码只认 code / error.data.code / data.code，不被 requestId 里的数字误伤。"""
+    from gateway.account_pool.pool import _business_code
+    assert _business_code(b'{"code":14003}') == 14003
+    assert _business_code(b'{"data":{"code":14018}}') == 14018
+    assert _business_code(b'{"error":{"data":{"code":6004}}}') == 6004
+    assert _business_code(b'{"requestId":"14003-abc","msg":"ok"}') is None
+
+
+# ── 10. 免费判定：只认真倍率，绝不采信促销名单 ─────────────────────────────────
+
+def test_promo_model_with_real_multiplier_is_not_free():
+    """上游把扣费的 x0.11/x0.51 塞进 modelPromotions——绝不因此标"限时免费"。
+
+    真实结构是 `badge.label`（旧代码取 promo["name"]，永远落空）。
+    """
+    from gateway.account_pool.catalog import _parse_wb_models
+    payload = {"data": {"models": [
+        {"id": "deepseek-v4.1-flash", "name": "DeepSeek-V4.1-Flash", "credits": "x0.11 credits"},
+        {"id": "hy3", "name": "Hy3", "credits": "x0.00 credits"},
+        {"id": "auto", "name": "Auto"},
+    ], "modelPromotions": [{"enabled": True, "priority": 200,
+                            "badge": {"label": "限时特惠", "color": "#009273"},
+                            "modelIds": ["deepseek-v4.1-flash", "hy3"]}]}}
+    rows = _parse_wb_models(payload)
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["deepseek-v4.1-flash"]["promo_free"] is False
+    assert by_id["deepseek-v4.1-flash"]["multiplier"] == 0.11
+    assert by_id["deepseek-v4.1-flash"]["promotion"] == "限时特惠"
+    assert by_id["hy3"]["promo_free"] is True
+    assert by_id["auto"]["promo_free"] is False  # 倍率缺失视为收费
+
+
+def test_roster_filters_out_ide_and_video_models():
+    """客户端只展示 agents[cli].models：codewise/视频/图像/内部变体一律不出现。"""
+    from gateway.account_pool.catalog import _parse_wb_models
+    payload = {"data": {
+        "models": [
+            {"id": "hy3", "name": "Hy3", "credits": "x0.00"},
+            {"id": "hy3-b", "name": "Hy3", "credits": "x0.00"},
+            {"id": "codewise-jump", "name": "codewise-jump"},
+            {"id": "kling-video-v3", "name": "Kling-Video-V3"},
+            {"id": "hunyuan-image-alpha", "name": "Hunyuan Image Alpha"},
+            {"id": "fast-model", "name": "快速", "credits": "x0.15"},
+        ],
+        "agents": [{"name": "cli", "tags": ["cli", "default"],
+                    "models": ["hy3", "kimi-k3-1"]}],
+    }}
+    rows = _parse_wb_models(payload)
+    ids = [r["id"] for r in rows]
+    assert ids == ["fast-model", "hy3"]  # 档位置顶 + roster 成员
+    assert all("codewise" not in i and "video" not in i for i in ids)
+
+
+def test_credits_with_unit_suffix_parses():
+    """/v2 的 credits 是 "x0.79 credits"，纯 float() 会失败变 None（最贵的错）。"""
+    from gateway.account_pool.catalog import _parse_multiplier
+    assert _parse_multiplier("x0.79 credits") == 0.79
+    assert _parse_multiplier("x0.00") == 0.0
+    assert _parse_multiplier(0.51) == 0.51
+    assert _parse_multiplier(None) is None

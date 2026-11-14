@@ -39,8 +39,14 @@ def test_cold_start_within_budget(brain_config):
     try:
         elapsed = time.perf_counter() - started
         assert elapsed < COLD_START_BUDGET_SEC, f"冷启动 {elapsed:.1f}s 超预算"
-        # 三模型必须懒加载：构造阶段不加载权重
-        assert app.embedder.dense_dim == brain_config.model.dense_dim
+        # ★ 全面云端（2026-11-12）：本地模型全裁撤——云端未配齐时 embedder 是
+        #   Disabled 占位（degraded=True、dense_dim=0），绝不加载本地权重。
+        assert app.embedder.degraded is True
+        from main import _DisabledEmbedder
+        assert isinstance(app.embedder._local if hasattr(app.embedder, "_local")
+                          else app.embedder, _DisabledEmbedder) or app.embedder.degraded
+        with pytest.raises(EngineUnavailable):
+            app.embedder.embed_query("x")
     finally:
         app.close()
 

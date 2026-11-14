@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -69,7 +70,72 @@ class _RateLimited(AccountPoolError):
 
 
 class _SessionDead(AccountPoolError):
-    """401/403：已写 dead_until，调用方换号重试。"""
+    """401/403 / 12153 登录态失效：已写 dead_until，调用方换号重试。"""
+
+
+class _OutOfCredit(AccountPoolError):
+    """14018 / 欠费文案：账号额度耗尽，换号可救（本号当日别再试）。"""
+
+
+# ── 上游业务码分类（照抄 dsh-connect-workbuddy v5.21.3 / upstream.ts，MIT）──
+# 关键：HTTP 状态只是外壳，真正的故障语义在响应体 business code 里。
+# 把 14003（模型忙，全局，冷模型 2 分钟）误当 6004（账号限流，冷账号 30 分钟）
+# 会让整池被一个模型小抖动冷半小时——wbmod issue #56 的坑，这里一次性修对。
+_HARD_CREDIT_MARKERS = (
+    "insufficient credit", "no credit", "credit exhausted", "credits exhausted",
+    "out of credit", "quota exceeded", "quota exhaust", "payment required",
+    "额度已用尽", "积分不足", "余额不足",
+)
+_SESSION_DEAD_MARKERS = ("offline user session not found", "12153")
+_MODEL_BUSY_CODE = 14003
+_CREDITS_EXHAUSTED_CODE = 14018
+_RATE_LIMITED_CODE = 6004
+_MODEL_BUSY_COOLDOWN_SEC = 120.0        # 上游自述"约 1 分钟"，取 2 分钟跨过突发
+_RETRY_TIME_RE = re.compile(
+    r"(?:将在\s*)?(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*(?:UTC[+\-]\d+|重置|reset)",
+    re.IGNORECASE,
+)
+
+
+def _business_code(body: bytes) -> int | None:
+    """从响应体取上游业务码，只认 code / error.data.code / data.code 三种形状。"""
+    try:
+        payload = json.loads(body.decode("utf-8", "replace") or "{}")
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    # 覆盖实测三种形状 + 一层嵌套：code / data.code / error.code / error.data.code /
+    # data.error.code。按"钱包类优先"由调用方排序，这里只做纯提取（最浅命中先返回）。
+    holders = (payload, data, error,
+               error.get("data") if isinstance(error.get("data"), dict) else {},
+               data.get("error") if isinstance(data.get("error"), dict) else {})
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        for key in ("code", "businessCode"):
+            value = holder.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    return None
+
+
+def _reset_at_ms(body: bytes) -> float | None:
+    """从响应体文案解析上游给出的恢复时间（epoch 秒）；上游没写就返回 None，不编造。"""
+    text = body.decode("utf-8", "replace")
+    match = _RETRY_TIME_RE.search(text)
+    if not match:
+        return None
+    try:
+        # 文案是本地时间（UTC+8）；本机时区即北京时间，按本地解释
+        stamp = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+        return stamp if stamp > time.time() else None
+    except (ValueError, OverflowError):
+        return None
 
 
 # ---- free-upstream.ts:179-193 的单调计数器（照抄：降序计数器硬门） ----
@@ -225,9 +291,18 @@ class AccountPool:
         # 也可能直接是 AccountPoolConfig——两种都兼容
         lane_source = getattr(config, "account_pool", config)
         self.free_lane_enabled = bool(getattr(lane_source, "free_lane", False))
-        self._timeout = float(getattr(config, "request_timeout_sec", 20.0))
-        self._max_attempts = int(getattr(config, "max_attempts", 3))
-        self._credential_dead_sec = float(getattr(config, "credential_dead_sec", 3600.0))
+        # ★ 默认模型必须兼容两种配置形态：直接 AccountPoolConfig（裸用）或 BrainConfig
+        #   （model_router 装配时传整个 config，default_model 在 .account_pool 子块上）。
+        #   此前只从顶层读 → 拿空串 → 上游 400 → 自动路由的号池分支永远失败。
+        self._default_model = str(
+            getattr(lane_source, "default_model", "")
+            or getattr(config, "default_model", "") or "")
+        self._timeout = float(getattr(lane_source, "request_timeout_sec",
+                                       getattr(config, "request_timeout_sec", 20.0)))
+        self._max_attempts = int(getattr(lane_source, "max_attempts",
+                                         getattr(config, "max_attempts", 3)))
+        self._credential_dead_sec = float(getattr(lane_source, "credential_dead_sec",
+                                                  getattr(config, "credential_dead_sec", 3600.0)))
         if transport is not None:
             self._transport = transport
         else:
@@ -397,15 +472,13 @@ class AccountPool:
         return effort
 
     def invoke(self, prompt: str, *, model: str) -> str:
-        """模型拉起：free:* 走免密 lane，其余走账号池 failover。"""
-        from gateway.account_pool.catalog import is_free_lane
-
+        """模型拉起：一律走账号池 failover（免密 lane 已删除）。"""
         model = str(model or "").strip()
         if not model:
             raise AccountPoolError("缺少 model")
-        if model.startswith("free:") or is_free_lane(model):
-            base = model.split(":", 1)[1] if model.startswith("free:") else model
-            return self.free_chat(prompt, model=base)
+        # 免密 lane 已删除：历史 free:<id> 去掉前缀走号池同名模型，不再调 free_chat。
+        if model.startswith("free:"):
+            model = model.split(":", 1)[1]
         return self.complete(prompt, model=model)
 
     # -- 签到（billing 端点，xdpool scheduler 同款）------------------------
@@ -588,19 +661,39 @@ class AccountPool:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         status, resp_headers, body = self._request(
             "POST", base + "/v2/chat/completions", headers, payload)
-        if status == 429:
-            retry_after = 60.0
-            raw = _header(resp_headers, "Retry-After")
-            if raw:
+
+        # ★ 业务码优先于 HTTP 状态（照抄 wbmod classifyUpstreamError 顺序，issue #56/#127）。
+        # 响应体可能带 business code，也可能只有文案标记；两者都覆盖，先 wallet 后 throttle。
+        lower = body.decode("utf-8", "replace").lower()
+        code = _business_code(body)
+        # 1) 欠费：额度耗尽，换号可救，本号当日别再试
+        if status == 402 or code == _CREDITS_EXHAUSTED_CODE \
+                or any(marker in lower for marker in _HARD_CREDIT_MARKERS):
+            raise _OutOfCredit(f"{account.label()}: 额度已用尽（code={code}），换号重试")
+        # 2) 登录态失效：刷新重试 or 换号；文案标记覆盖非 401/403 的伪装
+        if status in (401, 403) or "12153" in lower \
+                or any(marker in lower for marker in _SESSION_DEAD_MARKERS):
+            raise _SessionDead(f"{account.label()}: 登录态失效（HTTP {status}/code={code}）")
+        # 3) 模型忙（14003）：全局模型负载，**只冷该模型 2 分钟，绝不冷账号**
+        #    一个模型抖动不能把整池每个账号都冷 30 分钟（issue #56）。
+        if code == _MODEL_BUSY_CODE or "model is busy" in lower or "模型繁忙" in lower \
+                or "负载较高" in lower:
+            account.cooldowns[model] = time.time() + _MODEL_BUSY_COOLDOWN_SEC
+            raise _RateLimited(
+                f"{account.label()}: 模型 {model} 繁忙，仅冷模型 {_MODEL_BUSY_COOLDOWN_SEC:.0f}s")
+        # 4) 账号级限流（6004 / 其它 429）：恢复时间优先读响应体文案，再退响应头
+        if status == 429 or code == _RATE_LIMITED_CODE:
+            reset_at = _reset_at_ms(body)
+            retry_after = (reset_at - time.time()) if reset_at else 0.0
+            if retry_after <= 0:
+                raw = _header(resp_headers, "Retry-After")
                 try:
-                    retry_after = float(raw)
+                    retry_after = float(raw) if raw else 60.0
                 except ValueError:
-                    pass
+                    retry_after = 60.0
             account.cooldowns[model] = time.time() + retry_after
-            raise _RateLimited(f"{account.label()}: 429，冷却 {model} {retry_after:.0f}s")
-        if status in (401, 403):
-            account.dead_until = time.time() + self._credential_dead_sec
-            raise _SessionDead(f"{account.label()}: HTTP {status}，登录态疑似失效")
+            raise _RateLimited(
+                f"{account.label()}: 账号限流（code={code}），冷 {model} {retry_after:.0f}s")
         if status != 200:
             raise AccountPoolError(
                 f"{account.label()}: chat 上游 HTTP {status}: {_snippet(body)}")
@@ -609,9 +702,20 @@ class AccountPool:
     # -- failover ---------------------------------------------------------
 
     def complete(self, prompt: str, *, model: str | None = None,
-                 conversation_key: str = "") -> str:
-        model = model or str(getattr(self.config, "default_model", "") or "")
-        messages = [{"role": "user", "content": prompt}]
+                 conversation_key: str = "",
+                 images: list[str] | None = None) -> str:
+        model = model or self._default_model
+        content: Any = prompt
+        if images:
+            # 多模态：OpenAI 兼容 content 数组（text + image_url）；
+            # data URL / http(s) URL 直接透传上游 /v2/chat/completions。
+            parts: list[dict] = []
+            if str(prompt or "").strip():
+                parts.append({"type": "text", "text": str(prompt)})
+            for src in images:
+                parts.append({"type": "image_url", "image_url": {"url": str(src)}})
+            content = parts or prompt
+        messages = [{"role": "user", "content": content}]
         now = time.time()
         eligible = [a for a in self.accounts
                     if a.account_id() not in self.ignored
@@ -624,7 +728,9 @@ class AccountPool:
             try:
                 return self.chat(account, model, messages,
                                  conversation_key=conversation_key)
-            except (_RateLimited, _SessionDead) as exc:  # 仅 soft_rate/session_dead 换号
+            # 可换号的软故障：账号限流 / 模型忙 / 登录失效 / 额度耗尽。
+            # 不可换号的硬故障（上游协议错、网络错）直接抛，换号也救不了。
+            except (_RateLimited, _SessionDead, _OutOfCredit) as exc:
                 last = exc
                 continue
         raise AccountPoolError(f"号池全部 {self._max_attempts} 次尝试失败: {last}")
@@ -695,5 +801,7 @@ class PoolClient:
             self.failures += 1
         self.latency_ms = 0.7 * self.latency_ms + 0.3 * max(1.0, latency_ms)
 
-    def complete(self, prompt: str, model: str | None = None) -> str:
-        return self.pool.complete(prompt, model=model or getattr(self.config, "default_model", ""))
+    def complete(self, prompt: str, model: str | None = None,
+                 *, images: list[str] | None = None) -> str:
+        return self.pool.complete(prompt, model=model or self.pool._default_model,
+                                  images=images)

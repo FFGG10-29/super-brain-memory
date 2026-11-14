@@ -16,6 +16,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,10 +31,12 @@ from brain.router_extractor import RouterExtractor
 from brain.synaptic_plasticity import SynapticPlasticity
 from brain.thalamus import Thalamus
 from config import BrainConfig, get_config
+from core.errors import EngineUnavailable
 from core.ids import HybridLogicalClock
 from core.structured_log import configure_logging, log_event
 from core.interfaces import (
     Embedder,
+    Embedding,
     GraphRepository,
     HealthCheckable,
     HealthStatus,
@@ -42,13 +45,12 @@ from core.interfaces import (
     LocalLLM,
     RelationalRepository,
     Reranker,
+    ScoredId,
     TimeSeriesRepository,
     VectorRepository,
 )
 from engine.cuda_runtime import prepare_cuda_dll_path
-from engine.embedding import BgeM3Embedder
-from engine.local_llm import QwenLocalLLM, DisabledLLM
-from engine.reranker import create_reranker
+from engine.local_llm import DisabledLLM  # 本地 LLM 已裁撤（2026-11-12）：QwenLocalLLM 不再实例化
 from gateway.http_adapter import HTTPAdapter
 from gateway.mcp_server import MCPToolkit
 from gateway.registry import AgentRegistry
@@ -221,70 +223,91 @@ def build_storage(config: BrainConfig) -> StorageSet:
     )
 
 
-def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
-    """按每条通道（embed / llm）各自的 backend 与供应商装配。
+class _DisabledEmbedder(Embedder):
+    """本地嵌入已裁撤（2026-11-12 用户裁决：全面云端）。
 
-    Embedding 与 LLM 可以是两家不同供应商（地址 / key 各自独立）。
-    选了云端的通道：URL / 模型名任一缺失就退回本地实现并打印警告，
-    保证"配置了一半"的设备也能启动 —— 不会因为云 API 抖动而拒绝开机。
+    云端嵌入失败时显式抛不可用——vector 投影会跳过并留 outbox 重试，绝不伪装本地。
+    """
+
+    degraded = True
+
+    @property
+    def dense_dim(self) -> int:
+        return 0
+
+    def embed_documents(self, texts: Sequence[str]) -> list[Embedding]:
+        raise EngineUnavailable("本地嵌入已裁撤（全面云端），云端嵌入不可用")
+
+
+class _DisabledReranker(Reranker):
+    """本地精排已裁撤（2026-11-12 用户裁决：全面云端）；云端失败时精排直接跳过。"""
+
+    degraded = True
+
+    def rerank(
+        self, query: str, candidates: Sequence[tuple[str, str]], *,
+        top_k: int | None = None,
+    ) -> list[ScoredId]:
+        raise EngineUnavailable("本地精排已裁撤（全面云端），云端精排不可用")
+
+
+def _build_models(config: BrainConfig) -> tuple[Embedder, Reranker, LocalLLM]:
+    """按每条通道（embed / rerank / llm）各自的 backend 与供应商装配。
+
+    ★【2026-11-12 用户裁决】本地模型全删（bge-m3 / bge-reranker / Qwen3-0.6B 一并
+    裁撤，省内存省体积），全面云端/号池，不考虑本地降级：
+      - 选 cloud 时用 FallbackXxx(cloud, 本地占位工厂) 包装——本地占位永远显式抛
+        EngineUnavailable，云端失败即如实降级（向量投影跳过留 outbox、精排跳过、
+        抽取走规则拆分），绝不加载任何本地大模型。
+      - URL / 模型名缺失也装配云端占位（配置了一半仍能开机，报错不崩）。
     """
     model = config.model
 
-    local_embed_dir = _resolve_model_dir(config, model.embedding_model)
-    embedder: Embedder
-    if model.embed_backend == "cloud":
-        if model.embed_base_url and model.embed_model:
-            from brain.cloud_models import CloudCredentials, CloudEmbedder, load_cloud_api_key
+    def _local_embedder() -> Embedder:
+        return _DisabledEmbedder()
 
-            credentials = CloudCredentials(
-                model.embed_base_url,
-                load_cloud_api_key(config, "embed"),
-                timeout=model.embed_timeout_sec,
-            )
-            embedder = CloudEmbedder(credentials, model.embed_model, dense_dim=model.embed_dim)
-        else:
-            print("警告：Embedding 选了云端但 API 地址/模型名未配齐，退回本地/降级")
-            embedder = BgeM3Embedder(
-                dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
-            )
-    else:
-        embedder = BgeM3Embedder(
-            dense_dim=model.dense_dim, model_dir=local_embed_dir, use_cuda=model.use_cuda
-        )
+    def _local_llm() -> LocalLLM:
+        # 本地 LLM 全删：抽取/巩固走 task_routes 远程，远程挂了降级规则拆分（不丢数据）。
+        return DisabledLLM()
 
-    local_llm_path = model.llm_gguf_dir / model.llm_gguf_file
-    # ★ 本地 LLM 总开关：关掉时用 DisabledLLM 占位，裸写也绝不实例化 llama_cpp（规避 CUDA 崩）。
-    #   认知契约下带 cognition 的写入走 from_agent，不经过 LLM，质量不受影响。
-    if not model.llm_enabled:
-        llm: LocalLLM = DisabledLLM()
-    elif model.llm_backend == "cloud":
-        if model.llm_base_url and model.llm_model:
-            from brain.cloud_models import CloudCredentials, CloudLLM, load_cloud_api_key
+    def _local_reranker() -> Reranker:
+        return _DisabledReranker()
 
-            credentials = CloudCredentials(
-                model.llm_base_url,
-                load_cloud_api_key(config, "llm"),
-                timeout=model.llm_timeout_sec,
-            )
-            llm = CloudLLM(credentials, model.llm_model)
-        else:
-            print("警告：LLM 选了云端但 API 地址/模型名未配齐，退回本地/规则")
-            llm = QwenLocalLLM(
-                model_path=str(local_llm_path) if local_llm_path.exists() else None,
-                gpu_layers=model.llm_gpu_layers,
-                max_tokens=model.llm_max_tokens,
-            )
-    else:
-        llm = QwenLocalLLM(
-            model_path=str(local_llm_path) if local_llm_path.exists() else None,
-            gpu_layers=model.llm_gpu_layers,
-            max_tokens=model.llm_max_tokens,
-        )
-
-    reranker = create_reranker(
-        model_dir=_resolve_model_dir(config, config.model.reranker_model),
-        use_cuda=config.model.use_cuda,
+    from brain.cloud_models import (
+        CloudCredentials, CloudEmbedder, CloudLLM, CloudReranker,
+        FallbackEmbedder, FallbackLLM, FallbackReranker, load_cloud_api_key,
     )
+
+    # ① Embedding
+    if model.embed_backend == "cloud" and model.embed_base_url and model.embed_model:
+        creds = CloudCredentials(model.embed_base_url, load_cloud_api_key(config, "embed"),
+                                 timeout=model.embed_timeout_sec)
+        embedder: Embedder = FallbackEmbedder(
+            CloudEmbedder(creds, model.embed_model, dense_dim=model.embed_dim), _local_embedder)
+    else:
+        if model.embed_backend == "cloud":
+            print("警告：Embedding 云端地址/模型名未配齐，装配 Disabled 占位（本地已裁撤，向量投影将跳过）")
+        embedder = _local_embedder()
+
+    # ② Rerank（云端 /v1/rerank 真交叉编码；本地 ONNX 已裁撤，失败即跳过精排）
+    if model.rerank_backend == "cloud" and model.rerank_base_url and model.rerank_model:
+        rcreds = CloudCredentials(model.rerank_base_url, load_cloud_api_key(config, "rerank"),
+                                  timeout=max(8, config.recall.rerank_timeout_ms // 1000))
+        reranker: Reranker = FallbackReranker(
+            CloudReranker(rcreds, model.rerank_model), _local_reranker)
+    else:
+        reranker = _local_reranker()
+
+    # ③ LLM（记忆抽取 / 叙事巩固；号池/远程路由另由 model_router.task_routes 接管）
+    if model.llm_backend == "cloud" and model.llm_base_url and model.llm_model:
+        lcreds = CloudCredentials(model.llm_base_url, load_cloud_api_key(config, "llm"),
+                                  timeout=model.llm_timeout_sec)
+        llm: LocalLLM = FallbackLLM(CloudLLM(lcreds, model.llm_model), _local_llm)
+    else:
+        if model.llm_backend == "cloud":
+            print("警告：LLM 云端地址/模型名未配齐，装配 Disabled 占位（抽取降级规则拆分）")
+        llm = _local_llm()
+
     return embedder, reranker, llm
 
 
@@ -380,18 +403,64 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
     from core.context_layers import set_distill_trigger
     from brain.write_gate import WriteRequest
 
-    def _remember_via_gate(text: str, **kwargs: Any):
-        if write_gate is None:
-            return hippocampus.remember(text, **kwargs)
-        return write_gate.submit(WriteRequest(
-            fn=lambda: hippocampus.remember(text, **kwargs)
-        )).result(timeout=30)
+    def _distill_save(text: str, *, agent_id: str = "distiller",
+                      namespace: str = "document") -> dict[str, Any]:
+        """蒸馏产物同样遵守「叙事是输入源」铁律（2026-11-12 用户裁决：任何途径都要符合）。
 
-    _distill_save = lambda text, *, agent_id="distiller", namespace="document": (
-        _remember_via_gate(text, agent_id=agent_id, namespace=namespace)
-    )
+        蒸馏器切块喂进来的常是聊天导出/原始聊天档案——绝不允许整段长文本裸写单条
+        （图谱建不了实体节点、精确召回失效）。统一交给 RouterExtractor 一进多出
+        解剖成碎片入池（transactional→覆盖式 / light→轻拆 / heavy→全拆，梯度判定
+        防过度拆分）；蒸馏产物是知识不是情节，layer=fact。失败原文留项目档案待重试。
+        """
+        import dataclasses as _dc
+
+        from brain.router_extractor import RouterExtractor
+        from engine.local_llm import DisabledLLM
+
+        def run() -> dict[str, Any]:
+            try:
+                bundle = RouterExtractor(DisabledLLM(), config).extract_multi(
+                    text, agent_id=agent_id)
+            except Exception as exc:  # noqa: BLE001  抽取失败留档待重试
+                hippocampus._defer_orphan(text, agent_id, {"topic": namespace})
+                return {"applied": 0, "error": f"extract failed: {type(exc).__name__}: {exc}"}
+            if not bundle.items:
+                return {"applied": 0, "handled": True,
+                        "reason": "寒暄/信息密度不足，不进六引擎（合规不拆）"}
+            bundle = _dc.replace(bundle, layer="fact")
+            result = hippocampus.remember_bundle(
+                bundle, agent_id=agent_id, namespace=namespace)
+            if not result.get("handled", result.get("applied", 0) > 0):
+                hippocampus._defer_orphan(text, agent_id, {"topic": namespace})
+            return result
+
+        if write_gate is None:
+            return run()
+        return write_gate.submit(WriteRequest(fn=run)).result(timeout=60)
+
     start_distill_worker(_distill_save)
     set_distill_trigger(enqueue_document)
+
+    def _ingest_bundle_via_gate(content: str, agent_id: str) -> dict[str, Any]:
+        """夜间重试：把待重试档案原文按新架构一进五重新入池。"""
+        from brain.router_extractor import RouterExtractor
+        from engine.local_llm import DisabledLLM
+
+        def run() -> dict[str, Any]:
+            try:
+                bundle = RouterExtractor(DisabledLLM(), config).extract_multi(
+                    content, agent_id=agent_id)
+                if not bundle.items:
+                    return {"ok": False, "applied": 0}
+                br = hippocampus.remember_bundle(
+                    bundle, agent_id=agent_id, namespace="topic:f844c49c0e58")
+                return {"ok": br.get("applied", 0) > 0, **br}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "applied": 0, "error": f"{type(exc).__name__}: {exc}"}
+
+        if write_gate is None:
+            return run()
+        return write_gate.submit(WriteRequest(fn=run)).result(timeout=45)
 
     life_loop = LifeLoop(
         storage.timeseries,
@@ -401,10 +470,20 @@ def build_app(config: BrainConfig | None = None, *, write_gate: Any | None = Non
         config=config,
         save_memory=_distill_save,
         event_log=journal,           # E3：supersede 事件源（被纠正次数统计）
+        ingest_bundle=_ingest_bundle_via_gate,  # 夜间一进多出重试
     )
     circadian = Circadian()
 
     def _nightly_consolidate() -> tuple[int, int, int]:
+        # 一进多出铁律：夜间窗口先把"待重试·原文"按新架构重新拆分入池
+        try:
+            retry_report = life_loop.retry_pending_ingest(limit=100)
+            if retry_report.get("succeeded"):
+                log_event("one_to_many_retry", agent_id="consolidator",
+                          succeeded=retry_report["succeeded"],
+                          remaining=retry_report.get("remaining", 0))
+        except Exception:  # noqa: BLE001  重试失败不影响其它夜间任务
+            pass
         consolidations = neocortex.consolidate()
         summaries = consolidator.summarize_clusters(
             consolidations,

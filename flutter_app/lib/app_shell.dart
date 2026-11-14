@@ -7,7 +7,6 @@ import 'backend_launcher.dart';
 import 'brain_client.dart';
 import 'ai_space_page.dart';
 import 'cache_page.dart';
-import 'model_providers_page.dart';
 import 'chat_page.dart';
 import 'context_pages.dart';
 import 'narrative_page.dart';
@@ -81,7 +80,6 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '号池网关', 'icon': Icons.dns_outlined},
     <String, Object>{'name': '缓存监控', 'icon': Icons.speed_outlined},
     <String, Object>{'name': 'AI 空间', 'icon': Icons.person_outline},
-    <String, Object>{'name': '供应商路由', 'icon': Icons.alt_route},
   ];
 
   /// 主导航分组：左栏只显示 7 个入口，组内子页放到顶栏下方的子导航条。
@@ -92,9 +90,11 @@ class _AppShellState extends State<AppShell> {
     <String, Object>{'name': '记忆工作台', 'icon': Icons.memory, 'pages': <int>[1, 2, 14]},
     <String, Object>{'name': '记忆洞察', 'icon': Icons.insights_outlined, 'pages': <int>[4, 5, 12, 13, 24, 28]},
     <String, Object>{'name': 'Agent 上下文', 'icon': Icons.psychology_outlined, 'pages': <int>[18, 19, 20, 21, 22]},
-    <String, Object>{'name': '模型配置', 'icon': Icons.smart_toy_outlined, 'pages': <int>[8, 26, 29]},
+    // 供应商路由(29)已并入「模型配置」统一页(8)；26=号池网关页，必须保留在子导航条。
+    <String, Object>{'name': '模型配置', 'icon': Icons.smart_toy_outlined, 'pages': <int>[8, 26]},
     <String, Object>{'name': '大肥鱼聊天', 'icon': Icons.chat_bubble_outline, 'pages': <int>[25]},
-    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 8, 9, 27]},
+    // 8=模型配置已从运行监控移除（2026-11-12 用户裁决：顶层已有模型配置，不重复）。
+    <String, Object>{'name': '运行监控', 'icon': Icons.monitor_heart, 'pages': <int>[3, 6, 7, 9, 27]},
     <String, Object>{'name': '系统设置', 'icon': Icons.tune, 'pages': <int>[11, 15, 16, 10]},
     <String, Object>{'name': '关于', 'icon': Icons.info_outline, 'pages': <int>[17]},
   ];
@@ -127,7 +127,16 @@ class _AppShellState extends State<AppShell> {
 
   void _subscribe() {
     _eventsSub?.cancel();
-    _eventsSub = _client.events.listen(_onEvent);
+    _eventsSub = _client.events.listen(_onEvent,
+        onDone: _onEventsLost, onError: (_) => _onEventsLost());
+  }
+
+  /// 后端事件流断开（后端死/卡）→ 自动亮出窗口，让用户看得到状态、找得到入口，
+  /// 绝不出现「窗口隐藏到托盘 + 托盘图标消失」的双重失联（2026-11-13 实测事故）。
+  void _onEventsLost() {
+    try {
+      if (Prefs.get<bool>('hide_on_close', true)) Win32Window.show();
+    } catch (_) {}
   }
 
   void _onEvent(Map<String, dynamic> event) {
@@ -172,7 +181,7 @@ class _AppShellState extends State<AppShell> {
       // 「关窗隐藏到托盘」默认关闭：Windows 11 常把新托盘图标折叠到溢出区，
       // 用户看不到图标时一旦隐藏窗口就再也找不回来（表现为「软件打不开」）。
       // 只有用户在「设置 → 诊断」里确认托盘图标可见并手动开启，才启用隐藏模式。
-      final hideOnClose = Prefs.get<bool>('hide_on_close', false);
+      final hideOnClose = Prefs.get<bool>('hide_on_close', true);
       trayStatus.value = ok
           ? (hideOnClose
               ? '托盘已启用 · 关窗隐藏到托盘（可在设置 → 诊断关闭）'
@@ -261,7 +270,8 @@ class _AppShellState extends State<AppShell> {
       PoolPage(client: _client),
       CachePage(client: _client),
       AiSpacePage(client: _client),
-      ModelProvidersPage(client: _client),
+      // 索引 29 原「供应商路由」已并入模型配置页(8)，保留占位维持索引稳定，不再渲染。
+      const SizedBox.shrink(),
     ];
     return <Widget>[
       for (var i = 0; i < pages.length; i++)

@@ -174,7 +174,29 @@ class OnnxReranker(Reranker):
 
 
 def create_reranker(*, model_dir: str | None = None, use_cuda: bool = False) -> Reranker:
-    """组合根用工厂：模型目录缺失时直接给降级实现，避免每次调用都走异常路径。"""
+    """组合根工厂：目录缺失时回退 ``models_dir()`` 完整探测链，仍找不到才降级。
+
+    2026-11-12 修复（P0-1）：旧实现 ``if not model_dir: return IdentityReranker()``
+    在裸命令启动（未注入 SUPER_BRAIN_MODELS_DIR）时，``_resolve_model_dir`` 返回 None
+    就让精排永久摆烂，而 embedder 靠 BgeM3Embedder 内部找模型仍 degraded=false——
+    两条路径不一致。现按 models_dir() 的「环境变量 > 随包 models/ > 用户目录 >
+    dev data/models」统一解析，找到 reranker 子目录才实例化真模型。
+    """
+    if not model_dir:
+        try:
+            from core.runtime_paths import models_dir
+
+            root = models_dir()
+            for candidate in (
+                root / "BAAI" / "bge-reranker-v2-m3",
+                root / "bge-reranker-v2-m3",
+                root,
+            ):
+                if candidate.is_dir() and resolve_onnx_model_file(str(candidate)) is not None:
+                    model_dir = str(candidate)
+                    break
+        except Exception:  # noqa: BLE001  探测失败回退降级，不影响启动
+            pass
     if not model_dir:
         return IdentityReranker()
     return OnnxReranker(model_dir=model_dir, use_cuda=use_cuda)

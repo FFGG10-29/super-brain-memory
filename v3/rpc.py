@@ -68,14 +68,14 @@ class RpcHandler(RpcExtension):
     def _memories(self, limit: int = 200, offset: int = 0, **_: Any) -> list[dict[str, Any]]:
         return self._daemon.memories(limit=int(limit), offset=int(offset))
 
-    def _recall(self, q: str = "", limit: int = 8, deep: bool = False,
+    def _recall(self, q: str = "", limit: int = 8, deep: bool = True,
                 namespaces: list[str] | None = None, topics: list[str] | None = None,
                 **_: Any) -> dict[str, Any]:
-        """默认走只读投影的字符 2-gram 召回（毫秒级，前端点查询立刻有结果）。
+        """v4.1 默认走真实六通道类人召回（embedding / RRF / 精排 / 激活扩散 /
+        叙事骨架 / PAD 门控 / 置信度 / 知识缺口）。
 
-        deep=True 才走真实六通道（embedding / RRF / 精排），供「召回归因」页使用。
-        ★ A 包：namespaces / topics 都会下推到只读投影过滤，实现按类召回省开销；
-        空列表 = Bot 通道全量可读（不隔离）。
+        仅显式 deep=false 才降级到只读字符 2-gram 投影（兼容/可视化/测试兜底）。
+        ★ A 包：namespaces / topics 下推到各通道过滤实现按类召回；空列表 = Bot 全量可读。
         """
         ns = [str(x) for x in (namespaces or [])]
         for topic in topics or []:
@@ -101,6 +101,15 @@ class RpcHandler(RpcExtension):
         total = sum(v for v in inbox.values() if isinstance(v, int))
         processed = inbox.get("done", 0) + inbox.get("failed", 0)
         pct = round(100.0 * processed / total, 1) if total else 100.0
+        # ★ 队列明细（2026-11-12 用户裁决：必须能看到待蒸馏的是什么、来自哪里）
+        try:
+            pending_items = self._daemon.inbox.peek("pending", limit=8)
+        except Exception:  # noqa: BLE001
+            pending_items = []
+        try:
+            processing_items = self._daemon.inbox.peek("processing", limit=4)
+        except Exception:  # noqa: BLE001
+            processing_items = []
         return {
             "inbox": inbox,
             "pending": inbox.get("pending", 0),
@@ -111,6 +120,8 @@ class RpcHandler(RpcExtension):
             "refined_pct": pct,
             "worker": h.get("worker", {}),
             "worker_mode": h.get("worker_mode"),
+            "pending_items": pending_items,
+            "processing_items": processing_items,
         }
 
     def _refine_trigger(self, limit: int = 50, **_: Any) -> dict[str, Any]:
@@ -154,12 +165,18 @@ class RpcHandler(RpcExtension):
         return {"error": "记忆不存在或已封存"}
 
     def _save_memory(self, content: str = "", agent_id: str = "flutter",
-                     namespace: str = "topic:default", **_: Any):
+                     namespace: str = "topic:default", bundle: dict | None = None,
+                     cognition: dict | None = None, **_: Any):
         # ★ 新写入默认带空间标记：非 topic: 前缀一律归默认空间
         ns = str(namespace or "topic:default")
         if not ns.startswith("topic:"):
             ns = "topic:default"
-        return self._daemon.handle_event(str(content), agent_id=str(agent_id), namespace=ns)
+        # ★ WorkBuddy 前置拆分 bundle / 认知契约透传（与 MCP save_memory 同款）
+        return self._daemon.handle_event(
+            str(content), agent_id=str(agent_id), namespace=ns,
+            bundle=bundle if isinstance(bundle, dict) else None,
+            cognition=cognition if isinstance(cognition, dict) else None,
+        )
 
     # ── 系统概览 ──────────────────────────────────────────────────────────
     def _engines(self, **_: Any) -> dict[str, Any]:
@@ -353,19 +370,136 @@ class RpcHandler(RpcExtension):
                     return {"ok": False, "task": name, "message": f"{type(exc).__name__}: {exc}"}
         return {"ok": False, "message": "任务不存在"}
 
+    @staticmethod
+    def _describe_model(instance: Any, *, configured: str, cloud_label: str = "",
+                        local_label: str = "") -> dict[str, Any]:
+        """穿透 Fallback 包装，报告【运行时真实生效】的模型，而非配置期望值或占位。
+
+        用户硬要求：三模型用哪个必须显示真实情况、不允许占位。
+        - 无 Fallback：直接报实例类型 + 配置期望后端（实际=期望）。
+        - FallbackXxx：读 using_local / circuit_state 判断此刻真正跑的是云端还是本地，
+          并给出实际模型名（云端取 cloud._model，本地取本地实例类型）。
+        """
+        is_fallback = type(instance).__name__.startswith("Fallback")
+        degraded = bool(getattr(instance, "degraded", False))
+        if not is_fallback:
+            return {
+                "configured": configured, "active": configured,
+                "kind": type(instance).__name__, "degraded": degraded,
+                "model": "", "detail": "实际=配置（无云端回落包装）",
+            }
+        cloud = getattr(instance, "_cloud", None)
+        local = getattr(instance, "_local", None)
+        using_local = bool(getattr(instance, "using_local", False))
+        circuit = str(getattr(instance, "circuit_state", "closed"))
+        active = "local" if using_local else "cloud"
+        cloud_model = str(getattr(cloud, "_model", "") or "")
+        # 不确定时以实际对象为准：本地实例已懒加载 → 它的类型就是证据
+        local_kind = type(local).__name__ if local is not None else local_label or "本地模型(未加载)"
+        return {
+            "configured": configured,
+            "active": active,
+            "kind": type(cloud if not using_local else (local or cloud)).__name__,
+            "degraded": degraded,
+            "model": cloud_model if not using_local else "",
+            "circuit_state": circuit,
+            "cloud": cloud_label or cloud_model,
+            "local": local_kind,
+            "detail": ("云端可用" if not using_local
+                       else f"云端不可用→回落本地（熔断 {circuit}）"),
+        }
+
+    @staticmethod
+    def _gpu_memory() -> dict[str, Any]:
+        """真实 GPU 显存（nvidia-smi，1.5s 超时）；不可用返回 null，绝不硬编码百分比。"""
+        import subprocess as _sp
+
+        try:
+            out = _sp.run(
+                ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=1.5,
+            )
+            line = (out.stdout or "").strip().splitlines()
+            if out.returncode != 0 or not line:
+                return {"available": False, "used_mb": None, "total_mb": None,
+                        "used_pct": None, "name": "", "reason": "nvidia-smi 不可用"}
+            parts = [p.strip() for p in line[0].split(",")]
+            name, used, total, util = parts[0], float(parts[1]), float(parts[2]), float(parts[3])
+            return {"available": True, "name": name,
+                    "used_mb": int(used), "total_mb": int(total),
+                    "used_pct": round(used / total * 100, 1) if total > 0 else None,
+                    "util_pct": int(util)}
+        except Exception as exc:  # noqa: BLE001  无 N 卡 / 超时 / 无驱动
+            return {"available": False, "used_mb": None, "total_mb": None,
+                    "used_pct": None, "name": "", "reason": f"{type(exc).__name__}"}
+
     def _model_status(self, **_: Any) -> dict[str, Any]:
         app = self._daemon.app
-        config = self._daemon._config.model
-        model = {"embedding_backend": getattr(config, "embed_backend", "local"),
-                 "llm_backend": getattr(config, "llm_backend", "local"),
-                 "use_cuda": config.use_cuda, "dense_dim": config.dense_dim}
+        mcfg = self._daemon._config.model
+        base = {
+            "embedding_backend": getattr(mcfg, "embed_backend", "local"),
+            "rerank_backend": getattr(mcfg, "rerank_backend", "local"),
+            "llm_backend": getattr(mcfg, "llm_backend", "local"),
+            "use_cuda": mcfg.use_cuda, "dense_dim": mcfg.dense_dim,
+            "gpu": self._gpu_memory(),
+        }
         if app is None:
-            return {**model, "note": "进程分离模式：模型由 Worker 进程加载"}
+            return {**base, "note": "进程分离模式：模型由 Worker 进程加载"}
+
+        def _spec_label(spec: str) -> str:
+            if spec.startswith("pool:"):
+                return f"号池 · {spec.split(':', 1)[1]}"
+            if spec.startswith("cloud:"):
+                pid, _, mid = spec.split(":", 1)[1].partition("|")
+                return f"[{pid}] {mid}"
+            if spec.startswith("provider:"):
+                return f"供应商 · {spec.split(':', 1)[1]}"
+            return spec
+
+        # 记忆抽取/巩固的真实路由（overlay 优先）：它们不占内核 LLM 实例，
+        # 但用户必须在这里看到实际走的是号池/云端还是本地，不允许“一直显示本地”。
+        route_detail = ""
+        try:
+            from gateway.model_router import get_model_router
+            router = get_model_router()
+            routes = (router._task_routes_overlay()
+                      or dict(self._daemon._config.model_router.task_routes or {}))
+        except Exception:  # noqa: BLE001
+            routes = dict(self._daemon._config.model_router.task_routes or {})
+        parts = []
+        for task, label in (("extract", "抽取"), ("consolidation", "巩固")):
+            spec = str(routes.get(task) or "")
+            if spec:
+                parts.append(f"{label}→{_spec_label(spec)}")
+        route_detail = "；".join(parts)
+
+        llm = self._describe_model(
+            app.llm, configured=getattr(mcfg, "llm_backend", "local"),
+            cloud_label=mcfg.llm_model, local_label="DisabledLLM(已裁撤)")
+        # ★【2026-11-12 用户裁决】本地模型全删、全面云端：抽取/巩固实际走 model_router
+        # 的号池/云端路由，这里必须报路由真实态（如"号池 · hy4"），不允许再拿已裁撤的
+        # 本地实例占位——kind/local 恒为 DisabledLLM 占位，无信息量。
+        if route_detail:
+            llm.update({
+                "active": "cloud",
+                "kind": "ModelRouter",
+                "model": _spec_label(str(routes.get("extract") or "")),
+                "detail": route_detail,
+            })
         return {
-            **model,
-            "embedder": {"kind": type(app.embedder).__name__, "degraded": app.embedder.degraded},
-            "reranker": {"kind": type(app.reranker).__name__, "degraded": app.reranker.degraded},
-            "llm": {"kind": type(app.llm).__name__, "degraded": app.llm.degraded},
+            **base,
+            "embedder": self._describe_model(
+                app.embedder, configured=getattr(mcfg, "embed_backend", "local"),
+                cloud_label=f"硅基流动/{mcfg.embed_model}" if "siliconflow" in mcfg.embed_base_url
+                else mcfg.embed_model, local_label="BgeM3Embedder(本地)"),
+            "reranker": self._describe_model(
+                app.reranker, configured=getattr(mcfg, "rerank_backend", "local"),
+                cloud_label=f"硅基流动/{mcfg.rerank_model}" if "siliconflow" in mcfg.rerank_base_url
+                else mcfg.rerank_model, local_label="OnnxReranker(本地)"),
+            "llm": llm,
+            "task_routes": {k: v for k, v in (routes or {}).items()
+                            if k in ("extract", "consolidation", "rerank")},
         }
 
     # ── 配置（全量参数，走用户差异补丁）──────────────────────────────────

@@ -56,7 +56,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "sleep_nag": True,              # 深夜催睡
     "signature_auto": True,         # 被夸/受委屈/生日自动改签名
     "command_channel": True,        # ★ 闲聊/指令双通道：主人指令不装傻、由 WorkBuddy 执行
-    "max_lines_per_reply": 3,       # 每次回复条数上限
+    "max_lines_per_reply": 6,       # 每次回复条数上限（只兜底，不强制凑数）
     "emotion_baseline": {"p": 0.2, "a": 0.45, "d": 0.5},
 }
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
@@ -70,6 +70,8 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
 _FEEDBACK_MAX_STEP = 0.05           # 自动演化单次幅度上限
 _FEEDBACK_STREAK = 3                # 同向连续次数
 _FEEDBACK_SESSIONS = 2              # 跨会话数
+_FEEDBACK_SPAN_MS = 24 * 3600 * 1000   # ★ 阻尼：同向 streak 必须跨越 ≥24h（防一时脾气冲垮人设）
+_FEEDBACK_DAMP_WINDOW = 100         # ★ 阻尼：反向低通窗口（单次极端反馈不能盖过历史积累）
 _HISTORY_MAX = 60
 _LOG_MAX = 300
 
@@ -194,21 +196,53 @@ class PersonaLayer:
         """骨架全文由项目档案按需读取，不塞进每轮注入。"""
         return get_context_layers().documents_read(self._read().get("baseline_doc_id", BASELINE_DOC_ID)).get("content", "")
 
-    def compose_text(self) -> str:
-        """Bot 通道专用注入：骨架只读摘要 + 当前可调参数 + 护栏。"""
+    def compose_text(self, *, full: bool = False) -> str:
+        """Bot 通道人格注入。
+
+        full=True（聊天主链路用）：**完整行为剧本**（baseline_text，1805 字，含
+        "说话方式/防OOC/输出铁律/记忆调用"）+ 实时可调参数。这才是让大肥鱼"活"起来的
+        角色指令——QQ 侧 wbmod 一直读的是这份全文当 system；此前本方法只给 263 字
+        元数据摘要，导致同一个大肥鱼在超级大脑聊天里机械、在 QQ 里鲜活。
+        full=False（其它 Agent 的上下文投影）：保留精简摘要，省 token。
+        """
         data = self._read()
         p = dict(DEFAULT_PARAMS)
         p.update(data.get("params") or {})
         emo = p.get("emotion_baseline") or {}
         g = data.get("guardrails") or {}
-        return "\n".join([
-            f"【L0 人格层 · 大肥鱼】骨架只读：档案 #{data.get('baseline_doc_id', BASELINE_DOC_ID)}；"
-            "防 OOC 只在闲聊生效；主人下达操作指令走指令通道，由 WorkBuddy 接管执行，不装傻、不挡活。",
+        params_line = (
             "【可调参数】"
             f"方言≤{p.get('dialect_per_day')}句/天；斗嘴{p.get('sassiness')}；黏人{p.get('clinginess')}；"
             f"吃醋{p.get('jealousy')}；主动关心{p.get('care_initiative')}；催睡={'开' if p.get('sleep_nag') else '关'}；"
-            f"签名自动={'开' if p.get('signature_auto') else '关'}；每次≤{p.get('max_lines_per_reply')}条；"
-            f"情绪基线 P={emo.get('p')} A={emo.get('a')} D={emo.get('d')}。",
+            f"签名自动={'开' if p.get('signature_auto') else '关'}；"
+            f"最大回复条数={p.get('max_lines_per_reply')}（硬上限，不是每轮目标：实际按语境在 "
+            f"1~{p.get('max_lines_per_reply')} 条之间自然变化，绝大多数时候少于上限，不许每轮发满）；"
+            f"情绪基线 P={emo.get('p')} A={emo.get('a')} D={emo.get('d')}。"
+        )
+        if full:
+            # 完整行为剧本走进程内缓存（persona ns），避免每轮 read 档案全文；
+            # key 绑定骨架文件 mtime：主人改完 L0 立即生效，不必重启后端。
+            # 旧实现 key 只挂 doc_id + ttl_sec=0（永不过期），导致改人格必须重启进程。
+            mgr = get_cache_manager()
+            doc_id = data.get("baseline_doc_id", BASELINE_DOC_ID)
+            try:
+                stamp = (self.root / "documents" / f"{doc_id}.md").stat().st_mtime_ns
+            except OSError:
+                stamp = 0
+            key = f"baseline_full|{doc_id}|{stamp}"
+            script = mgr.get(_CACHE_NS, key) if mgr is not None else None
+            if script is None:
+                script = self.baseline_text() or ""
+                if mgr is not None:
+                    mgr.set(_CACHE_NS, key, script, ttl_sec=0)
+            header = "【大肥鱼人格 · 最高优先级角色设定】严格按以下行为剧本说话与待人：\n"
+            guard = ("\n【执行边界】读得到 ≠ 说得出：sensitive 记忆不外发；骨架字段只读；"
+                     "操作指令走 WorkBuddy 通道不装傻。\n" + params_line)
+            return header + script + guard
+        return "\n".join([
+            f"【L0 人格层 · 大肥鱼】骨架只读：档案 #{data.get('baseline_doc_id', BASELINE_DOC_ID)}；"
+            "防 OOC 只在闲聊生效；主人下达操作指令走指令通道，由 WorkBuddy 接管执行，不装傻、不挡活。",
+            params_line,
             "【人格护栏】读得到 ≠ 说得出：sensitive 记忆不外发、不进人格；骨架字段任何反馈不可改；"
             "执行权限归 WorkBuddy，不因人格演化放开；"
             f"Bot 全量可读={g.get('bot_reads_all_topics', True)}。",
@@ -326,12 +360,14 @@ class PersonaLayer:
                 "session_id": str(session_id)[:80], "actor": actor, "ts_ms": _now_ms(),
             })
             data["feedback_log"] = log[-_LOG_MAX:]
-            # 同向连续 N 次且跨会话 ≥ M 次才生成提案，防止单次情绪冲垮人格
+            # 同向连续 N 次 + 跨会话 ≥ M 次 + streak 时间跨度 ≥24h 才生成提案
+            #（★ 2026-11-12 阻尼：连续 3 句脾气≠人格该变，人设演化必须跨天成立）
             tail = data["feedback_log"][-_FEEDBACK_STREAK:]
             same = (len(tail) == _FEEDBACK_STREAK
                     and all(x["valence"] > 0 for x in tail) == (valence > 0)
                     and all(x["target"] == target for x in tail)
-                    and len({x["session_id"] for x in tail if x["session_id"]}) >= _FEEDBACK_SESSIONS)
+                    and len({x["session_id"] for x in tail if x["session_id"]}) >= _FEEDBACK_SESSIONS
+                    and (int(tail[-1]["ts_ms"]) - int(tail[0]["ts_ms"])) >= _FEEDBACK_SPAN_MS)
             proposal = None
             if same:
                 proposals = list(data.get("proposals") or [])
@@ -342,12 +378,23 @@ class PersonaLayer:
                     step = _FEEDBACK_MAX_STEP if valence > 0 else -_FEEDBACK_MAX_STEP
                     if hi - lo != 1.0:
                         step = step * (hi - lo)
+                    # ★ 阻尼低通：单次 -0.8 不许瞬间盖过长期 +0.2 的积累。
+                    #   damp = streak强度 / (streak强度 + 近窗反向强度)，历史上反向越多，
+                    #   本次提案步长越被压小；长期一致时 damp→1，步长足额。与
+                    #   affinity 低通滤波同构——人格参数也必须慢变量。
+                    tail_strength = sum(abs(x["valence"]) for x in tail) or 1e-6
+                    history = data["feedback_log"][-_FEEDBACK_DAMP_WINDOW:-_FEEDBACK_STREAK]
+                    opposite = sum(abs(x["valence"]) for x in history
+                                   if (x["valence"] > 0) != (valence > 0))
+                    damp = tail_strength / (tail_strength + opposite)
+                    step = step * damp
                     proposal = {
                         "id": uuid.uuid4().hex[:12], "target": target,
                         "from": current.get(target),
                         "to": round(max(lo, min(hi, float(current.get(target, lo)) + step)), 4),
                         "direction": "strengthen" if valence > 0 else "weaken",
-                        "reason": f"同向连续 {_FEEDBACK_STREAK} 次且跨会话 ≥{_FEEDBACK_SESSIONS}：{signal}",
+                        "reason": (f"同向连续 {_FEEDBACK_STREAK} 次、跨会话 ≥{_FEEDBACK_SESSIONS}"
+                                   f"且跨度 ≥24h（阻尼系数 {damp:.2f}）：{signal}"),
                         "evidence": [{"signal": x["signal"], "valence": x["valence"],
                                       "session_id": x["session_id"]} for x in tail],
                         "status": "pending", "created_ms": _now_ms(),

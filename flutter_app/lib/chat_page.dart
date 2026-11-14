@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import 'brain_client.dart';
 import 'chat_service.dart';
+import 'prefs.dart';
 
 /// 聊天入口测试页 —— 微信风格（浅色、绿/白气泡、顶栏"大肥鱼"）。
 /// 数据全部来自 8769 真实通道：hello 鉴权、typing、reply、error 帧。
@@ -27,9 +31,11 @@ class _ChatPageState extends State<ChatPage> {
   ChatLinkState _link = ChatLinkState.disconnected;
   String _tokenError = '';
   String _sessionId = '';
-  // 模型选择：'' = 跟随路由；free:* = 免密；其余 = WorkBuddy 模型
+  // 模型选择：'' = 跟随路由；其余 = WorkBuddy 模型（免密 free:* 已移除）
   String _selectedModel = '';
   bool _showEmojiPanel = false;
+  // 待发送图片（data URL）：点 + 选图 → 预览 → 随消息一起发
+  final List<String> _pendingImages = <String>[];
 
   /// 表情包（emoji 面板）：点击插入输入框，长按直接发送。
   static const List<String> _emojiSet = <String>[
@@ -41,7 +47,6 @@ class _ChatPageState extends State<ChatPage> {
     '🍅', '🍜', '🍚', '🍰', '🍵', '🍺', '🀄', '🎮', '😴', '💤',
   ];
   List<Map<String, dynamic>> _wbModels = <Map<String, dynamic>>[];
-  List<Map<String, dynamic>> _freeModels = <Map<String, dynamic>>[];
   bool _typing = false;
   StreamSubscription<Map<String, dynamic>>? _framesSub;
   StreamSubscription<ChatLinkState>? _stateSub;
@@ -53,9 +58,15 @@ class _ChatPageState extends State<ChatPage> {
   static const Color _text = Color(0xFF191919);
   static const Color _hint = Color(0xFF9B9B9B);
 
+  /// Prefs 键：模型选择与会话 id 跨页面/重启保留。
+  static const String _kModel = 'chat.selected_model';
+  static const String _kSession = 'chat.session_id';
+
   @override
   void initState() {
     super.initState();
+    // 读回上次选择：'' = 跟随路由；若选的模型已下架，_loadModels 后仍可手动改。
+    _selectedModel = Prefs.get<String>(_kModel, '');
     unawaited(_boot());
   }
 
@@ -76,16 +87,30 @@ class _ChatPageState extends State<ChatPage> {
       _stateSub = service.states.listen((state) {
         if (mounted) setState(() => _link = state);
       });
-      await service.connect(token);
+      // 带上持久化的 session_id：后端 restore 同一会话，历史不丢。
+      await service.connect(token,
+          sessionId: Prefs.get<String>(_kSession, ''));
     } catch (error) {
       if (mounted) setState(() => _tokenError = '连接失败：$error');
     }
+  }
+
+  /// 把模型一次回复按行拆成独立气泡（大肥鱼「一句话一条」铁律）。
+  /// 空行过滤；纯单行原样返回（保持空气泡也可，由调用方判断）。
+  static List<String> _splitReply(String text) {
+    final lines = text.split(RegExp(r'\r?\n'))
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    return lines.isEmpty ? <String>[text] : lines;
   }
 
   void _onFrame(Map<String, dynamic> frame) {
     final type = frame['type'];
     if (type == 'hello_ack') {
       _sessionId = (frame['session_id'] ?? '').toString();
+      // 后端 create 的新会话 id 或 restore 的旧 id 都写回，形成闭环。
+      if (_sessionId.isNotEmpty) Prefs.save(<String, dynamic>{_kSession: _sessionId});
       unawaited(_loadHistory());
       unawaited(_loadModels());
     } else if (type == 'typing') {
@@ -93,14 +118,27 @@ class _ChatPageState extends State<ChatPage> {
       if (mounted) setState(() => _typing = state != false);
     } else if (type == 'reply') {
       if (mounted) {
+        final text = (frame['text'] ?? '').toString();
+        final model = (frame['model'] ?? '').toString();
+        final kind = (frame['provider_kind'] ?? '').toString();
+        final fallback = frame['fallback'];
+        // 大肥鱼人格「一句话一条」：模型一次可回 1~3 句（换行分隔），
+        // 拆成独立气泡逐条呈现（与 QQ 桥拆行发送一致）；模型标签只挂最后一条。
+        final lines = _splitReply(text);
         setState(() {
           _typing = false;
-          _messages.add(_Msg(
-              text: (frame['text'] ?? '').toString(),
-              mine: false,
-              model: (frame['model'] ?? '').toString(),
-              kind: (frame['provider_kind'] ?? '').toString(),
-              fallback: frame['fallback']));
+          if (lines.length <= 1) {
+            _messages.add(_Msg(text: text, mine: false, model: model,
+                               kind: kind, fallback: fallback));
+          } else {
+            for (var i = 0; i < lines.length; i++) {
+              final last = i == lines.length - 1;
+              _messages.add(_Msg(
+                  text: lines[i], mine: false,
+                  model: last ? model : '', kind: last ? kind : '',
+                  fallback: last ? fallback : null));
+            }
+          }
         });
         unawaited(_scrollDown());
       }
@@ -116,7 +154,23 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  /// 模型清单（号池目录：WorkBuddy 启用模型 + 免费模型），进页面拉一次。
+  /// 号池目录混入的非对话模型 id 特征（补全/图像/视频/语音/向量）。
+  /// 聊天右上角只列 LLM：选到补全端点会直接发不出消息。
+  static final RegExp _nonChatModelId = RegExp(
+    r'(codewise|completion|[-_]image|[-_]video|[-_]tts|[-_]asr|[-_]embed|[-_]rerank|whisper)',
+    caseSensitive: false,
+  );
+
+  bool _isChatModel(String id) {
+    final base = id.toLowerCase();
+    if (_nonChatModelId.hasMatch(base)) return false;
+    // 纯补全底座小模型（不是对话档位）
+    if (base == 'hunyuan-3b' || base.startsWith('hunyuan-7b')) return false;
+    // auto / fast-model / balanced-model / deep-model 是 WorkBuddy 对话档位别名，保留
+    return true;
+  }
+
+  /// 模型清单（号池目录：只取 WorkBuddy 对话模型），进页面拉一次。
   Future<void> _loadModels() async {
     try {
       final data = await widget.client.call('pool.catalog', <String, dynamic>{});
@@ -125,7 +179,6 @@ class _ChatPageState extends State<ChatPage> {
           .map((e) => e.toString())
           .toSet();
       final wb = (data['wb'] as Map? ?? {});
-      final free = (data['free'] as Map? ?? {});
       String nameOf(dynamic row) {
         if (row is! Map) return '';
         final n = (row['name'] ?? '').toString();
@@ -136,7 +189,9 @@ class _ChatPageState extends State<ChatPage> {
       // 不同供应商同名模型不去重，加 id 标识区分（hy3/hy3-b…）
       final wbRows = <Map<String, dynamic>>[
         for (final row in (wb['models'] as List<dynamic>? ?? <dynamic>[]))
-          if (row is Map && !disabled.contains((row['id'] ?? '').toString()))
+          if (row is Map
+              && !disabled.contains((row['id'] ?? '').toString())
+              && _isChatModel((row['id'] ?? '').toString()))
             <String, dynamic>{
               'id': (row['id'] ?? '').toString(),
               'name': nameOf(row),
@@ -154,14 +209,13 @@ class _ChatPageState extends State<ChatPage> {
       }
       setState(() {
         _wbModels = wbRows;
-        _freeModels = <Map<String, dynamic>>[
-          for (final row in (free['models'] as List<dynamic>? ?? <dynamic>[]))
-            if (row is Map)
-              <String, dynamic>{
-                'id': 'free:${(row['id'] ?? '').toString()}',
-                'name': nameOf(row),
-              },
-        ];
+        // 选中模型若已下架/被禁用/变成非对话类型 → 自动回「跟随路由」并落盘，
+        // 否则发消息仍带失效 id（第 324 行）导致发送失败。
+        if (_selectedModel.isNotEmpty &&
+            !wbRows.any((m) => m['id'] == _selectedModel)) {
+          _selectedModel = '';
+          Prefs.save(<String, dynamic>{_kModel: ''});
+        }
       });
     } catch (_) {
       // 目录拉不到也能聊天（跟随路由）
@@ -183,11 +237,16 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         for (final row in rows) {
           if (row is! Map) continue;
-          _messages.add(_Msg(
-            text: (row['text'] ?? '').toString(),
-            mine: (row['role'] ?? '').toString() == 'user',
-            model: '', kind: '', fallback: null,
-          ));
+          final mine = (row['role'] ?? '').toString() == 'user';
+          final text = (row['text'] ?? '').toString();
+          // 历史 assistant 多句回放同样逐条拆气泡（用户消息保持原样）
+          if (!mine && text.contains(RegExp(r'\r?\n'))) {
+            for (final line in _splitReply(text)) {
+              _messages.add(_Msg(text: line, mine: false, model: '', kind: '', fallback: null));
+            }
+          } else {
+            _messages.add(_Msg(text: text, mine: mine, model: '', kind: '', fallback: null));
+          }
         }
       });
       unawaited(_scrollDown());
@@ -271,14 +330,48 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
+  /// 选图：文件选择器（png/jpg/webp/gif）→ 读字节 → data URL 进待发列表。
+  Future<void> _pickImage() async {
+    try {
+      const group = XTypeGroup(label: '图片', extensions: <String>['png', 'jpg', 'jpeg', 'webp', 'gif']);
+      final file = await openFile(acceptedTypeGroups: <XTypeGroup>[group]);
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      if (bytes.lengthInBytes > 8 * 1024 * 1024) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('图片超过 8MB，先压缩再发'), duration: Duration(seconds: 2)));
+        }
+        return;
+      }
+      final ext = file.name.split('.').last.toLowerCase().replaceAll('jpeg', 'jpg');
+      final mime = ext == 'png' ? 'image/png'
+          : ext == 'webp' ? 'image/webp'
+          : ext == 'gif' ? 'image/gif'
+          : 'image/jpeg';
+      final dataUrl = 'data:$mime;base64,${base64Encode(bytes)}';
+      if (!mounted) return;
+      setState(() {
+        if (_pendingImages.length < 4) _pendingImages.add(dataUrl);
+      });
+    } catch (_) {
+      // 选图失败不打断聊天
+    }
+  }
+
   void _send() {
     final text = _input.text.trim();
-    if (text.isEmpty || _service == null) return;
-    _service!.sendMessage(text, model: _selectedModel.isEmpty ? null : _selectedModel);
+    final images = List<String>.from(_pendingImages);
+    if ((text.isEmpty && images.isEmpty) || _service == null) return;
+    _service!.sendMessage(text,
+        model: _selectedModel.isEmpty ? null : _selectedModel,
+        images: images.isEmpty ? null : images);
     setState(() {
-      _messages.add(_Msg(text: text, mine: true, model: '', kind: '', fallback: null));
+      _messages.add(_Msg(text: text, mine: true, model: '', kind: '',
+          fallback: null, images: images.isEmpty ? null : images));
       _typing = true;
       _input.clear();
+      _pendingImages.clear();
     });
     unawaited(_scrollDown());
   }
@@ -336,8 +429,16 @@ class _ChatPageState extends State<ChatPage> {
               ),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
-                Text(msg.text,
-                    style: const TextStyle(color: _text, fontSize: 15, height: 1.35)),
+                if (msg.images != null && msg.images!.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Column(children: <Widget>[
+                      for (final src in msg.images!) _imageThumb(src),
+                    ]),
+                  ),
+                if (msg.text.isNotEmpty)
+                  Text(msg.text,
+                      style: const TextStyle(color: _text, fontSize: 15, height: 1.35)),
                 if (tags.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 4),
@@ -351,6 +452,29 @@ class _ChatPageState extends State<ChatPage> {
           if (mine) _avatar(mine),
         ],
       ),
+    );
+  }
+
+  /// data URL → 气泡缩略图（宽 ≤200，圆角）；非 data URL（http 图）直接 Image.network。
+  static Widget _imageThumb(String src) {
+    const double w = 200;
+    if (src.startsWith('data:image/')) {
+      final b64 = src.split(',').last;
+      try {
+        final Uint8List bytes = base64Decode(b64);
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.memory(bytes, width: w, fit: BoxFit.cover),
+        );
+      } catch (_) {
+        return const Text('（图片解码失败）', style: TextStyle(color: _hint, fontSize: 12));
+      }
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.network(src, width: w, fit: BoxFit.cover, errorBuilder:
+          (_, __, ___) => const Text('（图片加载失败）',
+              style: TextStyle(color: _hint, fontSize: 12))),
     );
   }
 
@@ -385,7 +509,10 @@ class _ChatPageState extends State<ChatPage> {
           // 模型选择（AstrBot 式）：跟随路由 / WorkBuddy 模型 / 免费模型
           PopupMenuButton<String>(
             tooltip: '选择回复模型',
-            onSelected: (value) => setState(() => _selectedModel = value),
+            onSelected: (value) {
+              setState(() => _selectedModel = value);
+              Prefs.save(<String, dynamic>{_kModel: value});   // 选了就记住，关页面不丢
+            },
             color: Colors.white,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -396,11 +523,7 @@ class _ChatPageState extends State<ChatPage> {
                         : const Color(0xFF4A90D9)),
                 const SizedBox(width: 4),
                 Text(
-                  _selectedModel.isEmpty
-                      ? '跟随路由'
-                      : (_selectedModel.startsWith('free:')
-                          ? '免费:${_selectedModel.split(':')[1]}'
-                          : _selectedModel),
+                  _selectedModel.isEmpty ? '跟随路由' : _selectedModel,
                   style: const TextStyle(color: _text, fontSize: 11),
                 ),
                 const Icon(Icons.arrow_drop_down, size: 16, color: _hint),
@@ -416,20 +539,6 @@ class _ChatPageState extends State<ChatPage> {
                     child: Text('WorkBuddy 模型',
                         style: TextStyle(color: _hint, fontSize: 10))),
                 for (final m in _wbModels)
-                  PopupMenuItem<String>(value: m['id'] as String, height: 34,
-                      child: Text(m['name'] as String,
-                          style: TextStyle(
-                              color: _selectedModel == m['id']
-                                  ? const Color(0xFF07C160)
-                                  : _text,
-                              fontSize: 12))),
-              ],
-              if (_freeModels.isNotEmpty) ...<PopupMenuEntry<String>>[
-                const PopupMenuDivider(),
-                const PopupMenuItem<String>(enabled: false, height: 28,
-                    child: Text('免密免费模型',
-                        style: TextStyle(color: _hint, fontSize: 10))),
-                for (final m in _freeModels)
                   PopupMenuItem<String>(value: m['id'] as String, height: 34,
                       child: Text(m['name'] as String,
                           style: TextStyle(
@@ -498,50 +607,89 @@ class _ChatPageState extends State<ChatPage> {
           padding: EdgeInsets.only(
               left: 10, right: 10, top: 6,
               bottom: 6 + MediaQuery.of(context).padding.bottom),
-          child: Row(children: <Widget>[
-            // 表情包开关
-            IconButton(
-              tooltip: '表情包',
-              onPressed: () => setState(() => _showEmojiPanel = !_showEmojiPanel),
-              icon: Icon(Icons.emoji_emotions_outlined,
-                  size: 22,
-                  color: _showEmojiPanel ? const Color(0xFF07C160) : _hint),
-            ),
-            Expanded(
-              child: TextField(
-                controller: _input,
-                style: const TextStyle(color: _text, fontSize: 15),
-                decoration: InputDecoration(
-                  hintText: '说点什么…',
-                  hintStyle: const TextStyle(color: _hint, fontSize: 14),
-                  filled: true,
-                  fillColor: Colors.white,
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(6),
-                      borderSide: const BorderSide(color: Color(0xFFDDDDDD))),
-                  focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(6),
-                      borderSide: const BorderSide(color: Color(0xFF07C160))),
-                ),
-                onSubmitted: (_) => _send(),
+          child: Column(mainAxisSize: MainAxisSize.min, children: <Widget>[
+            // 待发图片预览条
+            if (_pendingImages.isNotEmpty)
+              Container(
+                margin: const EdgeInsets.only(bottom: 6),
+                height: 64,
+                child: Row(children: <Widget>[
+                  for (final src in _pendingImages)
+                    Stack(children: <Widget>[
+                      Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: _imageThumb(src),
+                        ),
+                      ),
+                      Positioned(
+                        top: 0, right: 0,
+                        child: GestureDetector(
+                          onTap: () => setState(() => _pendingImages.remove(src)),
+                          child: Container(
+                            padding: const EdgeInsets.all(2),
+                            decoration: const BoxDecoration(
+                                color: Colors.black54, shape: BoxShape.circle),
+                            child: const Icon(Icons.close, size: 12, color: Colors.white),
+                          ),
+                        ),
+                      ),
+                    ]),
+                ]),
               ),
-            ),
-            const SizedBox(width: 8),
-            Material(
-              color: const Color(0xFF07C160),
-              borderRadius: BorderRadius.circular(6),
-              child: InkWell(
+            Row(children: <Widget>[
+              // 表情包开关
+              IconButton(
+                tooltip: '表情包',
+                onPressed: () => setState(() => _showEmojiPanel = !_showEmojiPanel),
+                icon: Icon(Icons.emoji_emotions_outlined,
+                    size: 22,
+                    color: _showEmojiPanel ? const Color(0xFF07C160) : _hint),
+              ),
+              // 发图（号池多模态模型可识别）
+              IconButton(
+                tooltip: '发图片',
+                onPressed: _pendingImages.length >= 4 ? null : _pickImage,
+                icon: const Icon(Icons.add_photo_alternate_outlined,
+                    size: 22, color: _hint),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _input,
+                  style: const TextStyle(color: _text, fontSize: 15),
+                  decoration: InputDecoration(
+                    hintText: _pendingImages.isEmpty ? '说点什么…' : '图片已就绪，可配一句话…',
+                    hintStyle: const TextStyle(color: _hint, fontSize: 14),
+                    filled: true,
+                    fillColor: Colors.white,
+                    contentPadding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        borderSide: const BorderSide(color: Color(0xFFDDDDDD))),
+                    focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(6),
+                        borderSide: const BorderSide(color: Color(0xFF07C160))),
+                  ),
+                  onSubmitted: (_) => _send(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Material(
+                color: const Color(0xFF07C160),
                 borderRadius: BorderRadius.circular(6),
-                onTap: _send,
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  child: Text('发送',
-                      style: TextStyle(color: Colors.white, fontSize: 14)),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: _send,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    child: Text('发送',
+                        style: TextStyle(color: Colors.white, fontSize: 14)),
+                  ),
                 ),
               ),
-            ),
+            ]),
           ]),
         ),
       ]),
@@ -566,6 +714,7 @@ class _Msg {
     required this.model,
     required this.kind,
     required this.fallback,
+    this.images,
   });
 
   final String text;
@@ -573,4 +722,5 @@ class _Msg {
   final String model;
   final String kind;
   final Object? fallback;
+  final List<String>? images;
 }

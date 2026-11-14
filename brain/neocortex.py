@@ -18,10 +18,14 @@ from models.neuron import Neuron
 __all__ = ["Consolidation", "Neocortex"]
 
 _NARRATIVE_SYSTEM_PROMPT = (
-    "你是「大肥鱼」，AI 自己的记忆叙事者。把给定的事件骨架重构成**第一人称**叙事：\n"
-    "1. 用「我」指代 AI，用「你」指代用户；讲的是「我与你之间发生过什么」；\n"
-    "2. 保留时间顺序、名字、因果与关键细节，不要写成「主题：xxx」这类抽象标签；\n"
-    "3. 带情绪弧线（当时我的心情如何、后来怎样变化），不编造未给出的细节；\n"
+    "你是「大肥鱼」，AI 自己的记忆叙事者。给定的是**跨天、多次事件**的骨架——"
+    "不要逐件流水账复述，做「跨事件交织」（2026-11-12 架构裁决：白天碎片已入池，"
+    "夜间不再缝合单次事件）：\n"
+    "1. 用「我」指代 AI，用「你」指代用户；讲「我们这段时间的关系与变化」，"
+    "把不同日子的事件对照着讲（比如中午还在撒娇、晚上却说好累）；\n"
+    "2. 发现跨天重复出现的模式就显式点出，并提炼更高维度的洞察"
+    "（如：你最近很需要情绪价值 / 你偏好直球的称呼），这是叙事的灵魂；\n"
+    "3. 保留名字、时间顺序、因果与情绪弧线，绝不编造未给出的细节；\n"
     "4. 只输出叙事正文，不要标题、不要解释。"
 )
 
@@ -121,17 +125,55 @@ class Neocortex:
             sources.append(dict(row))
         return sources
 
+    def _micro_narratives(self, hedges: list[dict[str, Any]]) -> list[str]:
+        """收集成员 neuron 上挂的白天微叙事（会话日记，is_micro_narrative=true）。
+
+        夜间重构优先采用微叙事当高密度摘要（2026-11-12 架构裁决：白天微叙事+
+        夜间宏观提炼解耦），比从碎片反推省 Token、少幻觉；取不到就退回骨架。
+        """
+        import json as _json
+
+        micro: list[str] = []
+        hp = self._hippocampus
+        kv = getattr(hp, "_kv", None) if hp is not None else None
+        if kv is None:
+            return micro
+        for hedge in hedges:
+            for mid in (hedge.get("members") or []):
+                if len(micro) >= 12:  # 上限：微叙事只是原料，不是全量复读
+                    return micro
+                try:
+                    raw = kv.get("meta", str(mid))
+                    if not raw:
+                        continue
+                    meta = _json.loads(bytes(raw).decode("utf-8", "replace"))
+                    nar = str(meta.get("narrative") or "").strip()
+                    if nar and nar not in micro:
+                        micro.append(nar)
+                except Exception:  # noqa: BLE001  单条失败跳过
+                    continue
+        return micro
+
     def _narrative_prompt(self, topic: str, hedges: list[dict[str, Any]]) -> str:
         bones: list[str] = []
         for hedge in sorted(hedges, key=lambda item: int(item.get("occurred_at_ms") or 0)):
             skeleton = hedge.get("skeleton") if isinstance(hedge.get("skeleton"), dict) else {}
             summaries = skeleton.get("member_summaries") or {}
             detail = "；".join(f"{key}：{value}" for key, value in list(summaries.items())[:4])
+            ts = int(hedge.get("occurred_at_ms") or 0)
+            day = (time.strftime("%m-%d %H:%M", time.localtime(ts / 1000))
+                   if ts > 0 else str(skeleton.get("time") or "—"))
             bones.append(
-                f"- {skeleton.get('time', '—')} {hedge.get('label') or '一件事'}"
+                f"- [{day}] {hedge.get('label') or '一件事'}"
                 f"（P={skeleton.get('pad', [0, 0, 0])[0]}）\n  成员：{detail or '—'}"
             )
-        return f"主题空间：{topic}\n按时间顺序的事件骨架：\n" + "\n".join(bones)
+        prompt = (f"主题空间：{topic}\n跨天的事件骨架（按时间顺序，注意对照不同日子的"
+                  "情绪反差与重复模式）：\n" + "\n".join(bones))
+        micro = self._micro_narratives(hedges)
+        if micro:
+            prompt += ("\n\n【白天的会话日记（微叙事，高密度摘要，优先采信）】\n"
+                       + "\n".join(f"- {m}" for m in micro))
+        return prompt
 
     def _template_narrative(self, topic: str, hedges: list[dict[str, Any]]) -> str:
         """模型不可用时的降级产物（B3 式优雅降级，不静默丢弃）。
@@ -220,6 +262,7 @@ class Neocortex:
             }
             written = self._hippocampus.remember(
                 text, agent_id="consolidator", cognition=cognition,
+                _from_bundle=True,  # 系统派生叙事（夜间由合规 hyperedge 聚合而成），非原始输入
             )
             neuron_id = written.neuron.uuid7_id
             for hedge in hedges:

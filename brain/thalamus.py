@@ -36,13 +36,42 @@ _INTENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def classify_intent(text: str) -> str:
-    """轻量规则意图判定（聊天热路径 <1ms，不调 LLM）。返回 chat 等 6 类之一。"""
-    content = str(text or "").lower()
+def _classify_intent_uncached(content: str) -> str:
     for intent, keywords in _INTENT_RULES:
         if any(keyword in content for keyword in keywords):
             return intent
     return "chat"
+
+
+def classify_intent(text: str) -> str:
+    """轻量规则意图判定（聊天热路径 <1ms，不调 LLM）。返回 chat 等 6 类之一。
+
+    v4.1-C 全开：意图分类结果写 ``thalamus`` ns（键=sha256(lower(text))）。
+    规则本身 <1ms，缓存收益在**高频重复问法**（同 session 常见寒暄/同指令）与
+    统一可观测性；未装配/异常一律回退纯函数，语义不变。
+    """
+    content = str(text or "").lower()
+    try:
+        from core.cache_manager import get_cache_manager
+
+        mgr = get_cache_manager()
+    except Exception:  # noqa: BLE001
+        mgr = None
+    key = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if mgr is not None:
+        try:
+            hit = mgr.get("thalamus", key)
+            if isinstance(hit, str):
+                return hit
+        except Exception:  # noqa: BLE001
+            pass
+    result = _classify_intent_uncached(content)
+    if mgr is not None:
+        try:
+            mgr.set("thalamus", key, result)
+        except Exception:  # noqa: BLE001
+            pass
+    return result
 
 
 def _now_ms() -> int:
@@ -133,6 +162,28 @@ class Thalamus:
 
     def _significance(self, neuron: Neuron, content: str) -> float:
         params = self.params
+        # v4.1-C 全开：显著性打分写 ``salience`` ns。键含三权重+PAD+长度+置信度，
+        # 参数变了自然换键（无需显式失效）；未装配/异常回退纯计算。
+        try:
+            from core.cache_manager import get_cache_manager
+
+            mgr = get_cache_manager()
+        except Exception:  # noqa: BLE001
+            mgr = None
+        key = ""
+        if mgr is not None:
+            p, a, d = neuron.pad.p, neuron.pad.a, neuron.pad.d
+            key = hashlib.sha256(
+                f"{len(content)}|{p:.3f}|{a:.3f}|{d:.3f}|{neuron.confidence:.3f}"
+                f"|{params.significance_length_weight}|{params.significance_pad_weight}"
+                f"|{params.significance_confidence_weight}".encode("utf-8")
+            ).hexdigest()
+            try:
+                hit = mgr.get("salience", key)
+                if isinstance(hit, (int, float)):
+                    return float(hit)
+            except Exception:  # noqa: BLE001
+                pass
         info = min(1.0, len(content) / max(params.significance_length_ref, 1))
         salience = neuron.pad.salience()
         score = (
@@ -140,7 +191,13 @@ class Thalamus:
             + params.significance_pad_weight * salience
             + params.significance_confidence_weight * neuron.confidence
         )
-        return max(0.0, min(1.0, score))
+        value = max(0.0, min(1.0, score))
+        if mgr is not None and key:
+            try:
+                mgr.set("salience", key, value)
+            except Exception:  # noqa: BLE001
+                pass
+        return value
 
     # ── 去重索引（KV 单键滚动窗口，确定性、无扫描放大）──────────────────
     def _recent(self) -> list[dict[str, object]]:

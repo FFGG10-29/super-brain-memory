@@ -64,6 +64,16 @@ class FakeHippocampus:
             admission=SimpleNamespace(reason="new", duplicate_of=""),
             neuron=Neuron(agent_id=agent_id, content=content, namespace="topic:default"))
 
+    def remember_bundle(self, bundle, *, agent_id: str = "", namespace: str = ""):
+        self.cognitions.append({"content": "|".join(i.content for i in bundle.items),
+                                "agent_id": agent_id, "namespace": namespace, "bundle": True})
+        return {"applied": len(bundle.items), "total": len(bundle.items),
+                "neuron_ids": ["n-mock"], "handled": True,
+                "complexity": getattr(bundle, "complexity", "")}
+
+    def _defer_orphan(self, content, agent_id, cognition=None):
+        self.cognitions.append({"content": content, "deferred": True, "agent_id": agent_id})
+
 
 class FakeRelational:
     def __init__(self, rows: list[dict] | None = None) -> None:

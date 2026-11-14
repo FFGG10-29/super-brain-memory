@@ -119,8 +119,11 @@ a = Analysis(
         "core.fast_recall", "gateway.media_service",
         "chat.engine", "chat.protocol", "chat.event_bus", "chat.session_registry",
         "gateway.model_router",
-        # 号池网关由 model_router 函数内延迟导入，静态分析抓不到
+        # 号池网关由 model_router 函数内延迟导入，静态分析抓不到（P1-3 补齐 3 个）
         "gateway.account_pool.store", "gateway.account_pool.pool",
+        "gateway.account_pool.catalog",   # pool.invoke/model_router._complete_explicit 函数内导入
+        "gateway.account_pool.atrest",    # store._decrypt_if_encrypted 加密登录态解密核心
+        "storage.vector_cache",           # main.build_app C18 向量索引段缓存装饰器
         "workers.life_loop", "workers.circadian", "sync.git_worker", "sync.snapshot",
         "gateway.mcp_stdio", "gateway.http_adapter", "gateway.mcp_server",
         "gateway.tool_catalog", "gateway.bridge_launcher",

@@ -31,14 +31,13 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
   static const List<String> _tasks = <String>['extract', 'rerank', 'consolidation'];
   static const Map<String, String> _taskLabels = <String, String>{
     'extract': '记忆抽取（报名/登记 LLM）',
-    'rerank': '精排（预留：当前 ONNX 本地）',
+    'rerank': '精排（留空=本地 ONNX；配远程卸掉 CPU/显存）',
     'consolidation': '巩固（再巩固窗口 LLM）',
   };
 
   Map<String, dynamic> _data = <String, dynamic>{};
   Map<String, String> _routes = <String, String>{};
   List<Map<String, dynamic>> _poolModels = <Map<String, dynamic>>[];
-  List<Map<String, dynamic>> _freeModels = <Map<String, dynamic>>[];
   String _message = '';
   bool _busy = false;
 
@@ -69,21 +68,12 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
             .map((e) => e.toString())
             .toSet();
         final wb = (catalog['wb'] as Map? ?? {});
-        final free = (catalog['free'] as Map? ?? {});
         setState(() {
           _poolModels = <Map<String, dynamic>>[
             for (final row in (wb['models'] as List<dynamic>? ?? <dynamic>[]))
               if (row is Map && !disabled.contains((row['id'] ?? '').toString()))
                 <String, dynamic>{
                   'id': (row['id'] ?? '').toString(),
-                  'name': (row['name'] ?? '').toString(),
-                },
-          ];
-          _freeModels = <Map<String, dynamic>>[
-            for (final row in (free['models'] as List<dynamic>? ?? <dynamic>[]))
-              if (row is Map)
-                <String, dynamic>{
-                  'id': 'free:${(row['id'] ?? '').toString()}',
                   'name': (row['name'] ?? '').toString(),
                 },
           ];
@@ -313,7 +303,7 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
               const SizedBox(height: 4),
               const Text(
                   '后端小模型不必只吃本地：给每个任务点名一个远程供应商。'
-                  'spec 填 pool:模型名（号池 failover）、free:模型名（免密）、'
+                  'spec 填 pool:模型名（号池 failover）、'
                   'provider:名称（云供应商）；留空 = 本地 0.6B。',
                   style: TextStyle(color: _hint, fontSize: 11, height: 1.5)),
               const SizedBox(height: 8),
@@ -340,7 +330,8 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                   )),
             ]),
           ),
-          // ── 本地模型 ──────────────────────────────────────────────────
+          // ── 本地模型（已裁撤占位）──────────────────────────────────────
+          // 2026-11-12 全面云端：bge-m3 / 精排 ONNX / Qwen 0.6B 全部删除，本区块仅提示。
           Container(
             margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
             padding: const EdgeInsets.all(14),
@@ -353,12 +344,9 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                   style: TextStyle(color: Colors.white, fontSize: 13,
                       fontWeight: FontWeight.w600)),
               const SizedBox(width: 12),
-              Text('Ollama ${_data['local_endpoint'] ?? '-'} · '
-                  '路由本地档 ${_data['local_model'] ?? '-'}',
-                  style: const TextStyle(color: _hint, fontSize: 11)),
-              const Spacer(),
-              const Text('抽取 0.6B / embedding / 精排 ONNX 均在本机运行',
-                  style: TextStyle(color: _hint, fontSize: 10)),
+              Expanded(child: Text('已全部裁撤（bge-m3 / 精排 ONNX / Qwen 0.6B 已删除），'
+                  '全链路走云端/号池',
+                  style: const TextStyle(color: _hint, fontSize: 11))),
             ]),
           ),
         ]),
@@ -378,7 +366,7 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
     }
   }
 
-  /// 路由配置：下拉选择器（本地 / 号池模型 / 免费模型 / 云供应商）。
+  /// 路由配置：下拉选择器（本地 / 号池模型 / 云供应商）。
   Future<void> _routeDialog(String task) async {
     final providers = (_data['providers'] as List<dynamic>? ?? <dynamic>[])
         .whereType<Map>()
@@ -418,17 +406,6 @@ class _ModelProvidersPageState extends State<ModelProvidersPage> {
                     for (final m in _poolModels)
                       DropdownMenuItem<String>(
                           value: 'pool:${m['id']}',
-                          child: Text(m['name'] as String,
-                              style: const TextStyle(
-                                  color: Colors.white, fontSize: 12))),
-                  ],
-                  if (_freeModels.isNotEmpty) ...<DropdownMenuItem<String>>[
-                    const DropdownMenuItem<String>(enabled: false,
-                        child: Text('— 免密免费模型 —',
-                            style: TextStyle(color: _hint, fontSize: 10))),
-                    for (final m in _freeModels)
-                      DropdownMenuItem<String>(
-                          value: m['id'] as String,
                           child: Text(m['name'] as String,
                               style: const TextStyle(
                                   color: Colors.white, fontSize: 12))),

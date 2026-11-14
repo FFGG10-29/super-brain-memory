@@ -6,7 +6,7 @@ import 'brain_client.dart';
 
 /// 号池网关 —— 对齐 dsh-xdpool 原版：账号池表格（账号/区域/状态/已服务/操作）+
 /// 重新扫描凭证 + 一键签到 + 模型目录（WorkBuddy 倍率/上下文/限时免费/开关）+
-/// 免密 lane 全量免费模型（70+，opencode listing 实时）+ 拉起 WorkBuddy 登录。
+/// 云供应商 API key 配置 + 拉起 WorkBuddy 登录（免密 lane 已移除）。
 /// 全部走后端真实 RPC：pool.status/rescan/logout/restore/catalog/
 /// catalog_refresh/model_toggle/checkin/login_start。
 class PoolPage extends StatefulWidget {
@@ -42,15 +42,93 @@ class _PoolPageState extends State<PoolPage> {
   Map<String, dynamic> _data = <String, dynamic>{};
   Map<String, dynamic> _catalog = <String, dynamic>{};
   List<Map<String, dynamic>> _registry = <Map<String, dynamic>>[];
-  bool _showDisabled = false;
+  // 已禁用模型一律隐藏（关掉就消失）；要恢复去「同步模型表」后重新开启或后端 accounts.json 改
   String _message = '';
   bool _busy = false;
   String _acting = '';
+  // ★ 浏览器 OAuth 扫码登录（复用 wbmod 号池网关闭环，凭证落共享 vault 自动入池）
+  Timer? _oauthPollTimer;
+  String _oauthLoginId = '';
+  int _oauthElapsedSec = 0;
 
   @override
   void initState() {
     super.initState();
     unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _oauthPollTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 浏览器扫码登录：start 拿 authUrl（后端已用系统浏览器打开），轮询 poll 直至扫码成功。
+  Future<void> _oauthLogin() async {
+    if (_acting.isNotEmpty) return;
+    setState(() {
+      _acting = 'oauth';
+      _message = '正在发起浏览器登录…';
+      _oauthElapsedSec = 0;
+    });
+    try {
+      final start = await widget.client.call('pool.oauth_start', <String, dynamic>{'region': 'cn'});
+      if (start is! Map || start['ok'] != true) {
+        throw Exception(start is Map ? (start['error'] ?? '发起失败') : '发起失败');
+      }
+      _oauthLoginId = start['loginId'].toString();
+      final authUrl = start['authUrl'].toString();
+      if (mounted) setState(() {
+        _message = start['opened'] == true
+            ? '浏览器已打开，请扫码确认（最长等 5 分钟）…\n若未弹出，请手动打开：$authUrl'
+            : '请手动在浏览器打开并扫码：$authUrl';
+      });
+      _oauthPollTimer?.cancel();
+      _oauthPollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+        _oauthElapsedSec += 2;
+        try {
+          final raw = await widget.client.call('pool.oauth_poll',
+              <String, dynamic>{'loginId': _oauthLoginId});
+          final Map<String, dynamic> p = raw is Map
+              ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+          final done = p['done'] == true;
+          final ok = p['ok'] == true;
+          if (done && ok) {
+            _oauthPollTimer?.cancel();
+            final account = p['account'] is Map
+                ? Map<String, dynamic>.from(p['account'] as Map) : <String, dynamic>{};
+            if (mounted) setState(() {
+              _acting = '';
+              _message = '登录成功，账号已入池：${(account['label'] ?? account['id'] ?? '')}';
+            });
+            await _load();
+            return;
+          }
+          if (done && !ok) {
+            _oauthPollTimer?.cancel();
+            if (mounted) setState(() {
+              _acting = '';
+              _message = '登录未完成：${p['error'] ?? '超时'}';
+            });
+            return;
+          }
+          if (_oauthElapsedSec >= 150) {
+            _oauthPollTimer?.cancel();
+            if (mounted) setState(() {
+              _acting = '';
+              _message = '扫码超时（5 分钟），请重新发起';
+            });
+            return;
+          }
+          if (mounted) setState(() => _message = '等待扫码确认… $_oauthElapsedSec/150 秒');
+        } catch (_) { /* 网络抖动继续轮询 */ }
+      });
+    } catch (e) {
+      if (mounted) setState(() {
+        _acting = '';
+        _message = '浏览器登录失败：$e';
+      });
+    }
   }
 
   Future<void> _load({bool forceCatalog = false}) async {
@@ -156,6 +234,55 @@ class _PoolPageState extends State<PoolPage> {
     }
   }
 
+  /// 同名同倍率的一组路由变体（hy3/hy3-b/hy3-c…）统一启停：
+  /// 一次性改 disabled_models 并批量告知后端，避免逐条 RPC 与中间态闪烁。
+  Future<void> _toggleModelGroup(List<String> ids, bool enabled) async {
+    final disabledList = ((_catalog['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+        .map((e) => e.toString())
+        .toSet();
+    for (final id in ids) {
+      if (enabled) {
+        disabledList.remove(id);
+      } else {
+        disabledList.add(id);
+      }
+    }
+    setState(() {
+      _catalog['disabled_models'] = disabledList.toList();
+      _acting = 'group-${ids.first}';
+      _message = enabled ? '已启用' : '已禁用';
+    });
+    try {
+      for (final id in ids) {
+        final result = await widget.client.call(
+            'pool.model_toggle', <String, dynamic>{'model_id': id, 'enabled': enabled});
+        if (result is! Map || result['ok'] != true) {
+          throw (result is Map ? (result['error'] ?? '未知原因') : '响应异常');
+        }
+      }
+    } catch (error) {
+      // 失败回滚整组
+      final rollback = ((_catalog['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+          .map((e) => e.toString())
+          .toSet();
+      for (final id in ids) {
+        if (enabled) {
+          rollback.add(id);
+        } else {
+          rollback.remove(id);
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _catalog['disabled_models'] = rollback.toList();
+          _message = '分组开关失败：$error';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _acting = '');
+    }
+  }
+
   Widget _pill(String text, Color tone) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
         decoration: BoxDecoration(
@@ -203,7 +330,7 @@ class _PoolPageState extends State<PoolPage> {
         : dead
             ? _pill('失效 ${deadSec}s', _dead)
             : (cooldowns.isNotEmpty
-                ? _pill('冷却(${cooldowns.length}模型)', _warn)
+                ? _pill('冷却中', _warn)
                 : _pill('ready', _ok));
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
@@ -270,22 +397,34 @@ class _PoolPageState extends State<PoolPage> {
   }
 
   // 模型行：两行式——信息+启用开关；思考档 / 图片 / 上下文预算 / 拉起。
-  Widget _modelRow(Map model) {
+  // groupIds 非空表示该行代表一组同名同倍率的路由变体（如 hy3/hy3-b/hy3-c），
+  // 开关作用于整组；避免上游把 9 个变体都叫 "Hy3" 时刷出一整屏重复行。
+  Widget _modelRow(Map model, {List<String> groupIds = const <String>[]}) {
     final id = (model['id'] ?? '').toString();
     final name = (model['name'] ?? id).toString();
     final multiplier = model['multiplier'];
     final ctx = model['context_window'];
+    final isGroup = groupIds.length > 1;
+    // ★ 免费只认后端 promo_free（现已严格=真实倍率 0），绝不因"促销"误标免费——
+    // 上游把正在扣费的 x0.11/x0.51 也塞进促销名单，标"限时免费"会误导白嫖判断。
     final promoFree = (model['promo_free'] ?? false) == true;
+    final promotion = (model['promotion'] ?? '').toString();
     final image = (model['image'] ?? false) == true;
     final reasoning = (model['reasoning'] ?? false) == true;
     final wire = (model['wire'] ?? '').toString();
     final regionSensitive = (model['region_sensitive'] ?? false) == true;
     final pref = _pref(id);
-    final disabled = _disabled.contains(id) || pref['enabled'] == false;
+    // 分组行：整组任一变体启用即算启用；开关一次性作用于全组
+    final disabledSet = _disabled;
+    final disabled = isGroup
+        ? groupIds.every((gid) => disabledSet.contains(gid) || _pref(gid)['enabled'] == false)
+        : (disabledSet.contains(id) || pref['enabled'] == false);
     final prefImage = pref.containsKey('image') ? pref['image'] == true : image;
     final thinking = (pref['thinking'] ?? '').toString();
     final ctxBudget = pref['ctx_budget'];
+    final category = (model['category'] ?? '').toString();
     final tags = <String>[
+      if (category.isNotEmpty) category,
       if (multiplier is num) 'x${multiplier.toStringAsFixed(2)}',
       if (multiplier == null && model.containsKey('multiplier')) '倍率未取到',
       if (ctx is num && ctx > 0) '原生 ${(ctx / 1000).toStringAsFixed(0)}K',
@@ -305,14 +444,18 @@ class _PoolPageState extends State<PoolPage> {
             flex: 6,
             child: Row(children: <Widget>[
               Flexible(
-                child: Text((model['display'] ?? name).toString(),
+                child: Text(isGroup ? name : (model['display'] ?? name).toString(),
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                         color: disabled ? _hint : Colors.white, fontSize: 12)),
               ),
               if (promoFree) ...<Widget>[
                 const SizedBox(width: 6),
-                _pill('限时免费', _promo),
+                _pill('免费', _promo),
+              ] else if (promotion.isNotEmpty) ...<Widget>[
+                // 促销 ≠ 免费：单独灰标，倍率仍在右侧显示真实值
+                const SizedBox(width: 6),
+                _pill('促销中', _hint),
               ],
             ]),
           ),
@@ -333,7 +476,9 @@ class _PoolPageState extends State<PoolPage> {
               materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
               onChanged: _acting.isNotEmpty
                   ? null
-                  : (value) => unawaited(_toggleModel(id, value)),
+                  : (value) => unawaited(isGroup
+                      ? _toggleModelGroup(groupIds, value)
+                      : _toggleModel(id, value)),
             ),
           ),
         ]),
@@ -546,44 +691,102 @@ class _PoolPageState extends State<PoolPage> {
 
   Widget _catalogCard() {
     final wb = (_catalog['wb'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{});
-    final free = (_catalog['free'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{});
     final wbModels = (wb['models'] as List<dynamic>? ?? <dynamic>[])
         .whereType<Map>()
         .map(Map<String, dynamic>.from)
         .toList()
       ..sort((a, b) {
+        // 档位（快速/均衡/极致）置顶，与客户端下拉一致；再按免费、名称。
+        final ta = (a['tier'] ?? false) == true ? 0 : 1;
+        final tb = (b['tier'] ?? false) == true ? 0 : 1;
+        if (ta != tb) return ta - tb;
         final pa = (a['promo_free'] ?? false) == true ? 0 : 1;
         final pb = (b['promo_free'] ?? false) == true ? 0 : 1;
         if (pa != pb) return pa - pb;
         return (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString());
       });
-    // 禁用的不显示（原版行为）；需要恢复时点「显示已禁用」
+    // 已禁用一律隐藏：关掉就消失，不再占据列表
     final disabledSet = _disabled;
-    final visibleWb = _showDisabled
-        ? wbModels
-        : wbModels.where((m) => !disabledSet.contains((m['id'] ?? '').toString())).toList();
-    // 同名变体（hy3/hy3-b/hy3-c… 上游名字都叫 Hy3）：重名时后缀 id 区分
-    final nameCounts = <String, int>{};
+    final visibleWb =
+        wbModels.where((m) => !disabledSet.contains((m['id'] ?? '').toString())).toList();
+    // ★ 同名同倍率合并为一行（2026-11-12 修"9 个 Hy3 刷屏"）：
+    //   上游把 hy3/hy3-b/hy3-c/hy4flash-exp1-4 等不同路由变体都命名 "Hy3"，
+    //   逐行渲染就是一整屏重复。按 (name, multiplier) 分组，每组取首个为代表，
+    //   变体 id 收进 groupIds，行内标"N 个变体"，开关整组生效。
+    //   倍率不同的同名模型（如 hy3 x0.00 vs hy3-x x0.05）保持分行——价格不同必须区分。
+    final Map<String, List<Map<String, dynamic>>> groups = <String, List<Map<String, dynamic>>>{};
+    final List<String> groupOrder = <String>[];
     for (final m in visibleWb) {
-      final n = (m['name'] ?? '').toString();
-      nameCounts[n] = (nameCounts[n] ?? 0) + 1;
+      final n = (m['name'] ?? m['id'] ?? '').toString();
+      final mult = m['multiplier'];
+      final key = '$n|${mult is num ? mult.toStringAsFixed(2) : 'none'}';
+      if (!groups.containsKey(key)) {
+        groups[key] = <Map<String, dynamic>>[];
+        groupOrder.add(key);
+      }
+      groups[key]!.add(m);
     }
-    for (final m in visibleWb) {
-      final n = (m['name'] ?? '').toString();
-      final id = (m['id'] ?? '').toString();
-      if ((nameCounts[n] ?? 0) > 1 && id != n) {
-        m['display'] = '$n · $id';
-      } else {
-        m['display'] = n;
+    // 沿用上面的排序：档位组优先 → 免费组 → name
+    groupOrder.sort((a, b) {
+      final ga = groups[a]!.first;
+      final gb = groups[b]!.first;
+      final ta = (ga['tier'] ?? false) == true ? 0 : 1;
+      final tb = (gb['tier'] ?? false) == true ? 0 : 1;
+      if (ta != tb) return ta - tb;
+      final pa = (ga['promo_free'] ?? false) == true ? 0 : 1;
+      final pb = (gb['promo_free'] ?? false) == true ? 0 : 1;
+      if (pa != pb) return pa - pb;
+      return (ga['name'] ?? '').toString().compareTo((gb['name'] ?? '').toString());
+    });
+    final groupRows = groupOrder.map((key) => MapEntry(
+        groups[key]!.first,
+        groups[key]!.map((m) => (m['id'] ?? '').toString()).where((s) => s.isNotEmpty).toList(),
+    )).toList();
+    // ★ 供应商免费模型并入目录（2026-11-12）：硅基流动/OpenRouter 的模型也在此
+    //   显示、可单独启用/禁用。用 display 前缀标来源，复用 _modelRow 的 _pref 开关。
+    //   只展示有模型清单的供应商；custom_openai(0 模型) 跳过。
+    final List<Widget> supplierBlocks = <Widget>[];
+    supplierBlocks.add(const Padding(
+      padding: EdgeInsets.only(top: 8, bottom: 2),
+      child: Text('云供应商免费模型（来自注册表；开关仅影响记忆偏好，'
+          '实际调用的模型在下方「云供应商」卡片的下拉里选）',
+          style: TextStyle(color: _hint, fontSize: 10, height: 1.4)),
+    ));
+    for (final reg in _registry) {
+      final rid = (reg['id'] ?? '').toString();
+      final rname = (reg['name'] ?? rid).toString();
+      final models = (reg['models'] as List<dynamic>? ?? <dynamic>[])
+          .whereType<Map>()
+          .map(Map<String, dynamic>.from)
+          .toList();
+      if (models.isEmpty) continue;
+      supplierBlocks.add(Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: Row(children: <Widget>[
+          Icon(_supplierIcon(rid), size: 13, color: _accent),
+          const SizedBox(width: 5),
+          Text(rname,
+              style: const TextStyle(color: _accent, fontSize: 11,
+                  fontWeight: FontWeight.w600)),
+        ]),
+      ));
+      for (final m in models) {
+        final mid = (m['id'] ?? '').toString();
+        final cat = (m['category'] ?? '').toString();
+        final ctx = m['contextWindow'];
+        supplierBlocks.add(_modelRow(<String, dynamic>{
+          'id': mid,
+          'display': '$rname · ${m['name'] ?? mid}',
+          'multiplier': 0.0,
+          'promo_free': true,
+          'context_window': ctx is num ? ctx : null,
+          'image': (cat == 'llm-vision'),
+          'reasoning': (m['reasoning'] == true),
+          'category': cat,
+        }));
       }
     }
-    final freeModels = (free['models'] as List<dynamic>? ?? <dynamic>[])
-        .whereType<Map>()
-        .map(Map<String, dynamic>.from)
-        .toList()
-      ..sort((a, b) => (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString()));
-    final freeLaneOn = (_data['free_lane'] ?? false) == true;
-    final live = (wb['live'] == true) || (free['live'] == true);
+    final live = wb['live'] == true;
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
       padding: const EdgeInsets.all(14),
@@ -600,16 +803,8 @@ class _PoolPageState extends State<PoolPage> {
                   fontWeight: FontWeight.w600)),
           const SizedBox(width: 8),
           _pill(live ? '上游实时' : '静态兜底', live ? _ok : _hint),
-          const SizedBox(width: 6),
-          // 原版行为：禁用即从列表消失；这里留恢复口
-          InkWell(
-            onTap: () => setState(() => _showDisabled = !_showDisabled),
-            child: Text(
-                _showDisabled ? '隐藏已禁用' : '显示已禁用（${disabledSet.length}）',
-                style: const TextStyle(color: _hint, fontSize: 10)),
-          ),
           const Spacer(),
-          // 原版「同步模型表」：强制重拉 /v3/config + 免密 listing
+          // 「同步模型表」：强制重拉 WorkBuddy /v3/config
           _actionButton('同步模型表', Icons.sync, 'catalog',
               () => unawaited(_rpc('pool.catalog',
                   <String, dynamic>{'force': true}, 'catalog',
@@ -631,45 +826,48 @@ class _PoolPageState extends State<PoolPage> {
             child: Text('WorkBuddy 目录未取到（账号未入池或上游不可达）。',
                 style: TextStyle(color: _hint, fontSize: 12)),
           )
-        else ...visibleWb.map(_modelRow),
-        const Divider(color: _border, height: 14),
-        // 免密 lane：70+ 免费模型（实时 listing，静态兜底保底）
-        ExpansionTile(
-          tilePadding: EdgeInsets.zero,
-          childrenPadding: EdgeInsets.zero,
-          iconColor: _hint,
-          collapsedIconColor: _hint,
-          title: Row(children: <Widget>[
-            Text('免密免费模型 · ${freeModels.length} 个',
-                style: const TextStyle(color: Colors.white, fontSize: 13,
-                    fontWeight: FontWeight.w600)),
-            const SizedBox(width: 8),
-            _pill(freeLaneOn ? 'lane 开' : 'lane 关（配置 free_lane）',
-                freeLaneOn ? _ok : _warn),
-            if ((free['live'] ?? false) == true) ...<Widget>[
-              const SizedBox(width: 6),
-              _pill('实时', _ok),
-            ],
-          ]),
-          subtitle: const Text(
-              'opencode.ai 免密通道（Bearer public），无需账号；倍率恒为 0，'
-              '分区敏感模型需出口网络匹配。',
-              style: TextStyle(color: _hint, fontSize: 10)),
-          children: <Widget>[
-            if (freeModels.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text('免费模型清单未取到。',
-                    style: TextStyle(color: _hint, fontSize: 12)),
-              )
-            else ...freeModels.map(_modelRow),
-          ],
-        ),
+        else ...groupRows.map((entry) => _modelRow(entry.key, groupIds: entry.value)),
+        if (supplierBlocks.isNotEmpty) ...<Widget>[
+          const Divider(color: _border, height: 14),
+          ...supplierBlocks,
+        ],
       ]),
     );
   }
 
-  // ── 浏览器登录 · 添加账号：77 家 API 供应商（xdpool 原版布局移植）──────
+  IconData _supplierIcon(String id) {
+    switch (id) {
+      case 'siliconflow': return Icons.bolt;
+      case 'open_router': return Icons.router;
+      case 'volcengine-ark':
+      case 'byteplus': return Icons.cloud;
+      default: return Icons.extension;
+    }
+  }
+
+  /// 类别中文标签（防止把向量/精排/TTS 当对话模型选错）。
+  String _catLabel(String cat) {
+    switch (cat) {
+      case 'embedding': return '向量';
+      case 'rerank': return '精排';
+      case 'llm': return '对话';
+      case 'llm-code': return '代码';
+      case 'llm-vision': return '视觉';
+      case 'asr': return '语音识别';
+      case 'asr-diarization': return '声纹分离';
+      case 'translation': return '翻译';
+      case 'tts': return '语音合成';
+      case 'router': return '路由';
+      default: return cat.isEmpty ? '未标注' : cat;
+    }
+  }
+
+  /// 只有这几类走 OpenAI /chat/completions，能当"对话模型"填进路由。
+  /// embedding/rerank/tts/asr 是专用端点，选了会 404/400，禁止当作对话模型保存。
+  bool _isChatModel(String cat) => cat == 'llm' || cat == 'llm-code' ||
+      cat == 'llm-vision' || cat == 'router';
+
+  // ── 浏览器登录 · 添加账号：云供应商 API key ────────────────────────────
   // 每行：名称（N 模型）+ 模型下拉 + API key 输入 + 保存（存系统凭据库并热重载）
   final Map<String, String> _registryModelPick = <String, String>{};
   final Map<String, TextEditingController> _registryKeyControllers =
@@ -690,15 +888,16 @@ class _PoolPageState extends State<PoolPage> {
                 fontWeight: FontWeight.w600)),
         const SizedBox(height: 4),
         const Text(
-            'WorkBuddy 新账号点右上「多账号 → 浏览器登录」扫码确认，凭证自动入池（多账号并存）；'
-            '下面 77 家是 API key 供应商：填 key 保存即热重载进聊天路由。',
+            'WorkBuddy 新账号：点上方「浏览器登录」扫码确认即自动入池（OAuth 凭证落共享 vault）；'
+            '或点「拉起桌面端」手动切号后重扫。'
+            '下面云供应商只保留硅基流动 / OpenRouter / 字节 / 自定义：填 key 保存即热重载进聊天路由。',
             style: TextStyle(color: _hint, fontSize: 11)),
         const SizedBox(height: 6),
         ExpansionTile(
           tilePadding: EdgeInsets.zero,
           childrenPadding: EdgeInsets.zero,
           iconColor: _hint, collapsedIconColor: _hint,
-          title: Text('云供应商 · ${_registry.length} 家',
+          title: Text('云供应商',
               style: const TextStyle(color: Colors.white, fontSize: 13,
                   fontWeight: FontWeight.w600)),
           children: <Widget>[
@@ -717,8 +916,15 @@ class _PoolPageState extends State<PoolPage> {
         .whereType<Map>()
         .map(Map<String, dynamic>.from)
         .toList();
-    final picked = _registryModelPick[id] ??
-        (models.isNotEmpty ? (models.first['id'] ?? '').toString() : '');
+    // 默认选第一个「可对话」模型（向量/精排/TTS 不能填进 chat 路由）
+    final chatModels = models.where((m) => _isChatModel((m['category'] ?? '').toString())).toList();
+    Map<String, dynamic>? defaultModel = chatModels.isNotEmpty
+        ? chatModels.first : (models.isNotEmpty ? models.first : null);
+    final picked = _registryModelPick[id] ?? defaultModel?['id']?.toString() ?? '';
+    // 当前选中模型的类别 → 非对话模型禁止保存
+    final pickedCat = (models.cast<Map<String, dynamic>?>().firstWhere(
+        (m) => (m?['id'] ?? '').toString() == picked, orElse: () => null)?['category'] ?? '').toString();
+    final pickedIsChat = _isChatModel(pickedCat);
     final controller = _registryKeyControllers.putIfAbsent(
         id, () => TextEditingController());
     return Padding(
@@ -729,7 +935,7 @@ class _PoolPageState extends State<PoolPage> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
             Text(name, style: const TextStyle(color: _accent, fontSize: 12)),
-            Text('$baseUrl · ${reg['model_count']} 模型',
+            Text(baseUrl,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: _hint, fontSize: 9)),
           ]),
@@ -750,11 +956,18 @@ class _PoolPageState extends State<PoolPage> {
                   borderSide: const BorderSide(color: _border)),
             ),
             items: <DropdownMenuItem<String>>[
-              for (final m in models)
+              for (final m in models) ...<DropdownMenuItem<String>>[
                 DropdownMenuItem<String>(
                     value: (m['id'] ?? '').toString(),
-                    child: Text((m['name'] ?? '').toString(),
-                        overflow: TextOverflow.ellipsis)),
+                    enabled: _isChatModel((m['category'] ?? '').toString()),
+                    child: Text(
+                        '[${_catLabel((m['category'] ?? '').toString())}] ${m['name'] ?? m['id']}',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: _isChatModel((m['category'] ?? '').toString())
+                                ? Colors.white : Colors.grey,
+                            fontSize: 10))),
+              ],
             ],
             onChanged: (value) =>
                 setState(() => _registryModelPick[id] = value ?? picked),
@@ -779,18 +992,24 @@ class _PoolPageState extends State<PoolPage> {
           ),
         ),
         const SizedBox(width: 8),
-        TextButton(
-          onPressed: _acting.isNotEmpty || picked.isEmpty || controller.text.trim().isEmpty
-              ? null
-              : () => unawaited(_saveRegistryProvider(
-                  id: id, baseUrl: baseUrl, model: picked,
-                  apiKey: controller.text.trim())),
-          style: TextButton.styleFrom(
-            backgroundColor: _accent.withValues(alpha: 0.14),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+        Tooltip(
+          message: pickedIsChat
+              ? '保存后自动开启云路由，聊天/抽取/巩固可选 provider:$id'
+              : '「${_catLabel(pickedCat)}」不是对话模型，走专用端点，不能填进 chat 路由；请选 [对话]/[视觉]/[代码]/[路由]',
+          child: TextButton(
+            onPressed: _acting.isNotEmpty || picked.isEmpty || controller.text.trim().isEmpty || !pickedIsChat
+                ? null
+                : () => unawaited(_saveRegistryProvider(
+                    id: id, baseUrl: baseUrl, model: picked,
+                    apiKey: controller.text.trim())),
+            style: TextButton.styleFrom(
+              backgroundColor: _accent.withValues(alpha: 0.14),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            child: Text(pickedIsChat ? '保存' : '非对话',
+                style: TextStyle(color: pickedIsChat ? _accent : Colors.grey, fontSize: 12)),
           ),
-          child: const Text('保存', style: TextStyle(color: _accent, fontSize: 12)),
         ),
       ]),
     );
@@ -818,7 +1037,6 @@ class _PoolPageState extends State<PoolPage> {
   @override
   Widget build(BuildContext context) {
     final enabled = (_data['enabled'] ?? false) == true;
-    final freeLane = (_data['free_lane'] ?? false) == true;
     final defaultModel = (_data['default_model'] ?? '').toString();
     final accountCount = (_data['account_count'] ?? 0) as int;
     final ignoredCount = (_data['ignored_count'] ?? 0) as int;
@@ -846,8 +1064,6 @@ class _PoolPageState extends State<PoolPage> {
                   style: TextStyle(color: Colors.white, fontSize: 18)),
               const SizedBox(width: 10),
               _pill(enabled ? '号池启用' : '号池未启用', enabled ? _ok : _hint),
-              const SizedBox(width: 6),
-              _pill(freeLane ? '免密 lane 开' : '免密 lane 关', freeLane ? _ok : _hint),
               const Spacer(),
               IconButton(
                 tooltip: '刷新',
@@ -897,12 +1113,16 @@ class _PoolPageState extends State<PoolPage> {
                     () => unawaited(_rpc('pool.checkin', <String, dynamic>{}, 'checkin',
                         okMessage: '签到完成'))),
                 const SizedBox(width: 6),
-                // 浏览器登录：直接跳系统默认浏览器登录页；登录后换号会被
-                // 凭证监听自动快照入池（多账号并存）
-                _actionButton('拉起登录', Icons.open_in_new, 'login',
-                    () => unawaited(_rpc('pool.login_url',
-                        <String, dynamic>{'url': 'https://www.workbuddy.cn/'}, 'login',
-                        okMessage: '已在浏览器打开登录页；登录后自动入池（多账号并存）'))),
+                // ★ 浏览器扫码登录（OAuth 闭环）：复用 wbmod 号池网关，扫码后凭证落共享
+                //   vault，Python 号池 discover 已扫该目录 → 自动入池，无需手动重扫。
+                _actionButton('浏览器登录', Icons.qr_code, 'oauth',
+                    () => unawaited(_oauthLogin()), tone: _ok),
+                const SizedBox(width: 6),
+                // 拉起 WorkBuddy 桌面端（备用路径）：桌面端一次只登一个账号，
+                // 手动切号后点「重新扫描凭证」抓进池。
+                _actionButton('拉起桌面端', Icons.login, 'login',
+                    () => unawaited(_rpc('pool.login_start', <String, dynamic>{}, 'login',
+                        okMessage: '已拉起桌面端；请手动切到要加的账号，再点「重新扫描凭证」'))),
               ]),
               const SizedBox(height: 6),
               const Row(children: <Widget>[
@@ -922,9 +1142,9 @@ class _PoolPageState extends State<PoolPage> {
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 14),
                   child: Text(
-                      '账号池为空。点「拉起登录」打开 WorkBuddy 桌面端登录，'
-                      '登录态（含加密态自动解密）落盘后点「重新扫描凭证」自动入池；'
-                      '已有 xdpool accounts.json 的机器重扫即入。',
+                      '加账号：①点「浏览器登录」→ 扫码确认 → 凭证自动入池（推荐，可多账号并存）；'
+                      '或点「拉起桌面端」→ 在客户端手动切到要加的账号 → 回本页点「重新扫描凭证」。'
+                      '两条路径的凭证共享，已在 wbmod 号池登录的账号重扫后也能看到。',
                       style: TextStyle(color: _hint, fontSize: 12)),
                 )
               else ...accounts.map(_accountRow),
@@ -954,8 +1174,7 @@ class _PoolPageState extends State<PoolPage> {
                   '· 「一键签到」走 billing 端点逐账号领取，已签到/无活动按幂等成功处理。\n'
                   '· 加密登录态（\$wbEncrypted）经 WorkBuddy 桌面端原生密钥解密，'
                   '密钥不落盘、不日志。\n'
-                  '· 「退出登录」＝移出号池：凭证保留在 accounts.json，随时可恢复。\n'
-                  '· 免密 lane 是共享第三方端点，有封号风险（默认关，本次按你的要求开启）。',
+                  '· 「退出登录」＝移出号池：凭证保留在 accounts.json，随时可恢复。',
                   style: TextStyle(color: _hint, fontSize: 11, height: 1.6)),
             ]),
           ),

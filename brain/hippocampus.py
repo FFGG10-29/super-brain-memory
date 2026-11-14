@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+from array import array
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,8 @@ from typing import Any
 from config import BrainConfig, get_config
 from core.errors import EngineUnavailable, StorageError
 from core.ids import HybridLogicalClock, new_uuid7
+from core.runtime_paths import data_dir
+from core.structured_log import log_event
 from core.interfaces import (
     Embedder,
     EventLog,
@@ -113,7 +116,14 @@ class Hippocampus:
         use_llm: bool = True,
         emit_event: bool = True,
         cognition: dict | None = None,
+        _from_bundle: bool = False,
     ) -> WriteResult:
+        # ★ 一进多出铁律的执行点在【外部输入入口层】（MCP save_memory / stdio /
+        #   chat._remember），不是这个最底层——remember 是所有写入（含内部派生：
+        #   语义合并 update、蒸馏、叙事、同步 worker）的汇聚点，在此一刀切会误伤
+        #   同事项演进，导致合并/蒸馏链路全线失效。入口已强制 extract_multi →
+        #   remember_bundle；这里保留 _from_bundle 参数仅为派生写入显式标注语义。
+        _ = _from_bundle  # 语义标注，底层不拦截
         # ★ A 包·空间标记兜底：所有写入最终汇聚于此，杜绝裸 private/document。
         #   优先级 cognition.topic > 显式 topic:<id> > 兜底 topic:default。
         #   这样任何新写入途径（MCP / inbox worker / stdio / 蒸馏）都自带空间归属。
@@ -245,6 +255,11 @@ class Hippocampus:
                     "narrative_skeleton": cognition.get("narrative_skeleton"),
                     # E6：Agent 视角标记（"Agent A 认为…"），供按对话对象选择视角
                     "perspective": str(cognition.get("perspective") or ""),
+                    # 叙事属性（flush 提纯产物挂 scenario）：旁路索引，不给 neurons 加列。
+                    # ★ is_micro_narrative：白天会话日记标记，夜间 neocortex 优先当
+                    #   高密度摘要喂给 LLM（省 Token、减幻觉），不做二次缝合。
+                    "narrative": str(cognition.get("narrative") or ""),
+                    "is_micro_narrative": bool(str(cognition.get("narrative") or "").strip()),
                     "namespace": neuron.namespace,
                     "ts_ms": neuron.created_at_ms,
                 }
@@ -255,6 +270,145 @@ class Hippocampus:
         if emit_event:
             self._emit_event(neuron, extraction, result)
         return result
+
+    def remember_bundle(
+        self,
+        bundle: Any,
+        *,
+        agent_id: str,
+        namespace: str = "private",
+        device_id: str | None = None,
+        now_ms: int | None = None,
+        emit_event: bool = True,
+    ) -> dict[str, Any]:
+        """一进多出：把一条输入拆出的一组记忆原子化落库 + 一张事件超边。
+
+        复用 remember() 的完整写入链（丘脑准入 / PAD 轨迹 / 六引擎投影 / 合并裁决），
+        每条 item 自带 memory_type + PAD + entities；同一 bundle 的条目共享一个
+        hyperedge（label + members），并显式补一张 Kùzu 事件节点，使 W5 激活扩散/
+        叙事骨架召回能把整组当一个事件单元取出（而不是散落的独立 neuron）。
+
+        `bundle` 是 brain.router_extractor.ExtractionBundle（duck-typed，避免循环 import）。
+        """
+        items = list(getattr(bundle, "items", []) or [])
+        complexity = str(getattr(bundle, "complexity", "light") or "light")
+        # 第一梯队·事务性：走 overwrite 覆盖式，只留摘要+原文，绝不进认知池/超边/叙事
+        if getattr(bundle, "transactional", False):
+            raw = str(getattr(bundle, "raw_content", "") or "")
+            summary = str(getattr(bundle, "summary", "") or "") or raw[:40]
+            try:
+                decision = route_write(content=raw, cognition={"memory_type": "code"},
+                                       namespace=namespace, config=self._config)
+                if decision.get("path") == "overwrite":
+                    self.overwrite_remember(raw, agent_id=agent_id, namespace=namespace,
+                                            cognition={"memory_type": "code", "summary": summary},
+                                            routing=decision)
+                else:
+                    # 无 overwrite 实体键（如纯摘要）：按 code 单条但打 _from_bundle 标记落库
+                    self.remember(summary or raw, agent_id=agent_id, namespace=namespace,
+                                  cognition={"memory_type": "code", "layer": "fact",
+                                             "source": "system", "summary": summary},
+                                  _from_bundle=True, use_llm=False)
+                return {"applied": 1, "neuron_ids": [], "complexity": "none",
+                        "transactional": True, "handled": True,
+                        "reason": "事务性→覆盖式，不进认知池"}
+            except Exception as exc:  # noqa: BLE001
+                return {"applied": 0, "neuron_ids": [], "transactional": True,
+                        "handled": False, "reason": f"事务性写入失败：{type(exc).__name__}: {exc}"}
+        # 第一梯队·寒暄/系统指令：不进六引擎，working-context 丢弃即可
+        if getattr(bundle, "ephemeral", False):
+            return {"applied": 0, "neuron_ids": [], "complexity": "none",
+                    "ephemeral": True, "handled": True,
+                    "reason": "寒暄/系统指令，不进长期记忆"}
+        if not items:
+            return {"applied": 0, "neuron_ids": [], "complexity": complexity,
+                    "handled": True, "reason": "信息密度不足以入池（已判定无需拆解）"}
+        event_label = str(getattr(bundle, "event_label", "") or "")
+        event_members = [str(m) for m in (getattr(bundle, "event_members", ()) or [])]
+        source = str(getattr(bundle, "source", "llm") or "llm")
+        # 分层语义跟随 bundle：聊天情节=episode；蒸馏知识=fact（蒸馏器覆写）。
+        # persona 不允许经 bundle 通道写入（L0 只能走显式授权的单条契约）。
+        layer = str(getattr(bundle, "layer", "") or "episode")
+        if layer not in ("fact", "episode"):
+            layer = "episode"
+        # ★ 叙事属性：flush 提纯出的第一人称叙事挂在交互 scenario 上（payload 属性），
+        #   夜间 neocortex 直接读它做跨天交织，不用再从碎片反推。
+        narrative = str(getattr(bundle, "narrative", "") or "").strip()
+        base_ns = namespace
+        results: list[WriteResult] = []
+        ids: list[str] = []
+        for item in items:
+            cog: dict[str, Any] = {
+                "memory_type": item.memory_type,
+                "pad": {"p": item.pad.p, "a": item.pad.a, "d": item.pad.d},
+                "confidence": item.confidence,
+                "source": "bot" if source == "bot" else source,
+                "layer": layer,
+                "entities": [{"name": e.name, "type": e.type} for e in item.entities],
+                # 每条共享同一事件骨架，W5 的 _absorb_hyperedges 按 members 聚合
+                "hyperedge": ({"label": event_label, "members": event_members}
+                              if event_label and event_members else None),
+            }
+            if narrative and item.memory_type == "scenario":
+                cog["narrative"] = narrative
+            # topic 走 base_ns（调用方传的是 topic:<id>），保持不变
+            res = self.remember(item.content, agent_id=agent_id, namespace=base_ns,
+                                device_id=device_id, now_ms=now_ms,
+                                use_llm=False, emit_event=emit_event, cognition=cog,
+                                _from_bundle=True)
+            results.append(res)
+            if res.applied:
+                ids.append(res.neuron.uuid7_id)
+        # 显式补一张 bundle 级事件超边节点（即便某条被丘脑拒收，事件骨架仍在）
+        if event_label and ids:
+            try:
+                self._hypergraph.add({
+                    "id": ids[0], "label": event_label, "members": event_members or ids,
+                    "occurred_at_ms": now_ms if now_ms is not None else _now_ms(),
+                    "namespace": base_ns, "kind": "bundle_event",
+                })
+            except Exception:  # noqa: BLE001  超边补建失败不影响已落库的 neuron
+                pass
+        applied = sum(1 for r in results if r.applied)
+        # 全军覆没（丘脑全拒）= 不合规 → 原文留项目档案待重试
+        if applied == 0:
+            try:
+                self._defer_orphan(" | ".join(i.content for i in items), agent_id,
+                                   {"topic": base_ns})
+            except Exception:  # noqa: BLE001
+                pass
+        return {"applied": applied, "total": len(items), "neuron_ids": ids,
+                "event_label": event_label or None, "complexity": complexity,
+                "handled": applied > 0}
+
+    def _defer_orphan(self, content: str, agent_id: str,
+                      cognition: dict | None = None) -> None:
+        """铁律拒收的原文 → 只落结构化日志（2026-11-12 用户裁决：系统文档存都不准存）。
+
+        曾经的实现写 [待重试 项目档案，与蒸馏触发器构成死循环泵（留档→触发蒸馏→
+        再失败→再留档），制造了大量垃圾记忆。现在失败只记日志与审计，绝不落档案；
+        聊天链路自身的 WAL（pending_ingest.ndjson）与清洗管线 JSONL 已各自兜底重试。
+        """
+        import json as _json
+
+        from core.structured_log import log_event
+
+        log_event("ingest_deferred", **{
+            "agent_id": agent_id,
+            "topic": str((cognition or {}).get("topic") or ""),
+            "chars": len(str(content or "")),
+            "preview": str(content or "")[:200],
+        })
+        try:
+            data_dir().mkdir(parents=True, exist_ok=True)
+            with (data_dir() / "ingest_deferred.ndjson").open("a", encoding="utf-8") as fh:
+                fh.write(_json.dumps({
+                    "ts": int(time.time() * 1000), "agent_id": agent_id,
+                    "topic": str((cognition or {}).get("topic") or ""),
+                    "content": str(content or "")[:4000],
+                }, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001  日志失败不影响主链路
+            pass
 
     def overwrite_remember(
         self,
@@ -557,6 +711,18 @@ class Hippocampus:
     def _project_graph(self, neuron: Neuron, extraction: dict) -> None:
         entities = extraction.get("entities") or []
         relations = extraction.get("relations") or []
+        # ★ 实体消歧（2026-11-12 架构裁决）："阿鱼/用户/宝儿"不许各自为战建四个节点。
+        #   写图前先把别名对齐到唯一 canonical 节点：LMDB 别名精确匹配 → 向量相似
+        #   （≥0.92 视为同一实体，合并）；保证同一话题只长一个核心节点，激活扩散不断链。
+        entities = [
+            {**e, "name": self._resolve_entity(str(e.get("name", "")))}
+            for e in entities if str(e.get("name", "")).strip()
+        ]
+        relations = [
+            {**r, "subject": self._resolve_entity(str(r.get("subject", ""))),
+             "object": self._resolve_entity(str(r.get("object", "")))}
+            for r in relations if r.get("subject") and r.get("object")
+        ]
         for entity in entities:
             name = str(entity.get("name", ""))
             if name:
@@ -576,6 +742,88 @@ class Hippocampus:
             self._graph.upsert_hyperedge_node(
                 neuron.uuid7_id, label=neuron.content[:40], occurred_at_ms=neuron.valid_from_ms
             )
+
+    # ── 实体消歧（Entity Resolution）─────────────────────────────────────
+    # LMDB 桶：entity_alias=别名→canonical；entity_names=canonical 成员键；
+    #          entity_vec=canonical→float32 向量（bge 嵌入，注册时算一次）。
+    _ENTITY_SIM_THRESHOLD = 0.92
+    _ENTITY_INDEX_CAP = 1000
+
+    def _resolve_entity(self, name: str) -> str:
+        """把实体名对齐到唯一 canonical 节点：别名精确 → 本名已注册 → 向量 ≥0.92 合并。
+
+        向量通道依赖 embedder（现为云端 bge）：只在新实体名首见时调一次，
+        命中别名/已注册不产生任何模型调用；embedder 不可用时退化为纯精确匹配。
+        """
+        name = str(name or "").strip()
+        if not name:
+            return name
+        try:
+            hit = self._kv.get("entity_alias", name)
+            if hit:
+                return bytes(hit).decode("utf-8", "replace")
+            if self._kv.get("entity_names", name):
+                return name
+        except Exception:  # noqa: BLE001  消歧失败绝不阻断写入，按原名落库
+            return name
+        # 新实体名：向量比对既有 canonical，≥0.92 判同一实体（别名归并）
+        canonical = name
+        try:
+            qvec = self._entity_vector(name)
+            if qvec is not None:
+                index = self._kv.get_json("entity_index", "names") or []
+                best, best_sim = "", 0.0
+                for known in index:
+                    raw = self._kv.get("entity_vec", str(known))
+                    if not raw:
+                        continue
+                    sim = self._cosine(qvec, raw)
+                    if sim > best_sim:
+                        best, best_sim = str(known), sim
+                if best and best_sim >= self._ENTITY_SIM_THRESHOLD:
+                    canonical = best
+        except Exception:  # noqa: BLE001  向量通道失败退精确匹配
+            canonical = name
+        try:
+            self._kv.put("entity_alias", name, canonical.encode("utf-8"))
+            if not self._kv.get("entity_names", canonical):
+                self._kv.put("entity_names", canonical, b"1")
+                index = self._kv.get_json("entity_index", "names") or []
+                index.append(canonical)
+                self._kv.put_json("entity_index", "names", index[-self._ENTITY_INDEX_CAP:])
+                vec = self._entity_vector(canonical)
+                if vec is not None:
+                    self._kv.put("entity_vec", canonical,
+                                 array("f", vec).tobytes())
+        except Exception:  # noqa: BLE001  注册失败不影响本次写入
+            pass
+        return canonical
+
+    def _entity_vector(self, name: str) -> list[float] | None:
+        """实体名向量（云端 bge，一次 HTTP）；embedder 不可用返回 None 跳过比对。"""
+        if self._embedder is None:
+            return None
+        try:
+            emb = self._embedder.embed_query(name)
+            dense = [float(x) for x in (emb.dense or [])]
+            return dense or None
+        except Exception:  # noqa: BLE001  云端失败不阻断写入
+            return None
+
+    @staticmethod
+    def _cosine(query: list[float], raw: bytes) -> float:
+        from array import array
+
+        other = array("f")
+        other.frombytes(raw)
+        if len(other) != len(query):
+            return 0.0
+        dot = sum(a * b for a, b in zip(query, other, strict=True))
+        nq = sum(a * a for a in query) ** 0.5
+        no = sum(b * b for b in other) ** 0.5
+        if nq <= 0 or no <= 0:
+            return 0.0
+        return dot / (nq * no)
 
     # ── 时序投影（PAD 轨迹 / 衰减快照）──────────────────────────────────
     def _append_pad_track(self, neuron: Neuron, *, source: str, now_ms: int | None) -> None:

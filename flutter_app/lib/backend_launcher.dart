@@ -92,15 +92,30 @@ class BackendLauncher {
     final command = _or(Prefs.get<String>('backend_command', ''), defaults['command']!);
     final directory = _or(Prefs.get<String>('backend_dir', ''), defaults['directory']!);
     var args = _or(Prefs.get<String>('backend_args', ''), defaults['args']!);
-    // 兼容旧偏好：以前默认把 '-m headless_server' 写进 prefs，传给 exe 会失败
-    if (command.toLowerCase().endsWith('.exe') && args.contains('-m ')) args = '';
+    // 兼容旧偏好：frozen headless-server.exe 不吃 '-m headless_server'，命中才清空。
+    // 不能用 endsWith('.exe') 判定——python/pythonw 直启（-m 模式）也是 .exe，
+    // 2026-11-13 实测该规则把 pythonw 的启动参数清空，导致后端空挂 30s 超时。
+    if (command.toLowerCase().contains('headless-server.exe') && args.contains('-m ')) args = '';
     backendStatus.value = '正在拉起后端…';
+    // P0-1：显式注入模型目录（D 盘），确保 reranker/embedder 解析到真 ONNX 权重，
+    // 而不是靠进程内部兜底或退化成 IdentityReranker（无精排）。
+    // 后端代码层 create_reranker/models_dir 已有互补回退，这里是启动侧双保险；
+    // 已存在同名环境变量时不覆盖（尊重手动排障/自定义模型目录）。
+    final modelsDir = Prefs.get<String>('models_dir', '').trim();
+    final resolvedModels = modelsDir.isNotEmpty
+        ? modelsDir
+        : r'D:\SuperBrain\backend\_internal\models';
+    final env = <String, String>{};
+    if (Platform.isWindows && Directory(resolvedModels).existsSync()) {
+      env['SUPER_BRAIN_MODELS_DIR'] = resolvedModels;
+    }
     try {
       final process = await Process.start(
         command, _splitArgs(args),
         workingDirectory: directory,
         mode: ProcessStartMode.detached,
         includeParentEnvironment: true,
+        environment: env,
       );
       ownedPid = process.pid;
     } catch (error) {

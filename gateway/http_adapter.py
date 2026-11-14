@@ -109,6 +109,9 @@ class HTTPAdapter:
             # ★ 认知契约：HTTP /save 也允许透传 cognition（DSH、AstrBot 等插件可用）
             if isinstance(body.get("cognition"), dict):
                 save_args["cognition"] = body["cognition"]
+            # ★ WorkBuddy 侧前置拆分 bundle 透传（与 MCP save_memory 同款契约）
+            if isinstance(body.get("bundle"), dict):
+                save_args["bundle"] = body["bundle"]
             return 200, self._call_tool("save_memory", save_args, headers=headers)
         if method.upper() == "POST" and path.rstrip("/") == "/search":
             query = body.get("query") or body.get("text") or body.get("content") or ""

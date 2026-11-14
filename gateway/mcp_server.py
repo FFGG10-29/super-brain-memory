@@ -126,6 +126,23 @@ class MCPToolkit:
         cached = self._agent_brief_cache.get(agent_id)
         if cached is not None and now - cached[0] < self._AGENT_BRIEF_TTL_SEC:
             return cached[1]
+        # v4.1-C：L2 统一缓存（agent_brief ns，TTL 300s）——让 E6 心智模型进入
+        # cache.metrics 可观测。L1 私有 dict 仍是权威（测试锁定"每 brief 恰好 1 次
+        # relational 查询"），命中 L2 时回填 L1，两者 TTL 一致不会打架。
+        try:
+            from core.cache_manager import get_cache_manager
+
+            mgr = get_cache_manager()
+        except Exception:  # noqa: BLE001
+            mgr = None
+        if mgr is not None:
+            try:
+                hit = mgr.get("agent_brief", str(agent_id))
+                if isinstance(hit, str):
+                    self._agent_brief_cache[str(agent_id)] = (now, hit)
+                    return hit
+            except Exception:  # noqa: BLE001
+                pass
         try:
             rows = self._relational.query(
                 "neuron", memory_types=("profile", "fact"), limit=50)
@@ -165,7 +182,12 @@ class MCPToolkit:
             sections.append(
                 f"最近一次协作时间：{self._relative_time(latest_ms, now_ms=int(now * 1000))}")
         brief = "\n".join(sections)
-        self._agent_brief_cache[agent_id] = (now, brief)
+        self._agent_brief_cache[str(agent_id)] = (now, brief)
+        if mgr is not None:
+            try:
+                mgr.set("agent_brief", str(agent_id), brief)
+            except Exception:  # noqa: BLE001
+                pass
         return brief
 
     @staticmethod
@@ -238,6 +260,26 @@ class MCPToolkit:
             return result
         except (GatewayAuthError, ValueError, KeyError) as exc:
             return {"error": type(exc).__name__, "message": str(exc)}
+
+    def save_bundle_for_agent(self, agent: Agent, bundle: Any,
+                              *, namespace: str = "topic:f844c49c0e58") -> dict[str, Any]:
+        """一进多出：进程内把 ExtractionBundle 落一组 neuron + 事件超边。
+
+        外层（ChatEngine）已由 WriteGate 串行化；这里保留审计与 tool_read 缓存失效，
+        语义与 save_for_agent 一致，只是一次写入多条。bundled 写失败一律返回结构化
+        失败，由调用方降级到单条 save_for_agent。
+        """
+        started = time.perf_counter()
+        try:
+            result = self._hippocampus.remember_bundle(
+                bundle, agent_id=agent.agent_id, namespace=namespace,
+            )
+            self._invalidate_tool_cache_after_write({"applied": result.get("applied", 0)})
+            self._registry.audit(agent.agent_id, "save_bundle", ok=True,
+                                 latency_ms=(time.perf_counter() - started) * 1000)
+            return result
+        except Exception as exc:  # noqa: BLE001  批量写失败返回结构化，调用方降级
+            return {"error": type(exc).__name__, "message": str(exc), "applied": 0}
 
     def _call_with_tool_cache(self, tool: str, args: dict, agent: Agent) -> dict[str, Any]:
         """C19 缓存层：白名单读工具命中直接返回（跳过 dispatch，零重复执行）；
@@ -404,23 +446,69 @@ class MCPToolkit:
             # 透传给 hippocampus.remember；hippocampus 旁路索引 meta 已含 perspective 键
             # （brain/hippocampus.py），recall 侧按当前 agent 做视角前置排序。
             perspective = str((cognition or {}).get("perspective") or "")
-            result = self._hippocampus.remember(
-                content, agent_id=agent.agent_id, namespace=namespace,
+
+            # ★ 一进多出铁律统一判定（brain.ingest_guard，2026-11-12）：
+            #   与「前置 PAD 注入」同款，WorkBuddy 侧对话大模型可前置拆分整组，
+            #   随 save_memory 的 bundle 入参提交，后端跳过 extract_multi 直接落组。
+            #   判定优先级：bundle(前置已拆) > single(单条认知契约,密度=1) > extract(后端兜底拆)。
+            #   —— 原始对话 category 即便带单条 cognition 也强制走 extract，杜绝漏拆。
+            from brain.ingest_guard import classify as _classify
+
+            bundle_raw = args.get("bundle")
+            plan = _classify(
                 cognition=cognition,
+                bundle=bundle_raw if isinstance(bundle_raw, dict) else None,
+                content=content,
             )
+
+            if plan.mode == "single":
+                result = self._hippocampus.remember(
+                    content, agent_id=agent.agent_id, namespace=namespace,
+                    cognition=plan.cognition, _from_bundle=True,
+                )
+                return {
+                    "applied": result.applied,
+                    "neuron_id": result.neuron.uuid7_id,
+                    "pad": result.neuron.pad.as_tuple(),
+                    "source": "agent",
+                    "reason": result.admission.reason,
+                    "duplicate_of": result.admission.duplicate_of,
+                    "superseded": result.superseded,
+                    "merge": (result.merge.action if result.merge is not None else None),
+                    "namespace": namespace, "topic": topic,
+                    "layer": str((plan.cognition or {}).get("layer") or "fact"),
+                    "perspective": perspective or None,
+                }
+
+            # bundle / extract 两路都经 extractor 归一：前置 bundle 只做白名单校验，
+            # 裸文本才真正跑拆分模型（本地 0.6B / 远程 task_routes["extract"]）。
+            from brain.router_extractor import RouterExtractor
+            from engine.local_llm import DisabledLLM
+
+            extractor = RouterExtractor(DisabledLLM(), self._config)
+            if plan.mode == "bundle":
+                bundle_obj = extractor.bundle_from_payload(plan.bundle or {})
+                src = "workbuddy-presplit"
+            else:
+                bundle_obj = extractor.extract_multi(content, agent_id=agent.agent_id)
+                src = "local"
+            br = self._hippocampus.remember_bundle(
+                bundle_obj, agent_id=agent.agent_id, namespace=namespace)
+            if not br.get("handled", br.get("applied", 0) > 0):
+                self._hippocampus._defer_orphan(content, agent.agent_id, cognition)
+                return {"applied": False, "neuron_id": "", "pad": (0, 0, 0),
+                        "source": src, "reason": "一进多出失败，原文留项目档案待重试",
+                        "namespace": namespace, "topic": topic}
+            first_id = (br.get("neuron_ids") or [""])[0]
             return {
-                "applied": result.applied,
-                "neuron_id": result.neuron.uuid7_id,
-                "pad": result.neuron.pad.as_tuple(),
-                "source": "agent" if cognition else "local",
-                "reason": result.admission.reason,
-                "duplicate_of": result.admission.duplicate_of,
-                "superseded": result.superseded,
-                "merge": (result.merge.action if result.merge is not None else None),
-                "namespace": namespace,
-                "topic": topic,
-                "layer": str((cognition or {}).get("layer") or "fact"),
-                "perspective": perspective or None,
+                "applied": True, "written": br.get("applied", 0),
+                "complexity": br.get("complexity"),
+                "neuron_id": first_id, "pad": (0, 0, 0), "source": src,
+                "reason": f"一进多出 {br.get('applied')}/{br.get('total')}"
+                          + ("（WorkBuddy 前置拆分）" if plan.mode == "bundle" else ""),
+                "duplicate_of": None, "superseded": [], "merge": None,
+                "namespace": namespace, "topic": topic, "bundle": br,
+                "perspective": None, "layer": "episode",
             }
 
         if tool == "recall_memory":
@@ -428,10 +516,11 @@ class MCPToolkit:
             # 顺手兼容历史上被忽略的 top_k 参数；显式传 limit 时完全尊重调用方。
             limit = int(args.get("limit") or args.get("top_k") or min(self._config.recall.top_k, 3))
             query = str(args.get("query", ""))
-            # 默认走只读投影的字符 2-gram 召回（毫秒级，与 Flutter 前端一致）。
-            # 六通道 embedding/RRF/精排实测 30-45s，只有 deep=true 才走，
-            # 避免 Agent 每轮提问都卡在检索上（DSH 档案里的 known recall-hang）。
-            deep = bool(args.get("deep", False))
+            # v4.1 裁决：默认全面六通道类人召回（激活扩散/叙事骨架/PAD门控/
+            # 置信度/知识缺口/精排），快速投影退出主路径。仅当调用方显式
+            # deep=false、且本地未装配 prefrontal 时才降级到只读字符 2-gram
+            # （保留作兼容/可视化/测试兜底，不再是生产主链路）。
+            deep = bool(args.get("deep", True))
             # ★ A 包：按类召回下推。topics/scope=active/namespace 三选一；
             #   Bot 通道（channel=bot）不传即 ALL 全量可读，不做隔离。
             channel = str(args.get("channel") or "workbuddy")
@@ -600,7 +689,29 @@ class MCPToolkit:
             "（该工具需要桌面后端在线）" if method is not None else ""))
 
     def tool_list(self) -> list[dict]:
-        return list(TOOL_SCHEMAS)
+        # v4.1-C 全开：工具面清单（66 项静态 schema）缓存进 ``tool`` ns。
+        # 与 tool_read（工具*执行结果*，60s）分工：本 ns 缓存的是 tools/list 协议面本身。
+        # schema 在进程内随代码固定，命中即省去逐次 list 拷贝；未装配/异常回退直返。
+        try:
+            from core.cache_manager import get_cache_manager
+
+            mgr = get_cache_manager()
+        except Exception:  # noqa: BLE001
+            mgr = None
+        if mgr is not None:
+            try:
+                hit = mgr.get("tool", "tool_list")
+                if isinstance(hit, list):
+                    return list(hit)
+            except Exception:  # noqa: BLE001
+                pass
+        schemas = list(TOOL_SCHEMAS)
+        if mgr is not None:
+            try:
+                mgr.set("tool", "tool_list", schemas, ttl_sec=0)  # 进程内固定，靠代码变更换进程
+            except Exception:  # noqa: BLE001
+                pass
+        return schemas
 
     def serve(self, *, host: str | None = None, port: int | None = None) -> None:
         """装配官方 MCP SDK（Streamable HTTP）。未安装时给出安装提示而非静默降级。"""

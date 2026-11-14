@@ -24,10 +24,32 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+class FakeExtractor:
+    """产出一组结构化记忆（一进多出）。"""
+    def extract_multi(self, content: str, *, agent_id: str = ""):
+        from brain.router_extractor import (ExtractionBundle, ExtractionItem)
+        from models.neuron import PAD
+        return ExtractionBundle(
+            items=(
+                ExtractionItem(memory_type="profile", content=f"画像：{content}",
+                               pad=PAD(p=0.3, a=0.1, d=0.2), confidence=0.9),
+                ExtractionItem(memory_type="emotion", content=f"情绪：{content}",
+                               pad=PAD(p=0.8, a=0.6, d=0.2), confidence=0.85),
+                ExtractionItem(memory_type="scenario", content=content,
+                               pad=PAD(p=0.2, a=0.1, d=0.1), confidence=0.9),
+            ),
+            event_label=f"事件：{content[:12]}", event_members=("阿鱼", "肥鱼"),
+            source="llm",
+        )
+
+
 class FakeToolkit:
-    def __init__(self) -> None:
+    def __init__(self, *, bundle_ok: bool = True) -> None:
         self.recalls: list[dict] = []
         self.saves: list[dict] = []
+        self.bundles: list[Any] = []
+        self.bundle_ok = bundle_ok
+        self.extractor = FakeExtractor()
 
     def recall_for_agent(self, agent: Any, args: dict) -> dict:
         self.recalls.append(dict(args))
@@ -37,6 +59,11 @@ class FakeToolkit:
     def save_for_agent(self, agent: Any, args: dict) -> dict:
         self.saves.append(dict(args))
         return {"applied": True}
+
+    def save_bundle_for_agent(self, agent: Any, bundle: Any, **_: Any) -> dict:
+        self.bundles.append(bundle)
+        return {"applied": 3 if self.bundle_ok else 0,
+                "total": 3, "neuron_ids": ["n1", "n2", "n3"]}
 
 
 class FakeRouter:
@@ -50,7 +77,7 @@ class FakeRouter:
 def engine_factory(tmp_path):
     built: list[tuple[ChatEngine, WriteGate, SessionRegistry, FakeToolkit]] = []
 
-    def build(*, token: str = "test-token", deep_async: bool = True):
+    def build(*, token: str = "test-token", deep_async: bool = True, bundle_ok: bool = True):
         index = len(built)
         port = _free_port()
         cfg = BrainConfig(
@@ -61,7 +88,7 @@ def engine_factory(tmp_path):
         )
         gate = WriteGate()
         sessions = SessionRegistry(tmp_path / f"sessions-{index}.db")
-        toolkit = FakeToolkit()
+        toolkit = FakeToolkit(bundle_ok=bundle_ok)
         engine = ChatEngine(
             config=cfg, toolkit=toolkit, router=FakeRouter(), write_gate=gate,
             agent=object(), token=token, sessions=sessions,
@@ -216,7 +243,8 @@ async def test_deep_recall_ready_is_pushed_from_8769(engine_factory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worth_remembering_goes_through_write_gate(engine_factory) -> None:
+async def test_worth_remembering_is_one_to_many_bundle(engine_factory) -> None:
+    """一进多出铁律：一条对话拆成 profile+emotion+scenario 一组，走 bundle 通道。"""
     engine, toolkit = engine_factory()
     async with connect(f"ws://127.0.0.1:{engine._port}") as ws:
         await _hello(ws)
@@ -225,8 +253,100 @@ async def test_worth_remembering_goes_through_write_gate(engine_factory) -> None
         await ws.send(json.dumps({"type": "message", "text": "记住这个约定：聊天要带人格"}))
         await _frames_until(ws, "reply")
         for _ in range(20):
-            if toolkit.saves:
+            if toolkit.bundles:
                 break
             await asyncio.sleep(0.05)
-    assert toolkit.saves and "记住这个约定" in toolkit.saves[0]["content"]
-    assert toolkit.saves[0]["cognition"]["source"] == "user_chat"
+    assert toolkit.bundles, "必须走一进多出 bundle 通道"
+    bundle = toolkit.bundles[0]
+    assert {i.memory_type for i in bundle.items} >= {"profile", "emotion", "scenario"}
+    assert all(any(getattr(i.pad, ax, 0) != 0 for ax in ("p", "a", "d")) for i in bundle.items)
+    assert bundle.event_label and "肥鱼" in bundle.event_members
+    assert not toolkit.saves, "铁律：bundle 成功时绝不走单条降级"
+
+
+async def test_worth_remembering_failure_defers_never_falls_back(engine_factory, monkeypatch) -> None:
+    """铁律：一进多出失败 → 留项目档案待重试，绝不降级单条写记忆。"""
+    engine, toolkit = engine_factory(bundle_ok=False)
+    deferred: list[str] = []
+    monkeypatch.setattr(engine, "_defer_to_archive",
+                        lambda text, intent: deferred.append(text))
+    async with connect(f"ws://127.0.0.1:{engine._port}") as ws:
+        await _hello(ws)
+        import json
+
+        await ws.send(json.dumps({"type": "message", "text": "记住：这条一进多出要失败"}))
+        await _frames_until(ws, "reply")
+        for _ in range(20):
+            if deferred:
+                break
+            await asyncio.sleep(0.05)
+    assert deferred and any("一进多出要失败" in t for t in deferred), "失败原文必须留项目档案待重试"
+    assert not toolkit.saves, "铁律：绝不降级单条 save_for_agent"
+    assert len(toolkit.bundles) == 1, "仍走了一次 bundle 尝试，只是没落库"
+
+
+async def test_flush_narrative_is_extractor_input_not_storage(engine_factory) -> None:
+    """架构裁决（2026-11-12）：flush 提纯出的叙事是 RouterExtractor 的**输入材料**，
+    经一进多出解剖成碎片入池；叙事本身作为 scenario 的 narrative 属性随组落库，
+    绝不整段直接当记忆正文。门控 = 满 8 条且用户静默 ≥3 分钟（静默由主循环轮询判定）。"""
+    engine, toolkit = engine_factory()
+    narrative = "今天中午阿鱼喊我想不想他，我回了想你宝儿，还发了表情包，两边都甜甜的。"
+    engine._narrative_summary = lambda batch: narrative  # 提纯通道固定产出
+    for i in range(8):
+        engine._queue_memory(f"消息{i}：阿鱼说想我", "chat")
+    assert len(engine._mem_buffer) == 8
+    assert not engine._flush_due(), "刚填满但用户还在说话（未静默）→ 不得截断高潮"
+    # 用户静默 4 分钟 → 引擎主循环自动冲刷（不手动调，锁真实触发路径）
+    engine._mem_last_message_ts = time.time() - 240
+    for _ in range(60):
+        if not engine._mem_buffer and toolkit.bundles:
+            break
+        await asyncio.sleep(0.05)
+    assert not engine._mem_buffer, "冲刷后缓冲必须清空"
+    assert toolkit.bundles, "叙事必须经一进多出解剖入池，绝不成段直存"
+    bundle = toolkit.bundles[-1]
+    assert getattr(bundle, "narrative", "") == narrative, "叙事必须作为属性随组落库"
+    assert any(narrative[:20] in item.content for item in bundle.items), \
+        "碎片由叙事解剖而来（抽取器输入=叙事）"
+
+
+async def test_flush_falls_back_to_per_item_when_narrative_chain_fails(
+        engine_factory, monkeypatch) -> None:
+    """提纯失败（空叙事）→ 回退逐条各自一进多出；bundle 失败 → 原文留档待重试。"""
+    engine, toolkit = engine_factory(bundle_ok=False)
+    monkeypatch.setattr(engine, "_narrative_summary", lambda batch: "")
+    deferred: list[str] = []
+    monkeypatch.setattr(engine, "_defer_to_archive",
+                        lambda text, intent: deferred.append(text))
+    for i in range(8):
+        engine._queue_memory(f"逐条回退消息{i}", "chat")
+    engine._mem_last_message_ts = time.time() - 240
+    for _ in range(60):
+        if deferred:
+            break
+        await asyncio.sleep(0.05)
+    assert deferred, "叙事链失败必须回退逐条处理"
+    assert len(deferred) == 8, "每条原文各走一进多出，失败各留档（一进多出按条判定）"
+
+
+@pytest.mark.asyncio
+async def test_hello_restores_session_and_replays_history(engine_factory) -> None:
+    """关页面重进：前端回传持久化的 session_id → restore 同一会话 → 历史可取回。"""
+    import json
+    engine, _ = engine_factory()
+    # 第一次连接：空 session_id → 后端 create 新会话，发一条消息落库
+    async with connect(f"ws://127.0.0.1:{engine._port}") as first:
+        ack = await _hello(first)  # session_id 默认空串
+        sid = ack["session_id"]
+        assert sid
+        await first.send(json.dumps({"type": "message", "text": "这条要留存"}))
+        await _frames_until(first, "reply")
+    # 模拟关页面重进：带旧 session_id 重连
+    async with connect(f"ws://127.0.0.1:{engine._port}") as second:
+        ack2 = await _hello(second, session_id=sid)
+        assert ack2["session_id"] == sid, "后端必须 restore 同一会话 id"
+    # 历史从持久化库取回（chat.history RPC 的数据源）
+    history = engine.history(sid, limit=200)
+    roles_texts = [(m["role"], m["text"]) for m in history]
+    assert any(role == "user" and text == "这条要留存" for role, text in roles_texts), (
+        f"重进后应能取回上次消息，实际={roles_texts}")

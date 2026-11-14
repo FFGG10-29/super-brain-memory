@@ -428,7 +428,15 @@ class _PersonaPageState extends State<PersonaPage> {
               _slider('吃醋阈值', 'jealousy', 0, 1, 0.5),
               _slider('主动关心', 'care_initiative', 0, 1, 0.5),
               _slider('方言句/天', 'dialect_per_day', 0, 30, 15, integer: true),
-              _slider('回复条数', 'max_lines_per_reply', 1, 6, 3, integer: true),
+              _slider('最大回复条数', 'max_lines_per_reply', 1, 6, 6, integer: true),
+              const Padding(
+                padding: EdgeInsets.only(left: 2, bottom: 6),
+                child: Text(
+                  '只是硬上限，不是每轮目标：设 3 则按语境回 1~3 条，设 5 则回 1~5 条，\n'
+                  '绝大多数时候会少于上限，不会每次都发满。',
+                  style: TextStyle(color: _hintP, fontSize: 9, height: 1.5),
+                ),
+              ),
               _toggle('深夜催睡', 'sleep_nag'),
               _toggle('签名自动改', 'signature_auto'),
               _toggle('指令通道（不装傻）', 'command_channel'),

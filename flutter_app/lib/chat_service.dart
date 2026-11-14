@@ -7,8 +7,9 @@ enum ChatLinkState { connecting, connected, reconnecting, disconnected }
 
 /// 聊天纯消息流客户端（独立端口 8769，区别于 8767 管理 WS）。
 /// 协议：
-///   首帧 → {"type":"hello","token":...,"device_id":"flutter"}
+///   首帧 → {"type":"hello","token":...,"device_id":"flutter","session_id":...}
 ///   回   ← {"type":"hello_ack","session_id":...}
+///   session_id 由前端持久化后回传，后端 restore 同一会话 → 关页面/重启不丢聊天记录。
 ///   发   → {"type":"message","text":...}
 ///   回   ← typing 帧 / reply 帧（text/intent/model/provider_kind/fallback）
 /// 零第三方依赖：直接用 dart:io 的 WebSocket。
@@ -25,6 +26,8 @@ class ChatService {
   Timer? _reconnectTimer;
   bool _closed = false;
   String _token = '';
+  /// 持久化的会话 id：由调用方从 Prefs 传入，重连时重发，保持同一会话。
+  String _sessionId = '';
   int _attempts = 0;
 
   final StreamController<Map<String, dynamic>> _frames =
@@ -42,8 +45,9 @@ class ChatService {
 
   /// 建立连接：WebSocket.connect 成功后立即发 hello 首帧（重连也会重发）。
   /// 返回本次 connect 是否成功；hello_ack 及后续帧经 [frames] 流给出。
-  Future<bool> connect(String token) async {
+  Future<bool> connect(String token, {String sessionId = ''}) async {
     _token = token;
+    _sessionId = sessionId;
     _closed = false;
     _attempts = 0;
     _states.add(ChatLinkState.connecting);
@@ -69,6 +73,7 @@ class ChatService {
         'type': 'hello',
         'token': _token,
         'device_id': 'flutter',
+        'session_id': _sessionId,   // 空串时后端 create 新会话；非空则 restore 旧会话
       }));
       _states.add(ChatLinkState.connected);
       return true;
@@ -111,10 +116,14 @@ class ChatService {
   }
 
   /// 发送一条用户消息（{"type":"message","text":...}；model 非空时指定回复模型）。
-  void sendMessage(String text, {String? model}) {
+  /// [images]：data URL（data:image/...;base64,...）或 http(s) URL 列表，
+  /// 后端作为 OpenAI image_url content 数组透传给号池多模态模型。
+  void sendMessage(String text, {String? model, List<String>? images}) {
+    final imgs = (images ?? const <String>[]).where((s) => s.isNotEmpty).toList();
     _send(<String, dynamic>{
       'type': 'message', 'text': text,
       if (model != null && model.isNotEmpty) 'model': model,
+      if (imgs.isNotEmpty) 'images': imgs,
     });
   }
 

@@ -316,12 +316,44 @@ class MemoryService:
             "audit": audit,
         }
 
-    # ── 写入 / 批量导入 ─────────────────────────────────────────────────
-    def save_memory(self, content: str, *, agent_id: str = "flutter") -> dict[str, Any]:
-        result = self.app.hippocampus.remember(content, agent_id=agent_id)
+    # ── 写入 / 批量导入（一进多出铁律统一入口）─────────────────────────
+    def _ingest_one(self, content: str, *, agent_id: str,
+                    cognition: dict | None = None, bundle: dict | None = None,
+                    namespace: str = "topic:default", fast: bool = True) -> dict[str, Any]:
+        """单条原文/前置包 → 一进多出铁律判定 → 落组；失败留项目档案，绝不降级单条。"""
+        from brain.ingest_guard import classify as _classify
+        from brain.router_extractor import RouterExtractor
+
+        plan = _classify(cognition=cognition, bundle=bundle, content=content)
+        if plan.mode == "single":
+            r = self.app.hippocampus.remember(
+                content, agent_id=agent_id, namespace=namespace,
+                cognition=plan.cognition, _from_bundle=True, use_llm=not fast)
+            return {"applied": r.applied, "written": 1 if r.applied else 0,
+                    "id": r.neuron.uuid7_id, "reason": r.admission.reason, "mode": "single"}
+        # 批量导入 fast 通道复用 DisabledLLM 规则拆分，不让几百条拖成几分钟
+        from engine.local_llm import DisabledLLM
+        extractor = RouterExtractor(DisabledLLM() if fast else None, self.config)
+        if plan.mode == "bundle":
+            obj = extractor.bundle_from_payload(plan.bundle or {})
+        else:
+            obj = extractor.extract_multi(content, agent_id=agent_id)
+        br = self.app.hippocampus.remember_bundle(
+            obj, agent_id=agent_id, namespace=namespace)
+        if not br.get("handled", br.get("applied", 0) > 0):
+            self.app.hippocampus._defer_orphan(content, agent_id, cognition)
+            return {"applied": False, "written": 0, "id": "",
+                    "reason": "一进多出失败，原文留项目档案待重试", "mode": plan.mode}
+        ids = br.get("neuron_ids") or []
+        return {"applied": True, "written": br.get("applied", 0),
+                "id": ids[0] if ids else "", "reason": f"一进多出 {br.get('applied')}/{br.get('total')}",
+                "mode": plan.mode, "complexity": br.get("complexity")}
+
+    def save_memory(self, content: str, *, agent_id: str = "flutter",
+                    cognition: dict | None = None, bundle: dict | None = None) -> dict[str, Any]:
+        result = self._ingest_one(content, agent_id=agent_id, cognition=cognition, bundle=bundle)
         self.activation.invalidate()
-        return {"applied": result.applied, "id": result.neuron.uuid7_id,
-                "reason": result.admission.reason}
+        return result
 
     def import_memories(self, text: str, suffix: str = ".txt", *,
                         agent_id: str = "import", fast: bool = True) -> dict[str, Any]:
@@ -332,10 +364,8 @@ class MemoryService:
         errors: list[str] = []
         for index, item in enumerate(entries, start=1):
             try:
-                result = self.app.hippocampus.remember(
-                    item, agent_id=agent_id, use_llm=not fast
-                )
-                if result.applied:
+                result = self._ingest_one(item, agent_id=agent_id, fast=fast)
+                if result.get("applied"):
                     applied += 1
                 else:
                     skipped += 1

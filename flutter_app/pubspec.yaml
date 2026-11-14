@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # 聊天发图（Windows 桌面官方文件选择器）
+  file_selector: ^1.0.0
 
 dev_dependencies:
   flutter_test:

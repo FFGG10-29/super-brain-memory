@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -147,13 +148,25 @@ def load_workbuddy_auth(path: Path) -> WorkBuddyCredential:
 
 
 def discover_auth_file(explicit: str = "") -> Path | None:
-    """explicit > env WORKBUDDY_AUTH_FILE > %LOCALAPPDATA% > %APPDATA% 同路径。"""
+    """explicit > env WORKBUDDY_AUTH_FILE > %LOCALAPPDATA% > %APPDATA% 同路径。
+
+    这是 WorkBuddy **桌面端**当前登录态活文件（一次仅一个账号）。多账号要靠
+    `import_account_snapshot` 把每次切号后的登录态另存为 ~/.dsh/.xdpool/*.info；
+    桌面端自己不产生历史快照文件（见 xdpool commandLogin 权威说明）。
+    """
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit))
     env_path = os.environ.get("WORKBUDDY_AUTH_FILE", "")
     if env_path:
         candidates.append(Path(env_path))
+    # ★ 显式指定（参数或 WORKBUDDY_AUTH_FILE）时绝不回退到真实桌面端活文件：
+    #   否则测试/多实例把 env 指向空路径仍会抓到本机登录态，破坏隔离、污染账号数。
+    if explicit or env_path:
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
     rel = (Path("CodeBuddyExtension") / "Data" / "Public" / "auth"
            / "workbuddy-desktop.info")
     for var in ("LOCALAPPDATA", "APPDATA"):
@@ -309,16 +322,17 @@ def import_transfer(text: str, *, accounts_file: str = "") -> dict[str, int]:
 
 
 # ── 登录态监听快照（多账号核心：换号登录先capture再被覆盖）─────────────────
-def capture_auth_snapshot(*, accounts_file: str = "", auth_file: str = "") -> dict[str, int]:
-    """把当前 WorkBuddy 登录态快照进 accounts.json（按 account_id 去重合并）。
+def capture_auth_snapshot(*, accounts_file: str = "", auth_file: str = "") -> dict[str, Any]:
+    """把**当前** WorkBuddy 桌面端登录态合并进 accounts.json（按 account_id 去重）。
 
-    用户在桌面端/浏览器登录另一个账号 → 凭证文件被覆盖 → 若不先快照，
-    旧账号就丢了。xdpool 的「浏览器登录…自动入池」就是这个机制：
-    监听凭证文件变化，每次变化把当前登录态合并进 accounts.json（多账号并存）。
+    正确多账号流程（xdpool commandLogin 权威）：桌面端一次只登一个账号，
+    你在桌面端手动切号后，每次调本函数把"当前账号"抓进池，旧账号因
+    accounts.json 已存而保留 → 多账号并存。**浏览器登录不写桌面端凭证文件，
+    因此无法用本函数捕获**——必须先让 WorkBuddy 桌面端登录该账号。
     """
     auth_path = discover_auth_file(auth_file)
     if auth_path is None or not auth_path.is_file():
-        return {"captured": 0, "reason": "无登录态文件"}
+        return {"captured": 0, "reason": "无桌面端登录态文件（浏览器登录不写入此处）"}
     try:
         credential = load_workbuddy_auth(auth_path)
     except Exception as exc:  # noqa: BLE001  加密/损坏不计入
@@ -341,19 +355,27 @@ def capture_auth_snapshot(*, accounts_file: str = "", auth_file: str = "") -> di
     changed = account_id not in existing or \
         existing[account_id].access_token != credential.access_token
     existing[account_id] = credential
-    save_accounts_atomic(
-        path, list(existing.values()),
-        ignored=meta.get("ignored"),
-        disabled_models=meta.get("disabled_models"),
-        default_model=meta.get("default_model", ""),
-        model_prefs=meta.get("model_prefs"))
+    if changed:
+        save_accounts_atomic(
+            path, list(existing.values()),
+            ignored=meta.get("ignored"),
+            disabled_models=meta.get("disabled_models"),
+            default_model=meta.get("default_model", ""),
+            model_prefs=meta.get("model_prefs"))
     return {"captured": 1 if changed else 0,
             "total": len(existing), "account_id": account_id,
             "changed": changed}
 
 
-def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[WorkBuddyCredential]:
-    """xdpool accounts.json + WorkBuddy 登录态，按 account_id 去重（先出现者优先）。"""
+def discover_accounts(*, accounts_file: str = "", auth_file: str = "",
+                      extra_auth_dirs: list[str] | None = None) -> list[WorkBuddyCredential]:
+    """xdpool accounts.json + WorkBuddy 登录态 + OAuth vault，按 account_id 去重。
+
+    `extra_auth_dirs` 是额外的凭证目录（每个 *.info 走 load_workbuddy_auth）——
+    默认纳入 wbmod 号池网关的 vault（D:/workbuddy/wbmod/vendor/xdpool-gateway/vault），
+    这样 wbmod 浏览器 OAuth 扫码入池的账号，超级大脑 rescan 也能直接读到，
+    两边共享同一份凭证，不必各扫各的。结构已实测兼容（同名 auth/account 嵌套形）。
+    """
     found: list[WorkBuddyCredential] = []
     seen: set[str] = set()
 
@@ -378,8 +400,38 @@ def discover_accounts(*, accounts_file: str = "", auth_file: str = "") -> list[W
 
     auth_path = discover_auth_file(auth_file)
     if auth_path is not None:
-        credential = load_workbuddy_auth(auth_path)
-        if credential.account_id() not in seen:
+        try:
+            credential = load_workbuddy_auth(auth_path)
+        except Exception:  # noqa: BLE001  登录态损坏不影响 xdpool 已存账号
+            credential = None
+        if credential is not None and credential.access_token \
+                and credential.account_id() not in seen:
+            seen.add(credential.account_id())
+            found.append(credential)
+
+    # ★ OAuth vault 目录（wmob 浏览器扫码入池的凭证）：与 wbmod 号池网关共享。
+    dirs = list(extra_auth_dirs or [])
+    if extra_auth_dirs is None:
+        # 环境变量优先（测试隔离：设为空串可彻底关闭 vault 扫描，避免污染真实凭证）。
+        env_dirs = os.environ.get("XDPOOL_VAULT_DIRS", "__DEFAULT__")
+        if env_dirs == "__DEFAULT__":
+            default_vault = Path.home() / ".workbuddy" / "xdpool-vault"  # 可配置兜底
+            wbmod_vault = Path("D:/workbuddy/wbmod/vendor/xdpool-gateway/vault")
+            dirs = [str(wbmod_vault), str(default_vault)]
+        else:
+            dirs = [d for d in env_dirs.split(";") if d.strip()]
+    for d in dirs:
+        vault = Path(d)
+        if not vault.is_dir():
+            continue
+        for info in sorted(vault.glob("*.info")):
+            try:
+                credential = load_workbuddy_auth(info)
+            except Exception:  # noqa: BLE001  单个损坏文件不影响其它账号
+                continue
+            if not credential.access_token or credential.account_id() in seen:
+                continue
+            seen.add(credential.account_id())
             found.append(credential)
     return found
 
@@ -412,6 +464,33 @@ def load_meta(path: Path) -> dict[str, Any]:
 def load_ignored(path: Path) -> set[str]:
     """accounts.json 顶层 ignored 列表（「移出号池」的账号 id；缺失视为空）。"""
     return {str(item) for item in load_meta(path).get("ignored", [])}
+
+
+def _restrict_windows_acl(path: Path) -> None:
+    """Windows 上把凭证文件 ACL 收紧为「仅当前用户 + SYSTEM」，兑现文档 0600 承诺。
+
+    POSIX 的 os.chmod(0600) 在 Windows 上只切只读位、完全不碰 DACL——
+    实测 accounts.json 继承 SYSTEM + BUILTIN\\Administrators + 当前用户全控制，
+    管理员组可读明文 accessToken/refreshToken。这里用 icacls 断继承、只留当前用户
+    与 SYSTEM（服务/备份需要），失败一律静默（不让 ACL 问题阻断凭证落盘）。
+
+    用 /inheritance:r 断开父目录继承；/grant:r 替换为显式授权（非追加）。
+    """
+    if os.name != "nt":
+        return
+    try:
+        # 当前用户（DOMAIN\\USER 或 COMPUTER\\USER）；icacls 接受 *SIDNAME 语法更稳
+        user = os.environ.get("USERNAME", "")
+        domain = os.environ.get("USERDOMAIN", "")
+        principal = f"{domain}\\{user}" if domain and user else (user or "*S-1-1-0")
+        # 先断继承，再显式授予当前用户与 SYSTEM 完全控制；移除其它 DACL 条目
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r",
+             f"{principal}:(F)", "*S-1-5-18:(F)"],
+            capture_output=True, timeout=15, check=False,
+        )
+    except Exception:  # noqa: BLE001  ACL 收紧失败不阻断凭证写入
+        pass
 
 
 def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential],
@@ -459,4 +538,5 @@ def save_accounts_atomic(path: Path, accounts: Iterable[WorkBuddyCredential],
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # POSIX 0600（Windows 上仅切只读位）
+    _restrict_windows_acl(path)                   # Windows 真收紧 DACL（P0-2）

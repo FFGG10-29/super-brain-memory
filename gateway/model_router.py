@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -63,6 +64,21 @@ def _cosine(a: Any, b: Any) -> float:
     return num / (da * db)
 
 
+def _multimodal_content(prompt: str, images: list[str] | None) -> Any:
+    """构造 OpenAI 兼容 user content：无图返回纯字符串；有图返回 text+image_url 数组。
+
+    images 元素是 data URL（data:image/...;base64,...）或 http(s) URL，直接透传上游。
+    """
+    if not images:
+        return prompt
+    parts: list[dict[str, Any]] = []
+    if str(prompt or "").strip():
+        parts.append({"type": "text", "text": str(prompt)})
+    for src in images:
+        parts.append({"type": "image_url", "image_url": {"url": str(src)}})
+    return parts or prompt
+
+
 @dataclass
 class ModelClient:
     """供应商客户端。测试可注入子类覆盖 complete()，不发真实网络请求。"""
@@ -92,8 +108,11 @@ class ModelClient:
             self.failures += 1
         self.latency_ms = 0.7 * self.latency_ms + 0.3 * max(1.0, latency_ms)
 
-    def complete(self, prompt: str) -> str:
-        """Ollama / OpenAI 兼容两种协议；注入 fake client 时不走这里。"""
+    def complete(self, prompt: str, *, images: list[str] | None = None) -> str:
+        """Ollama / OpenAI 兼容两种协议；注入 fake client 时不走这里。
+
+        images 非空时走 OpenAI 多模态 content 数组（仅 cloud 协议支持；本地协议忽略）。
+        """
         if not self.endpoint:
             raise RuntimeError(f"{self.name}: 未配置 endpoint")
         if self.kind == LOCAL:
@@ -102,7 +121,8 @@ class ModelClient:
         else:
             url = self.endpoint.rstrip("/") + "/chat/completions"
             payload = {"model": self.model,
-                       "messages": [{"role": "user", "content": prompt}]}
+                       "messages": [{"role": "user",
+                                     "content": _multimodal_content(prompt, images)}]}
         headers = {"Content-Type": "application/json", **self.headers}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -126,12 +146,15 @@ class LocalGGUFClient(ModelClient):
                          weight=0.5, timeout_sec=timeout_sec)
         self._llm = llm
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, *, images: list[str] | None = None) -> str:
         text = self._llm.complete_text(
             "你是本地记忆助手，只依据给定上下文简洁作答，不要编造。", prompt)
         if not text.strip():
             raise RuntimeError("GGUF 返回空文本")
         return text
+
+
+logger = logging.getLogger("model_router")
 
 
 class ModelRouter:
@@ -244,7 +267,13 @@ class ModelRouter:
                 pool.discover()
                 if pool.accounts:
                     self._account_pool = pool
-                    self._pool.append(PoolClient(pool, self._config))
+                    # 号池显式开启且有账号 → 提到候选池首位作默认模型源。
+                    # 理由：用户显式开 POOL_ENABLED 就是要用多账号/白嫖额度；本地
+                    # Ollama 未安装时排列首位只会每次空等超时（实测 8769 聊天因
+                    # local-ollama 优先而整链失败）。隐私底线不破：sensitive=True
+                    # 时 _eligible 排除 kind=cloud 的号池，敏感内容仍走本地；号池
+                    # 调用失败时 complete() 按 ordered 链照常 fallback 到本地。
+                    self._pool.insert(0, PoolClient(pool, self._config))
             except Exception:  # noqa: BLE001  号池不可用不影响路由层
                 self._account_pool = None
         if not cfg.enabled:
@@ -316,6 +345,18 @@ class ModelRouter:
         if sticky and sticky[1] == intent and sticky[2] > now and sticky[3] == caps:
             chain = list(sticky[4])
         self._sticky[session_id] = (best.name, intent, now + ttl, caps, chain)
+        # v4.1-C 全开：路由决策镜像写 ``route`` ns（键=session_id，值含 client/intent/caps/
+        # 到期时间的快照）。_sticky 仍是权威（同进程TTL语义）；route ns 仅作可观测 +
+        # 跨调用诊断（"这轮为何选它"），未装配/异常静默不影响路由。
+        try:
+            mgr = get_cache_manager()
+            if mgr is not None:
+                mgr.set("route", str(session_id), {
+                    "client": best.name, "intent": intent, "caps": list(caps),
+                    "expires_at": now + ttl, "chain": list(chain),
+                }, ttl_sec=ttl)
+        except Exception:  # noqa: BLE001  路由缓存失败不阻断选型
+            pass
         return best
 
     # ── C17：语义输出缓存 ─────────────────────────────────────────────────
@@ -377,6 +418,7 @@ class ModelRouter:
         sensitive: bool = False,
         memory_ids: list[str] | None = None,
         model: str = "",
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         """调用并按 providers 顺序 fallback；429/超时/异常都记事件，不抛给 ChatEngine。
 
@@ -385,11 +427,14 @@ class ModelRouter:
         `memory_ids` 由 ChatEngine 接线传入，写进缓存值的 affected_ids，
         使 `memory_updated` 总线失效可精确命中（C0 按值匹配）。
         C17：精确 miss 且语义可缓存时做 embedding 近邻查找（cache_kind="semantic"）。
+        `images` 非空（多模态聊天）：输出/语义缓存一律跳过（键只有 prompt，
+        同文异图会假命中），并把图片随 OpenAI content 数组透传给模型。
         """
         caps = tuple(str(cap) for cap in (required_caps or ()))
         mgr = get_cache_manager()
         cache_key = ""
-        if mgr is not None and not sensitive and intent in _OUTPUT_CACHE_INTENTS:
+        if (mgr is not None and not sensitive and not images
+                and intent in _OUTPUT_CACHE_INTENTS):
             cache_key = _output_cache_key(
                 prompt, str(self._config.model_router.intent_map.get(intent, "")), intent)
             cached = mgr.get("output", cache_key)
@@ -398,9 +443,10 @@ class ModelRouter:
                         "model": str(cached.get("model") or ""), "kind": "cache",
                         "fallback": False, "cache_hit": True}
 
-        # C17：精确缓存 miss 后做语义近邻查找；sensitive 一律不做语义读/写（与 C16 同纪律）。
+        # C17：精确缓存 miss 后做语义近邻查找；sensitive/带图一律不做语义读/写。
         # embedding 保存在 sem_embedding，成功后写入复用，避免二次编码。
-        sem_embedding = None if sensitive else self._semantic_embedding(prompt, intent)
+        sem_embedding = (None if sensitive or images
+                         else self._semantic_embedding(prompt, intent))
         if sem_embedding:
             hit = self._semantic_lookup(sem_embedding, intent)
             if hit is not None:
@@ -414,7 +460,7 @@ class ModelRouter:
         # free:* / 免密 id → 免密 lane；其余 → 号池 failover。失败如实报错，
         # 不静默换成别的模型（用户点名的是这一个）。
         if model:
-            return self._complete_explicit(prompt, model, session_id)
+            return self._complete_explicit(prompt, model, session_id, images=images)
         # C07：sticky 已缓存同 (intent, caps) 的 fallback 链就直接复用；
         # 链上每个客户端仍要重跑 _eligible（供应商健康/能力可能变化）。
         now = time.time()
@@ -439,7 +485,9 @@ class ModelRouter:
         for client in ordered:
             started = time.perf_counter()
             try:
-                text = client.complete(prompt)
+                # 带图才传 images kwarg（fake client/旧签名兼容：无图保持 complete(prompt)）
+                text = (client.complete(prompt, images=images) if images
+                        else client.complete(prompt))
                 if text:
                     client.record(True, (time.perf_counter() - started) * 1000)
                     if cache_key:
@@ -469,35 +517,78 @@ class ModelRouter:
     def complete_task(self, task: str, prompt: str) -> str:
         """内部消费者（抽取/精排/巩固）按 task_routes 定向调用远程供应商。
 
-        spec："pool:<model>" 走号池 failover；"free:<model>" 走免密 lane；
-        "provider:<name>" 走配置的云供应商。无路由/失败抛异常，由调用方回落本地。
+        spec："pool:<model>" 走号池 failover；"provider:<name>" 走配置的云供应商；
+        "cloud:<pid>|<model>" 走注册表供应商的具体模型（key 供应商级共用，
+        同一供应商不同用途可各选不同模型）。
+        免密 lane 已删除（2026-11-12）：历史 "free:<model>" 路由自动改走号池同名模型，
+        不再调用已下线的 free_chat。无路由/失败抛异常，由调用方回落本地。
         """
         spec = str((self._task_routes_overlay()
                     or self._config.model_router.task_routes or {}).get(task) or "")
         if not spec:
             raise RuntimeError(f"任务 {task} 未配置远程路由")
-        if spec.startswith("pool:"):
+        if spec.startswith(("pool:", "free:")):
             pool = self._account_pool
             if pool is None:
                 raise RuntimeError("号池未装配")
             return pool.complete(prompt, model=spec.split(":", 1)[1])
-        if spec.startswith("free:"):
-            pool = self._account_pool
-            if pool is None:
-                raise RuntimeError("号池未装配")
-            return pool.free_chat(prompt, model=spec.split(":", 1)[1])
+        if spec.startswith("cloud:"):
+            # 注册表供应商 + 指定模型：base_url 从 provider_registry 查，
+            # key 读供应商级 secret model_router.<pid>（一次填写全用途共用）。
+            rest = spec.split(":", 1)[1]
+            pid, _, model_id = rest.partition("|")
+            pid, model_id = pid.strip(), model_id.strip()
+            if not pid or not model_id:
+                raise RuntimeError(f"非法 cloud 路由 spec：{spec}")
+            base_url = ""
+            try:
+                from gateway.account_pool.catalog import provider_registry
+                for p in provider_registry():
+                    if str(p.get("id") or "") == pid:
+                        base_url = str(p.get("base_url") or "")
+                        break
+            except Exception:  # noqa: BLE001
+                base_url = ""
+            if not base_url:
+                raise RuntimeError(f"注册表无供应商 {pid}")
+            api_key = ""
+            if self._secret_store is not None:
+                api_key = self._secret_store.get(f"model_router.{pid}") or ""
+            if not api_key:
+                raise RuntimeError(f"供应商 {pid} 未配置 API Key")
+            tmp = ModelClient(name=f"{pid}:{model_id}", kind=CLOUD, endpoint=base_url,
+                              model=model_id, api_key=api_key,
+                              timeout_sec=float(self._config.model_router.request_timeout_sec))
+            logger.info("[route] %s -> cloud %s|%s @ %s", task, pid, model_id, base_url)
+            return tmp.complete(prompt)
         if spec.startswith("provider:"):
             name = spec.split(":", 1)[1]
             for client in self._pool:
                 if client.name == name:
                     return client.complete(prompt)
+            # 模型配置页「自定义/注册表模型」路径：base_url/model 写在 model.<name>_*，
+            # key 在 secret model.<name>_api_key，未进 provider overlay 候选池。
+            # 这里按需构造一个临时 OpenAI 兼容 client 发请求，让该路径真正生效。
+            mc = self._config.model
+            base_url = str(getattr(mc, f"{name}_base_url", "") or "")
+            model_name = str(getattr(mc, f"{name}_model", "") or "")
+            if base_url and model_name:
+                api_key = ""
+                if self._secret_store is not None:
+                    api_key = self._secret_store.get(f"{name}_api_key") or ""
+                if not api_key:
+                    raise RuntimeError(
+                        f"任务 {task} 选了云端模型 {model_name} 但 API Key 为空")
+                tmp = ModelClient(name=name, kind=CLOUD, endpoint=base_url,
+                                  model=model_name, api_key=api_key,
+                                  timeout_sec=float(self._config.model_router.request_timeout_sec))
+                return tmp.complete(prompt)
             raise RuntimeError(f"供应商不存在：{name}")
         raise RuntimeError(f"非法路由 spec：{spec}")
 
-    def _complete_explicit(self, prompt: str, model: str, session_id: str) -> dict[str, Any]:
-        """定向调用用户点名的模型（free:*/免密 id → 免密 lane；其余 → 号池）。"""
-        from gateway.account_pool.catalog import is_free_lane
-
+    def _complete_explicit(self, prompt: str, model: str, session_id: str,
+                           *, images: list[str] | None = None) -> dict[str, Any]:
+        """定向调用用户点名的模型（一律走号池；免密 lane 已删除）。"""
         pool = self._account_pool
         if pool is None:
             return {"ok": False, "text": "号池未装配（.env 设 POOL_ENABLED=true 并重启后端）",
@@ -505,12 +596,8 @@ class ModelRouter:
         base = model.split(":", 1)[1] if model.startswith("free:") else model
         started = time.perf_counter()
         try:
-            if model.startswith("free:") or is_free_lane(base):
-                text = pool.free_chat(prompt, model=base)
-                kind = "free"
-            else:
-                text = pool.complete(prompt, model=base)
-                kind = "pool"
+            text = pool.complete(prompt, model=base, images=images)
+            kind = "pool"
             return {"ok": True, "text": text, "model": base, "kind": kind,
                     "fallback": False, "cache_hit": False,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 1)}

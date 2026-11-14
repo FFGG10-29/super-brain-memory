@@ -30,6 +30,30 @@ __all__ = ["CacheManager", "CacheNamespace"]
 _FLUSH_BATCH = 500
 _LMDB_BUCKET = "cache"
 
+# 每个命名空间生产消费者 → **中文人话说明**（单一真源；缓存页据此展示）。
+# 2026-11-12 用户裁决：卡片必须用中文写明白"这是什么缓存、存了什么、谁在读写"。
+_CONSUMERS: dict[str, str] = {
+    "recall": "召回缓存——把「搜记忆」的检索结果存下来，相同问题不重新搜（六路召回）",
+    "embedding": "向量缓存——同一段文字算过的语义向量存下来，不再重复算",
+    "vector_index": "向量索引缓存——按查询缓存检索用的索引段，写入记忆后自动失效",
+    "doc_distill": "文档蒸馏缓存——记录哪些项目档案已提炼过，防止重复提炼（72 小时过期；内容变更立即失效）",
+    "persona": "人格缓存——大肥鱼人格参数快照（容量小，24 小时过期）",
+    "prompt_prefix": "提示词前缀缓存——人格注入等固定开头不重复拼接",
+    "tool_read": "读工具缓存——MCP 只读工具同样的调用直接返回上次结果（60 秒内）",
+    "tool": "工具清单缓存——tools/list 的工具定义列表复用",
+    "episodic": "情节快照缓存——聊天每轮记录召回了哪些记忆，记忆更新后精确失效",
+    "semantic": "语义输出缓存——意思相近的问题直接复用上次回复（阈值 0.95）",
+    "output": "输出缓存——一模一样的提问直接复用整段回复（敏感内容不缓存）",
+    "thalamus": "意图缓存——「这句话是想找记忆还是闲聊」的分类结果复用",
+    "salience": "显著性缓存——记忆重要度打分结果复用",
+    "safety": "敏感判定缓存——聊天敏感词判断结果复用",
+    "narrative": "叙事投影缓存——召回结果的叙事骨架投影（写入后精确失效）",
+    "path": "路径缓存——数据目录/模型目录的解析结果复用",
+    "route": "路由镜像缓存——「这轮聊天用了哪个模型」的选路留痕（供诊断）",
+    "conflict": "冲突缓存——新旧记忆覆盖关系的检测结果（写入后按 id 失效）",
+    "agent_brief": "协作简报缓存——与各 Agent 协作要点/主题摘要（5 分钟刷新）",
+}
+
 
 class CacheNamespace(str, Enum):
     """全部命名空间（含预留位）。本期有消费者的见 `config.cache.namespaces` 默认值。"""
@@ -49,6 +73,7 @@ class CacheNamespace(str, Enum):
     TOOL = "tool"
     DOC_DISTILL = "doc_distill"
     CONFLICT = "conflict"
+    AGENT_BRIEF = "agent_brief"      # E6 Agent 心智模型 brief（TTL 300s）
 
 
 @dataclass
@@ -435,8 +460,12 @@ class CacheManager:
         ids = [str(item) for item in (event.get("affected_ids") or []) if item]
         if not ids:
             return 0
+        # v4.1-C 全开：conflict（冲突痕迹）、semantic（语义输出）、output（精确输出）
+        # 加入默认波及集——三者值内均含 memory id / affected_ids 可精确命中；
+        # vector_index 由 CachedVectorStore 写入时显式带 affected_namespaces。
         namespaces = [str(item) for item in
-                      (event.get("affected_namespaces") or ("recall", "episodic"))]
+                      (event.get("affected_namespaces")
+                       or ("recall", "episodic", "conflict", "semantic", "output"))]
         total = 0
         for ns in namespaces:
             if not self._enabled(ns):
@@ -476,16 +505,29 @@ class CacheManager:
         return count
 
     def size(self, ns: str) -> int:
+        """条目数：memory 介质读 LRU，lmdb 介质按前缀扫桶（修复 lmdb 恒显 0 的 bug）。"""
+        settings = self._settings(ns)
+        if settings.get("media") == "lmdb":
+            if self._kv is None:
+                return 0
+            try:
+                count = 0
+                for _key, _raw in self._kv.scan_prefix(_LMDB_BUCKET, f"{ns}:", limit=5000):
+                    count += 1
+                return count
+            except Exception:  # noqa: BLE001  扫描失败按 0 计，不影响快照
+                return 0
         return self._store(ns).size()
 
     def snapshot_metrics(self) -> dict[str, Any]:
-        """前端缓存监控页：不清空地读当前 per-ns 聚合 + 条目数 + 配置开关。"""
+        """前端缓存监控页：不清空地读当前 per-ns 聚合 + 条目数 + 配置开关 + 消费者。"""
         with self._lock:
             counters = {ns: dict(row) for ns, row in self._counters.items()}
         block = getattr(self._config, "cache", None)
         namespaces_cfg = dict(getattr(block, "namespaces", None) or {})
         result: dict[str, Any] = {}
-        seen = set(counters) | set(namespaces_cfg) | set(self._stores)
+        # 候选集含 _CONSUMERS：确保每个已接线 ns 即使本轮零访问也出现在快照里
+        seen = set(counters) | set(namespaces_cfg) | set(self._stores) | set(_CONSUMERS)
         for ns in sorted(seen):
             cfg_ns = namespaces_cfg.get(ns) or {}
             row = counters.get(ns, {"hits": 0, "misses": 0, "evictions": 0,
@@ -495,13 +537,14 @@ class CacheManager:
                 "enabled": bool(self._enabled(ns)),
                 "media": cfg_ns.get("media", "memory"),
                 "capacity": int(cfg_ns.get("capacity", 512)),
-                "entries": self._store(ns).size() if self._enabled(ns) else 0,
+                "entries": self.size(ns) if self._enabled(ns) else 0,
                 "hits": int(row["hits"]),
                 "misses": int(row["misses"]),
                 "hit_rate": round(row["hits"] / lookups, 4) if lookups else 0.0,
                 "evictions": int(row["evictions"]),
                 "invalidations": int(row["invalidations"]),
                 "avg_latency_us": round(row["latency_us"] / lookups, 1) if lookups else 0.0,
+                "consumer": _CONSUMERS.get(ns, "（无生产消费者）"),
             }
         return {"enabled": bool(getattr(block, "enabled", True)), "namespaces": result}
 

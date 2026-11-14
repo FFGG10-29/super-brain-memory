@@ -21,6 +21,9 @@ os.environ["XDPOOL_ACCOUNTS_FILE"] = os.path.join(
     tempfile.gettempdir(), "brain_test_no_xdpool_accounts.json")
 os.environ["WORKBUDDY_AUTH_FILE"] = os.path.join(
     tempfile.gettempdir(), "brain_test_no_auth.info")
+# OAuth vault 共享扫描隔离：测试里关闭对真实 wbmod vault 的扫描（空串=不扫），
+# 避免本机真实凭证污染 discover_accounts 的账号数断言。
+os.environ["XDPOOL_VAULT_DIRS"] = ""
 
 from brain.amygdala import Amygdala
 from brain.hippocampus import Hippocampus
@@ -28,7 +31,7 @@ from brain.prefrontal import Prefrontal
 from brain.router_extractor import RouterExtractor
 from brain.synaptic_plasticity import SynapticPlasticity
 from brain.thalamus import Thalamus
-from config import BrainConfig, ModelConfig, StorageConfig, SyncConfig
+from config import BrainConfig, ModelConfig, OneToManyConfig, StorageConfig, SyncConfig
 from core.ids import HybridLogicalClock
 from engine.reranker import IdentityReranker
 from main import BrainApp, build_app, build_storage
@@ -77,6 +80,9 @@ def brain_config(tmp_path) -> BrainConfig:
         ),
         model=ModelConfig(dense_dim=DENSE_DIM, use_cuda=False, llm_gguf_dir=tmp_path / "models"),
         sync=SyncConfig(device_id="dev-test", local_repo_dir=tmp_path / "brain-sync"),
+        # 底层 remember() 单条测试仍可跑（铁律在生产入口 MCP/chat 层强制 + 专项测试验证）；
+        # 生产默认 enforce=True（config.OneToManyConfig），不受此测试 fixture 影响。
+        one_to_many=OneToManyConfig(enforce=False),
     )
 
 

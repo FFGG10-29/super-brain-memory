@@ -181,7 +181,8 @@ class V3Daemon:
 
     def handle_event(self, content: str, *, agent_id: str = "default",
                      namespace: str = "topic:default", cognition: dict[str, Any] | None = None,
-                     event_type: str | None = None) -> dict[str, Any]:
+                     event_type: str | None = None,
+                     bundle: dict[str, Any] | None = None) -> dict[str, Any]:
         content = str(content).strip()
         if len(content) < 4:
             return {"accepted": False, "error": "content too short"}
@@ -191,10 +192,21 @@ class V3Daemon:
         ns = str(namespace or "topic:default")
         if not ns.startswith("topic:"):
             ns = "topic:default"
+        # ★ WorkBuddy 侧前置拆分 bundle（与前置 PAD 同款）：写进 journal 透传给 worker
+        #   直接落组，避免 RPC save_memory 经 journal→worker 时漏拆。
+        #   寒暄/系统指令直接丢弃；事务性强制 overwrite，不进认知池。
+        _bundle = bundle if isinstance(bundle, dict) else None
+        if _bundle and bool(_bundle.get("ephemeral")) and not bool(_bundle.get("transactional")):
+            return {"accepted": True, "event_type": "ephemeral", "applied": 0,
+                    "reason": "寒暄/系统指令，不进长期记忆", "ack_ms": 0}
         decision = route_write(content=content, cognition=cognition, namespace=ns, config=self._config)
+        if _bundle and bool(_bundle.get("transactional")):
+            decision = {**decision, "path": "overwrite"}
         kind = event_type or ("overwrite" if decision["path"] == "overwrite" else "ingest")
         # W2 / A3：overwrite 只带新 payload（content + cognition），不记旧 payload
         extra: dict[str, Any] = {"cognition": dict(cognition or {})}
+        if _bundle:
+            extra["bundle"] = _bundle
         if kind == "overwrite":
             entity_id = decision["entity_id"]
             extra.update({

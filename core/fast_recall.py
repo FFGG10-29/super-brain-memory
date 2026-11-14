@@ -138,21 +138,62 @@ def build_projection(topic_id: str, *, relational: Any, kv: Any,
 
 
 def get_projection(topic_id: str, *, relational: Any, kv: Any) -> ProjectionCache:
+    """进程内 dict 为 L1；cache_manager 的 ``narrative`` ns 为 L2（可观测/可跨调用复用）。
+
+    v4.1-C 全开：投影本就是派生数据，两份缓存都靠 narrative_ids_hash 签名失效，
+    签名不符即重建——删掉任一层只会变慢，不会变错（架构 §14.3 可重建纪律）。
+    """
     signature = narrative_ids_hash(topic_id, kv=kv)
     with _PROJECTION_LOCK:
         cached = _PROJECTIONS.get(topic_id)
         if cached is not None and cached.narrative_ids_hash == signature:
             return cached
-        fresh = ProjectionCache(rows=build_projection(topic_id, relational=relational, kv=kv),
-                                narrative_ids_hash=signature, built_at_ms=int(time.time() * 1000))
-        _PROJECTIONS[topic_id] = fresh
-        return fresh
+    # L2：cache_manager（未装配/异常静默回退到现算）
+    try:
+        from core.cache_manager import get_cache_manager
+
+        mgr = get_cache_manager()
+    except Exception:  # noqa: BLE001
+        mgr = None
+    if mgr is not None:
+        try:
+            hit = mgr.get("narrative", str(topic_id))
+            if (isinstance(hit, dict) and hit.get("narrative_ids_hash") == signature
+                    and isinstance(hit.get("rows"), list)):
+                fresh = ProjectionCache(rows=hit["rows"], narrative_ids_hash=signature,
+                                        built_at_ms=int(hit.get("built_at_ms") or 0))
+                with _PROJECTION_LOCK:
+                    _PROJECTIONS[str(topic_id)] = fresh  # 回填 L1
+                return fresh
+        except Exception:  # noqa: BLE001
+            pass
+    fresh = ProjectionCache(rows=build_projection(topic_id, relational=relational, kv=kv),
+                            narrative_ids_hash=signature, built_at_ms=int(time.time() * 1000))
+    with _PROJECTION_LOCK:
+        _PROJECTIONS[str(topic_id)] = fresh
+    if mgr is not None:
+        try:
+            mgr.set("narrative", str(topic_id), {
+                "rows": fresh.rows, "narrative_ids_hash": signature,
+                "built_at_ms": fresh.built_at_ms,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+    return fresh
 
 
 def invalidate(topic_id: str) -> None:
     """叙事写入后主动失效（R26/R46）；下次同 topic 查询重建投影。"""
     with _PROJECTION_LOCK:
         _PROJECTIONS.pop(topic_id, None)
+    try:
+        from core.cache_manager import get_cache_manager
+
+        mgr = get_cache_manager()
+        if mgr is not None:
+            mgr.delete("narrative", str(topic_id))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def fast_recall_projected(topic_id: str, query: str, *, relational: Any,

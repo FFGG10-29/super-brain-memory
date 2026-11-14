@@ -175,6 +175,9 @@ class _MemoriesPageState extends State<MemoriesPage> {
     final pct = ((r['refined_pct'] as num?) ?? 0).toDouble();
     final worker = (r['worker'] as Map<String, dynamic>?) ?? <String, dynamic>{};
     final workerMode = (r['worker_mode']?.toString()) ?? '—';
+    final pendingItems = (r['pending_items'] as List<dynamic>? ?? <dynamic>[])
+        .whereType<Map<dynamic, dynamic>>()
+        .toList();
     return _Card(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -208,6 +211,24 @@ class _MemoriesPageState extends State<MemoriesPage> {
             '队列总量 $total · 已提炼 $pct% · Worker($workerMode) 已处理 ${worker['processed'] ?? 0} / 失败 ${worker['failed'] ?? 0}',
             style: const TextStyle(color: _hint, fontSize: 10),
           ),
+          // ★ 队列明细（2026-11-12 用户裁决：必须看得见待蒸馏的是什么、来自哪里）
+          if (pendingItems.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 8),
+            const Text('队列最前面的待提炼条目（来源 · 空间 · 字数 · 预览）：',
+                style: TextStyle(color: _hint, fontSize: 10)),
+            const SizedBox(height: 4),
+            for (final it in pendingItems)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: Text(
+                  '${it['agent_id']} · ${it['namespace']} · ${it['chars']}字 · '
+                      '${(it['preview'] ?? '').toString().replaceAll('\n', ' ')}',
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Color(0xFFB0BEC5), fontSize: 10,
+                      fontFamily: 'monospace'),
+                ),
+              ),
+          ],
           const SizedBox(height: 10),
           Row(
             children: <Widget>[
@@ -720,7 +741,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     const SizedBox(height: 10),
                     SwitchListTile(
                       dense: true,
-                      value: Prefs.get<bool>('hide_on_close', false),
+                      value: Prefs.get<bool>('hide_on_close', true),
                       title: const Text('关窗隐藏到托盘',
                           style: TextStyle(color: Colors.white, fontSize: 11)),
                       subtitle: const Text(
@@ -1062,7 +1083,10 @@ class _DataPageState extends State<DataPage> {
       );
 }
 
-/// 模型配置：双通道本地/云端、模型状态、参数保存与内核热重启。
+/// 模型配置（统一中枢）：一个地方管好所有模型用途，来源用下拉框选，不再分散。
+/// - Embedding：保留本地 bge-m3（向量化每次读写都要跑，远程延迟/配额扛不住），可选远程。
+/// - 抽取 / 精排 / 巩固：本地 / 号池模型 / 自定义供应商，一个下拉框搞定。
+/// 选号池模型只需一个下拉；选"自定义"才展开 url + key + 模型名，互不混淆。
 class ModelPage extends StatefulWidget {
   const ModelPage({super.key, required this.client});
   final BrainClient client;
@@ -1072,95 +1096,679 @@ class ModelPage extends StatefulWidget {
 }
 
 class _ModelPageState extends State<ModelPage> {
+  static const List<String> _tasks = <String>['embedding', 'extract', 'rerank', 'consolidation'];
+  static const Map<String, String> _taskLabels = <String, String>{
+    'embedding': 'Embedding 向量化',
+    'extract': '记忆抽取 LLM',
+    'rerank': '交叉编码精排',
+    'consolidation': '夜间巩固 LLM',
+  };
+  static const Map<String, String> _taskHints = <String, String>{
+    // ★ 本地模型已全删（2026-11-12 全面云端）：话术与最新架构保持一致。
+    'embedding': '每次写入/查询都要跑，走云端向量（号池或云供应商，本地模型已裁撤）',
+    'extract': '一进多出拆解用 LLM，走号池或云供应商（本地 0.6B 已删除）',
+    'rerank': '精排打分，硅基流动 bge-reranker-v2-m3 免费（本地 ONNX 已删除）',
+    'consolidation': '夜间叙事/摘要用的 LLM，走号池或云供应商',
+  };
+
   Map<String, dynamic> _status = <String, dynamic>{};
-  Map<String, dynamic> _sections = <String, dynamic>{};
-  late final TextEditingController _embedUrl = TextEditingController();
-  late final TextEditingController _llmUrl = TextEditingController();
+  // 每个任务的来源：pool:<id> | provider:<id> | cloud:<pid>|<model> | custom（本地已裁撤）
+  final Map<String, String> _sources = <String, String>{
+    'embedding': 'custom', 'extract': 'custom', 'rerank': 'custom', 'consolidation': 'custom',
+  };
+  // 号池模型清单（免密 free:* 已移除）
+  List<Map<String, dynamic>> _poolModels = <Map<String, dynamic>>[];
+  // 已保存 key 的云供应商（来自 router.config，供内部路由 provider:* 选择）
+  List<Map<String, dynamic>> _savedProviders = <Map<String, dynamic>>[];
+  // 注册表全量模型（带 category/provider），用于按用途过滤下拉
+  List<Map<String, dynamic>> _registryModels = <Map<String, dynamic>>[];
+  // 注册表供应商元数据（id/name/base_url 去重），用于「云供应商 Key」区
+  List<Map<String, dynamic>> _providersMeta = <Map<String, dynamic>>[];
+  // 供应商级 Key（pid → 输入框）：key 只跟供应商走，一次填写全用途共用
+  final Map<String, TextEditingController> _providerKeys = <String, TextEditingController>{};
+  final Set<String> _providerKeySaved = <String>{};
+  // 云供应商路由总开关（model_router.enabled；false 时填了 key 也不进候选池）
+  bool _routerEnabled = false;
+
+  /// 每个用途接受哪些模型类别——下拉只列匹配的，杜绝选错（精排处只出精排模型）。
+  static const Map<String, Set<String>> _taskCategories = <String, Set<String>>{
+    'embedding': <String>{'embedding'},
+    'rerank': <String>{'rerank'},
+    'extract': <String>{'llm', 'llm-code', 'llm-vision', 'router'},
+    'consolidation': <String>{'llm', 'llm-code', 'llm-vision', 'router'},
+  };
+  static const Map<String, String> _catLabel = <String, String>{
+    'embedding': '向量', 'rerank': '精排', 'llm': '对话', 'llm-code': '代码',
+    'llm-vision': '视觉', 'asr': '语音识别', 'asr-diarization': '声纹分离',
+    'translation': '翻译', 'tts': '语音合成', 'router': '路由',
+  };
+  // 自定义供应商（仅选 custom 时展示）
+  final Map<String, TextEditingController> _customUrl = <String, TextEditingController>{};
+  final Map<String, TextEditingController> _customKey = <String, TextEditingController>{};
+  final Map<String, TextEditingController> _customModel = <String, TextEditingController>{};
   String _message = '—';
+  bool _busy = false;
 
   @override
   void initState() {
     super.initState();
-    _reload();
+    for (final t in _tasks) {
+      _customUrl[t] = TextEditingController();
+      _customKey[t] = TextEditingController();
+      _customModel[t] = TextEditingController();
+    }
+    unawaited(_reload());
+  }
+
+  /// 把已保存的云端配置（用途类别 + base_url + model id）映射回下拉的 cloud:<pid>|<id>。
+  /// 匹配不到返回 null（调用方回退 custom）。
+  String? _matchRegistry(String task, String baseUrl, String modelId,
+      List<Map<String, dynamic>> registry) {
+    final cats = _taskCategories[task] ?? <String>{};
+    // 优先精确匹配 base_url + model id + 类别
+    for (final m in registry) {
+      if (cats.contains(m['category']) && m['id'] == modelId &&
+          baseUrl.replaceAll(RegExp(r'/+$'), '') ==
+              (m['base_url'] ?? '').toString().replaceAll(RegExp(r'/+$'), '')) {
+        return 'cloud:${m['pid']}|${m['id']}';
+      }
+    }
+    // 退化：只按类别 + model id 匹配（base_url 改过域名的历史配置）
+    for (final m in registry) {
+      if (cats.contains(m['category']) && m['id'] == modelId) {
+        return 'cloud:${m['pid']}|${m['id']}';
+      }
+    }
+    return null;
   }
 
   Future<void> _reload() async {
-    final status = await widget.client.modelStatus();
-    final config = await widget.client.config();
-    if (!mounted) return;
-    final sections = config['sections'] as Map<String, dynamic>? ?? <String, dynamic>{};
-    final model = sections['model'] as Map<String, dynamic>? ?? <String, dynamic>{};
-    setState(() {
-      _status = status;
-      _sections = sections;
-      _embedUrl.text = model['embed_base_url']?.toString() ?? '';
-      _llmUrl.text = model['llm_base_url']?.toString() ?? '';
-    });
+    setState(() => _busy = true);
+    try {
+      final status = await widget.client.modelStatus();
+      final config = await widget.client.config();
+      final sections = config['sections'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final model = sections['model'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final router = sections['model_router'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final routes = router['task_routes'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final routerOn = router['enabled'] == true;
+      // 拉已保存 key 的云供应商（内部路由 provider:* 选项来源）+ 总开关真实态
+      List<Map<String, dynamic>> savedProviders = <Map<String, dynamic>>[];
+      bool routerEnabled = routerOn;
+      // ★ 路由回填数据源：route_set 写的是 task_routes.json overlay，
+      //   只有 router.config 返回它；config.get 的 model_router 节是静态文件
+      //   初值，永远滞后——之前刷新回填全变 local 就是这个原因。
+      Map<String, dynamic> routeOverlay = <String, dynamic>{};
+      try {
+        final rc = await widget.client.call('router.config', <String, dynamic>{});
+        if (rc is Map && rc['ok'] == true) {
+          routerEnabled = rc['enabled'] == true;
+          savedProviders = (rc['providers'] as List<dynamic>? ?? <dynamic>[])
+              .whereType<Map>()
+              .map(Map<String, dynamic>.from)
+              .where((p) => p['has_key'] == true)
+              .toList();
+          final tr = rc['task_routes'];
+          if (tr is Map) routeOverlay = Map<String, dynamic>.from(tr);
+        }
+      } catch (_) {}
+      // 拉供应商注册表（带 category），按用途过滤下拉用
+      List<Map<String, dynamic>> registryModels = <Map<String, dynamic>>[];
+      final Map<String, Map<String, dynamic>> meta = <String, Map<String, dynamic>>{};
+      try {
+        final reg = await widget.client.call('pool.provider_registry', <String, dynamic>{});
+        if (reg is Map && reg['ok'] == true) {
+          for (final p in (reg['providers'] as List<dynamic>? ?? <dynamic>[])) {
+            if (p is! Map) continue;
+            final pid = (p['id'] ?? '').toString();
+            final pname = (p['name'] ?? pid).toString();
+            final baseUrl = (p['base_url'] ?? '').toString();
+            if (pid.isNotEmpty && baseUrl.isNotEmpty && !meta.containsKey(pid)) {
+              meta[pid] = <String, dynamic>{'pid': pid, 'pname': pname, 'base_url': baseUrl};
+            }
+            for (final m in (p['models'] as List<dynamic>? ?? <dynamic>[])) {
+              if (m is! Map) continue;
+              registryModels.add(<String, dynamic>{
+                'pid': pid, 'pname': pname, 'base_url': baseUrl,
+                'id': (m['id'] ?? '').toString(),
+                'name': (m['name'] ?? m['id'] ?? '').toString(),
+                'category': (m['category'] ?? '').toString(),
+              });
+            }
+          }
+        }
+      } catch (_) {}
+      // 拉号池目录（失败不影响本地配置展示）
+      List<Map<String, dynamic>> pool = <Map<String, dynamic>>[];
+      try {
+        final cat = await widget.client.call('pool.catalog', <String, dynamic>{});
+        if (cat is Map) {
+          final wb = cat['wb'] as Map? ?? <String, dynamic>{};
+          final disabled = ((cat['disabled_models'] as List<dynamic>? ?? <dynamic>[]))
+              .map((e) => e.toString()).toSet();
+          pool = (wb['models'] as List<dynamic>? ?? <dynamic>[])
+              .whereType<Map>()
+              .map(Map<String, dynamic>.from)
+              .where((m) => !disabled.contains((m['id'] ?? '').toString()))
+              .toList();
+        }
+      } catch (_) {}
+      // 回填已保存的 key（钥匙串读回，不落配置文件）：
+      // 之前刷新后 key 框永远空白，用户以为没存上、重填才能保存——其实早存了。
+      for (final t in _tasks) {
+        try {
+          final s = await widget.client.readSecret('${t}_api_key');
+          final v = (s['value'] ?? '').toString();
+          if (v.isNotEmpty && _customKey[t]!.text.isEmpty) _customKey[t]!.text = v;
+        } catch (_) {}
+      }
+      // 供应商级 key 回填：key 只跟供应商走，一次填写全用途共用
+      final Set<String> keySaved = <String>{};
+      for (final pid in meta.keys) {
+        _providerKeys.putIfAbsent(pid, () => TextEditingController());
+        try {
+          final s = await widget.client.readSecret('model_router.$pid');
+          final v = (s['value'] ?? '').toString();
+          if (v.isNotEmpty) {
+            _providerKeys[pid]!.text = v;
+            keySaved.add(pid);
+          }
+        } catch (_) {}
+      }
+      if (!mounted) return;
+      setState(() {
+        _status = status;
+        _poolModels = pool;
+        _savedProviders = savedProviders;
+        _registryModels = registryModels;
+        _providersMeta = meta.values.toList();
+        _providerKeySaved
+          ..clear()
+          ..addAll(keySaved);
+        _routerEnabled = routerEnabled;
+        // 回填已保存的路由：overlay 优先（route_set 实时写的），静态节兜底
+        for (final t in _tasks) {
+          final spec = (routeOverlay[t] ?? routes[t])?.toString() ?? '';
+          if (spec.isEmpty || spec.startsWith('free:') || spec == 'local') {
+            // 免密 lane 已删 + 本地档已裁撤（全面云端）：回填为 custom 占位，
+            // 避免下拉 value 不在 items 内报错，也不再出现"恢复本地"。
+            _sources[t] = 'custom';
+          } else if (spec.startsWith('pool:')) {
+            _sources[t] = spec;
+          } else if (spec.startsWith('provider:')) {
+            // 旧通道（provider:<task> + model.<task>_*）映射回注册表 cloud: 项，
+            // 匹配不到才留在 provider:（label 照常显示），避免刷新后看似“恢复本地”。
+            final url = model['${t}_base_url']?.toString() ?? '';
+            final mid = model['${t}_model']?.toString() ?? '';
+            final match = (url.isNotEmpty && mid.isNotEmpty)
+                ? _matchRegistry(t, url, mid, registryModels) : null;
+            _sources[t] = match ?? spec;
+            if (match == null) {
+              _customUrl[t]!.text = url;
+              _customModel[t]!.text = mid;
+              _sources[t] = url.isNotEmpty && mid.isNotEmpty ? 'custom' : spec;
+            }
+          } else if (spec.startsWith('cloud:')) {
+            _sources[t] = spec;
+          } else {
+            _sources[t] = 'custom';
+            final url = model['${t}_base_url']?.toString() ?? '';
+            _customUrl[t]!.text = url;
+            _customModel[t]!.text = model['${t}_model']?.toString() ?? '';
+          }
+        }
+        // Embedding/Rerank 云端态：优先映射回注册表的 cloud:<pid>|<id>（让 value 在下拉内），
+        // 匹配不到（自定义端点）才回退 custom，绝不出现 value 不在 items 的崩溃。
+        if (model['embed_backend']?.toString() == 'cloud') {
+          final url = model['embed_base_url']?.toString() ?? '';
+          final mid = model['embed_model']?.toString() ?? '';
+          final match = _matchRegistry('embedding', url, mid, registryModels);
+          _sources['embedding'] = match ?? 'custom';
+          _customUrl['embedding']!.text = url;
+          _customModel['embedding']!.text = mid;
+        }
+        if (model['rerank_backend']?.toString() == 'cloud') {
+          final url = model['rerank_base_url']?.toString() ?? '';
+          final mid = model['rerank_model']?.toString() ?? '';
+          final match = _matchRegistry('rerank', url, mid, registryModels);
+          _sources['rerank'] = match ?? 'custom';
+          _customUrl['rerank']!.text = url;
+          _customModel['rerank']!.text = mid;
+        }
+      });
+    } catch (e) {
+      if (mounted) setState(() => _message = '加载失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 云路由总开关：写 config.set({model_router:{enabled}}) 即时生效（后端 on_change→reload），
+  /// 无需重启内核。enabled=false 时 provider:* 供应商不进候选池，数据不出本机。
+  Future<void> _setRouterEnabled(bool on) async {
+    setState(() => _busy = true);
+    try {
+      final res = await widget.client.setConfig(<String, dynamic>{
+        'model_router': <String, dynamic>{'enabled': on},
+      });
+      if (res.containsKey('error')) throw Exception(res['error']);
+      if (!mounted) return;
+      setState(() {
+        _routerEnabled = on;
+        _message = on ? '云供应商路由已开启（选 provider:* 的用途现在会走云端）'
+                      : '云供应商路由已关闭（仅本地/号池，数据不出本机）';
+      });
+    } catch (e) {
+      if (mounted) setState(() => _message = '开关失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 解析 cloud:<pid>|<model_id> → 注册表模型条目（含 base_url/category）。
+  Map<String, dynamic>? _registryFor(String value) {
+    if (!value.startsWith('cloud:')) return null;
+    final rest = value.substring(6);
+    final sep = rest.indexOf('|');
+    final pid = sep < 0 ? rest : rest.substring(0, sep);
+    final mid = sep < 0 ? '' : rest.substring(sep + 1);
+    return _registryModels.cast<Map<String, dynamic>?>().firstWhere(
+        (x) => x?['pid'] == pid && x?['id'] == mid, orElse: () => null);
   }
 
   Future<void> _save() async {
-    final result = await widget.client.setConfig(<String, dynamic>{
-      'model': <String, dynamic>{'embed_base_url': _embedUrl.text.trim(), 'llm_base_url': _llmUrl.text.trim()},
-    });
-    setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已保存');
+    setState(() => _busy = true);
+    try {
+      // ⓪ 供应商级 Key：key 只跟供应商走，一次填写全用途共用。
+      //    存 secret model_router.<pid>；embed/rerank/llm 通道按 base_url 反查自动取用。
+      final Set<String> availKeys = <String>{..._providerKeySaved};
+      for (final entry in _providerKeys.entries) {
+        final k = entry.value.text.trim();
+        if (k.isEmpty) continue;
+        final res = await widget.client.writeSecret('model_router.${entry.key}', k);
+        if (res['ok'] != true) {
+          throw Exception('${entry.key} 的 Key 写入钥匙串失败：${res['backend'] ?? res['error'] ?? '未知'}');
+        }
+        availKeys.add(entry.key);
+      }
+      // 填了 key 自动开云路由（不填不动开关）
+      if (availKeys.isNotEmpty && !_routerEnabled) {
+        final on = await widget.client.setConfig(<String, dynamic>{
+          'model_router': <String, dynamic>{'enabled': true},
+        });
+        if (!on.containsKey('error')) _routerEnabled = true;
+      }
+      bool providerKeyReady(String? pid) =>
+          pid != null && pid.isNotEmpty && availKeys.contains(pid);
+      // ① Embedding：本地 / 注册表向量模型(cloud:) / 硅基流动预设 / 自定义云端
+      final embedSource = _sources['embedding']!;
+      String embedUrl = '', embedModel = '';
+      final embedReg = _registryFor(embedSource);
+      if (embedReg != null) {
+        if (!providerKeyReady(embedReg['pid']?.toString())) {
+          throw Exception('Embedding 选了[${embedReg['pname']}]但该供应商 Key 为空，请在「云供应商 Key」区填写');
+        }
+        embedUrl = (embedReg['base_url'] ?? '').toString();
+        embedModel = (embedReg['id'] ?? '').toString();
+      } else if (embedSource == 'preset:siliconflow') {
+        if (!providerKeyReady('siliconflow')) {
+          throw Exception('Embedding 选了硅基流动预设但 Key 为空，请在「云供应商 Key」区填写');
+        }
+        embedUrl = 'https://api.siliconflow.cn/v1';
+        embedModel = 'BAAI/bge-m3';
+      } else if (embedSource == 'custom') {
+        embedUrl = _customUrl['embedding']!.text.trim();
+        embedModel = _customModel['embedding']!.text.trim();
+      }
+      final embedPatch = <String, dynamic>{
+        'embed_backend': embedUrl.isNotEmpty ? 'cloud' : 'local',
+        'embed_base_url': embedUrl,
+        'embed_model': embedModel,
+      };
+      final embedCfg = await widget.client.setConfig(<String, dynamic>{'model': embedPatch});
+      if (embedCfg.containsKey('error')) throw Exception('Embedding 配置写入失败：${embedCfg['error']}');
+      if (embedSource == 'custom' && embedUrl.isNotEmpty) {
+        // 自定义端点无供应商 pid，key 仍走通道级 embed_api_key
+        final embedKey = _customKey['embedding']!.text.trim();
+        if (embedKey.isNotEmpty) {
+          final keyRes = await widget.client.writeSecret('embed_api_key', embedKey);
+          if (keyRes['ok'] != true) throw Exception('API Key 写入钥匙串失败：${keyRes['backend'] ?? keyRes['error'] ?? '未知'}');
+        } else {
+          throw Exception('Embedding 自定义端点已选云端但 API Key 为空，请填写 Key');
+        }
+      }
+      // ② Rerank：本地 / 硅基流动免费 bge-reranker-v2-m3 预设 / 自定义云端。
+      //    走 config.set 写 rerank_backend/base_url/model（运行期失败自动回落本地 ONNX）。
+      final rerankSource = _sources['rerank']!;
+      final Map<String, dynamic> rerankPatch = <String, dynamic>{};
+      final rerankReg = _registryFor(rerankSource);
+      if (rerankReg != null) {
+        if (!providerKeyReady(rerankReg['pid']?.toString())) {
+          throw Exception('Rerank 选了[${rerankReg['pname']}]但该供应商 Key 为空，请在「云供应商 Key」区填写');
+        }
+        rerankPatch.addAll(<String, dynamic>{
+          'rerank_backend': 'cloud',
+          'rerank_base_url': (rerankReg['base_url'] ?? '').toString(),
+          'rerank_model': (rerankReg['id'] ?? '').toString(),
+        });
+      } else if (rerankSource == 'preset:siliconflow') {
+        if (!providerKeyReady('siliconflow')) {
+          throw Exception('Rerank 选了硅基流动预设但 Key 为空，请在「云供应商 Key」区填写');
+        }
+        rerankPatch.addAll(<String, dynamic>{
+          'rerank_backend': 'cloud',
+          'rerank_base_url': 'https://api.siliconflow.cn/v1',
+          'rerank_model': 'BAAI/bge-reranker-v2-m3',
+        });
+      } else if (rerankSource == 'custom') {
+        rerankPatch.addAll(<String, dynamic>{
+          'rerank_backend': 'cloud',
+          'rerank_base_url': _customUrl['rerank']!.text.trim(),
+          'rerank_model': _customModel['rerank']!.text.trim(),
+        });
+      } else {
+        rerankPatch['rerank_backend'] = 'local';
+      }
+      final rerankCfg = await widget.client.setConfig(<String, dynamic>{'model': rerankPatch});
+      if (rerankCfg.containsKey('error')) throw Exception('Rerank 配置写入失败：${rerankCfg['error']}');
+      if (rerankSource == 'custom' && rerankPatch['rerank_backend'] == 'cloud') {
+        final rerankKey = _customKey['rerank']!.text.trim();
+        if (rerankKey.isNotEmpty) {
+          final keyRes = await widget.client.writeSecret('rerank_api_key', rerankKey);
+          if (keyRes['ok'] != true) throw Exception('Rerank API Key 写入失败：${keyRes['backend'] ?? keyRes['error'] ?? '未知'}');
+        } else {
+          throw Exception('Rerank 自定义端点已选云端但 API Key 为空，请填写 Key');
+        }
+      }
+
+      // ③ 内部消费者（extract/consolidation）→ router.route_set。
+      //    cloud:<pid>|<model> 由后端 ModelRouter 直接解析（base_url 走注册表，
+      //    key 走供应商级 model_router.<pid>）——同一供应商不同用途可各选不同模型。
+      for (final t in <String>['extract', 'consolidation']) {
+        final src = _sources[t]!;
+        String spec = '';
+        if (src.startsWith('pool:') || src.startsWith('provider:')) {
+          spec = src;
+        } else if (src.startsWith('cloud:')) {
+          final regModel = _registryFor(src)!;
+          if (!providerKeyReady(regModel['pid']?.toString())) {
+            throw Exception('$t 选了[${regModel['pname']}]但该供应商 Key 为空，请在「云供应商 Key」区填写');
+          }
+          spec = src;
+        } else if (src == 'custom') {
+          // 自定义端点：base_url+model 写 model.<t>_*，key 走 <t>_api_key（旧通道）
+          final baseUrl = _customUrl[t]!.text.trim();
+          final modelName = _customModel[t]!.text.trim();
+          if (baseUrl.isEmpty || modelName.isEmpty) {
+            throw Exception('$t 选了云端模型但地址/模型名为空');
+          }
+          await widget.client.setConfig(<String, dynamic>{
+            'model': <String, dynamic>{'${t}_base_url': baseUrl, '${t}_model': modelName},
+          });
+          final k = _customKey[t]!.text.trim();
+          if (k.isNotEmpty) {
+            await widget.client.writeSecret('${t}_api_key', k);
+          } else {
+            throw Exception('$t 选了自定义端点但 API Key 为空，请填写 Key');
+          }
+          spec = 'provider:$t';
+        }
+        final routeRes = await widget.client.call('router.route_set', <String, dynamic>{'task': t, 'spec': spec});
+        if (routeRes is Map && routeRes['ok'] != true) {
+          throw Exception('$t 路由保存失败：${routeRes['error'] ?? routeRes}');
+        }
+      }
+      if (mounted) setState(() => _message = '已保存：供应商 Key 一次填写全用途共用；Embedding/Rerank/抽取/巩固 各自可选同供应商不同模型（全面云端，本地模型已裁撤）');
+    } catch (e) {
+      if (mounted) setState(() => _message = '保存失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _restart() async {
     final result = await widget.client.restartKernel();
-    setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已重启');
-    _reload();
+    if (mounted) setState(() => _message = result['message']?.toString() ?? result['error']?.toString() ?? '已重启');
+    unawaited(_reload());
+  }
+
+  String _optionLabel(String value) {
+    if (value == 'local') return '本地模型（已裁撤）';
+    // 硅基流动预设按用途显示不同模型名（Embedding=bge-m3 / Rerank=bge-reranker-v2-m3）
+    // 这里用调用方 _taskRow 的用途覆盖；默认给 Embedding 名以兼容其它调用
+    if (value == 'preset:siliconflow') return '硅基流动 · 免费（emb bge-m3 / 精排 v2-m3）';
+    if (value.startsWith('cloud:')) {
+      // cloud:<pid>|<model_id>：注册表供应商的具体模型（类别已过滤）
+      final rest = value.substring(6);
+      final sep = rest.indexOf('|');
+      final pid = sep < 0 ? rest : rest.substring(0, sep);
+      final mid = sep < 0 ? '' : rest.substring(sep + 1);
+      final rm = _registryModels.cast<Map<String, dynamic>?>().firstWhere(
+          (x) => x?['pid'] == pid && x?['id'] == mid, orElse: () => null);
+      final cat = rm?['category'] ?? '';
+      // 每项强制带 [供应商] 前缀，同名模型（两家都有 bge-m3）各占一行，绝不去重。
+      return '[${rm?['pname'] ?? pid}] ${_catLabel[cat] ?? cat}·${rm?['name'] ?? mid}';
+    }
+    if (value.startsWith('pool:')) {
+      final id = value.split(':').sublist(1).join(':');
+      final m = _poolModels.cast<Map<String, dynamic>?>().firstWhere(
+          (x) => x?['id'] == id, orElse: () => null);
+      return '号池 · $id${m != null ? " x${m['multiplier']}" : ''}';
+    }
+    if (value.startsWith('provider:')) {
+      final id = value.split(':').sublist(1).join(':');
+      final p = _savedProviders.cast<Map<String, dynamic>?>().firstWhere(
+          (x) => x?['name'] == id, orElse: () => null);
+      return '供应商 · ${p?['model'] ?? id}';
+    }
+    return '自定义供应商';
+  }
+
+  /// 单个模型的真实运行状态行（后端 _describe_model 穿透 Fallback 给出 active/model/circuit）。
+  /// 不允许占位：拿不到就显示「未加载/未知」，绝不编造。
+  Widget _activeModelLine(String label, String key) {
+    final m = _status[key] as Map<String, dynamic>?;
+    if (m == null) {
+      return Padding(padding: const EdgeInsets.only(top: 4),
+          child: Text('$label：状态不可用',
+              style: const TextStyle(color: Color(0xFFFFB74D), fontSize: 11)));
+    }
+    final active = m['active']?.toString() ?? '?';
+    final configured = m['configured']?.toString() ?? '?';
+    final kind = m['kind']?.toString() ?? '?';
+    final model = m['model']?.toString() ?? '';
+    final detail = m['detail']?.toString() ?? '';
+    final isCloud = active == 'cloud';
+    final fellBack = active == 'local' && configured == 'cloud';
+    final color = fellBack ? const Color(0xFFFFB74D)
+        : (isCloud ? const Color(0xFF4ADE80) : _accent);
+    final badge = fellBack ? '⚠ 本地已裁撤·检查云端路由' : (isCloud ? '云端' : '本地(已裁撤)');
+    final modelPart = model.isNotEmpty ? ' · $model' : '';
+    return Padding(
+      padding: const EdgeInsets.only(top: 5),
+      child: RichText(text: TextSpan(style: const TextStyle(fontSize: 11), children: <TextSpan>[
+        TextSpan(text: '$label：', style: const TextStyle(color: Colors.white)),
+        TextSpan(text: '$badge', style: TextStyle(color: color, fontWeight: FontWeight.w600)),
+        TextSpan(text: ' · $kind$modelPart', style: TextStyle(color: color)),
+        if (detail.isNotEmpty)
+          TextSpan(text: '\n    $detail', style: const TextStyle(color: _hint, fontSize: 10)),
+      ])),
+    );
+  }
+
+  /// 真实 GPU 显存（后端 nvidia-smi 实测，非硬编码百分比）。
+  Widget _gpuLine() {
+    final gpu = _status['gpu'] as Map<String, dynamic>?;
+    final cuda = _status['use_cuda'];
+    final dim = _status['dense_dim'];
+    if (gpu == null || gpu['available'] != true) {
+      final reason = gpu?['reason']?.toString() ?? '未探测';
+      return Text('CUDA $cuda · 维度 $dim · GPU：不可用（$reason，本卡无独显或未装驱动）',
+          style: const TextStyle(color: _hint, fontSize: 10));
+    }
+    final used = gpu['used_mb'];
+    final total = gpu['total_mb'];
+    final pct = gpu['used_pct'];
+    final util = gpu['util_pct'];
+    final name = gpu['name']?.toString() ?? '';
+    return Text('CUDA $cuda · 维度 $dim · $name 显存 $used/$total MB（${pct}%）· GPU 利用 ${util}%',
+        style: const TextStyle(color: _hint, fontSize: 10));
+  }
+
+  Widget _taskRow(String task) {
+    final source = _sources[task]!;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+        Row(children: <Widget>[
+          Expanded(flex: 4, child: Text(_taskLabels[task] ?? task,
+              style: const TextStyle(color: Colors.white, fontSize: 12))),
+          Expanded(flex: 6,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              decoration: BoxDecoration(color: const Color(0xFF0E1B2D),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFF1B2A42))),
+              child: DropdownButton<String>(
+                value: source, isExpanded: true, dropdownColor: const Color(0xFF0E1B2D),
+                style: const TextStyle(color: Colors.white, fontSize: 11),
+                underline: const SizedBox(),
+                items: <String>[
+                  // ★ 本地模型已全删（2026-11-12 全面云端）：下拉不再提供 local 选项，
+                  //   只剩号池 / 云供应商 / 自定义。
+                  // 按用途类别过滤：精排处只列 rerank、Embedding 处只列 embedding、
+                  //   抽取/巩固只列对话/视觉/代码/路由模型——不会再把向量模型当对话选错。
+                  ..._registryModels
+                      .where((m) => (_taskCategories[task] ?? <String>{}).contains(m['category']))
+                      .map((m) => 'cloud:${m['pid']}|${m['id']}'),
+                  // 号池模型（仅对话类用途）
+                  if (task == 'extract' || task == 'consolidation')
+                    ..._poolModels.map((m) => 'pool:${m['id'] ?? ''}'),
+                  // 已保存 key 的供应商快捷项（provider:* 走 ModelRouter）
+                  if (task == 'extract' || task == 'consolidation')
+                    ..._savedProviders.map((p) => 'provider:${p['name'] ?? ''}'),
+                  'custom',
+                ].map((v) => DropdownMenuItem<String>(value: v,
+                    child: Text(_optionLabel(v), overflow: TextOverflow.ellipsis))).toList(),
+                onChanged: (v) => setState(() => _sources[task] = v ?? 'custom'),
+              ),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 3),
+        Text(_taskHints[task] ?? '', style: const TextStyle(color: _hint, fontSize: 10)),
+        if (source == 'custom' || source == 'preset:siliconflow' || source.startsWith('cloud:')) ...<Widget>[
+          const SizedBox(height: 8),
+          if (source == 'custom') ...<Widget>[
+            TextField(controller: _customUrl[task], style: const TextStyle(color: Colors.white, fontSize: 11),
+              decoration: const InputDecoration(labelText: 'API 地址', labelStyle: TextStyle(color: _hint, fontSize: 10), border: OutlineInputBorder())),
+            const SizedBox(height: 6),
+            TextField(controller: _customModel[task], style: const TextStyle(color: Colors.white, fontSize: 11),
+              decoration: const InputDecoration(labelText: '模型名', labelStyle: TextStyle(color: _hint, fontSize: 10), border: OutlineInputBorder())),
+            const SizedBox(height: 6),
+            TextField(controller: _customKey[task], obscureText: true, style: const TextStyle(color: Colors.white, fontSize: 11),
+              decoration: const InputDecoration(labelText: 'API Key（存系统钥匙串，不落配置文件）', labelStyle: TextStyle(color: _hint, fontSize: 10), border: OutlineInputBorder())),
+          ] else ...<Widget>[
+            // 注册表供应商/预设：地址与模型自动带入，Key 统一在「云供应商 Key」区填一次
+            Padding(padding: const EdgeInsets.only(bottom: 6),
+              child: Text('已选 ${_optionLabel(source)} · Key 用「云供应商 Key」区该供应商已存的那把，无需重复填写',
+                  style: const TextStyle(color: _accent, fontSize: 10))),
+          ],
+        ],
+      ]),
+    );
   }
 
   @override
   Widget build(BuildContext context) => PageFrame(
         title: '模型配置',
-        subtitle: 'Embedding / LLM 两条通道各自独立供应商（地址、模型名、密钥分开），保存后重启内核生效',
+        subtitle: '所有模型用途集中在此，来源一键下拉选择；号池/硅基流动免费模型可替换本地小模型降负载',
         child: ListView(
           children: <Widget>[
-            _Card(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const Text('当前实际使用', style: TextStyle(color: Colors.white, fontSize: 13)),
-                  const SizedBox(height: 8),
-                  Text('Embedding：${_status['embedding_backend'] ?? '—'} · ${_status['embedder']?['kind'] ?? '—'}',
-                      style: const TextStyle(color: _accent, fontSize: 11)),
-                  Text('LLM：${_status['llm_backend'] ?? '—'} · ${_status['llm']?['kind'] ?? '—'}',
-                      style: const TextStyle(color: _accent, fontSize: 11)),
-                  Text('CUDA ${_status['use_cuda']} · 维度 ${_status['dense_dim']}',
-                      style: const TextStyle(color: _hint, fontSize: 11)),
-                ],
-              ),
-            ),
+            _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+              const Text('当前实际使用（运行时真实状态，非配置期望值）',
+                  style: TextStyle(color: Colors.white, fontSize: 13)),
+              const SizedBox(height: 8),
+              _activeModelLine('Embedding', 'embedder'),
+              _activeModelLine('交叉精排', 'reranker'),
+              _activeModelLine('抽取/巩固 LLM', 'llm'),
+              const SizedBox(height: 8),
+              _gpuLine(),
+            ])),
             const SizedBox(height: 12),
-            _Card(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const Text('两条独立云端通道', style: TextStyle(color: Colors.white, fontSize: 13)),
-                  const SizedBox(height: 12),
-                  TextField(controller: _embedUrl, style: const TextStyle(color: Colors.white, fontSize: 12),
-                      decoration: const InputDecoration(labelText: 'Embedding API 地址', labelStyle: TextStyle(color: _hint, fontSize: 11), border: OutlineInputBorder())),
-                  const SizedBox(height: 10),
-                  TextField(controller: _llmUrl, style: const TextStyle(color: Colors.white, fontSize: 12),
-                      decoration: const InputDecoration(labelText: 'LLM API 地址', labelStyle: TextStyle(color: _hint, fontSize: 11), border: OutlineInputBorder())),
-                  const SizedBox(height: 12),
-                  Row(children: <Widget>[
-                    FilledButton(onPressed: _save, child: const Text('保存')),
-                    const SizedBox(width: 12),
-                    OutlinedButton(onPressed: _restart, child: const Text('应用并重启内核')),
-                  ]),
-                  const SizedBox(height: 8),
-                  Text(_message, style: const TextStyle(color: _hint, fontSize: 11)),
-                ],
-              ),
-            ),
+            // 供应商级 Key：每家只填一次，所有用途共用（key 只跟供应商走，不跟用途走）
+            if (_providersMeta.isNotEmpty)
+              _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+                const Text('云供应商 Key（每家填一次，全部用途共用）',
+                    style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 4),
+                const Text('同一供应商可在下方各用途里挑不同模型；Key 存系统钥匙串，刷新后自动回填。',
+                    style: TextStyle(color: _hint, fontSize: 10, height: 1.5)),
+                const SizedBox(height: 6),
+                ..._providersMeta.map((p) {
+                  final pid = (p['pid'] ?? '').toString();
+                  final saved = _providerKeySaved.contains(pid);
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: <Widget>[
+                      SizedBox(width: 108, child: Text('${p['pname']}',
+                          style: const TextStyle(color: Colors.white, fontSize: 11))),
+                      Expanded(
+                        child: TextField(
+                          controller: _providerKeys[pid],
+                          obscureText: false,
+                          style: const TextStyle(color: Colors.white, fontSize: 11),
+                          decoration: InputDecoration(
+                            isDense: true,
+                            labelText: saved ? '已保存（可覆盖）' : (p['base_url'] ?? ''),
+                            labelStyle: TextStyle(
+                                color: saved ? Colors.greenAccent : _hint, fontSize: 10),
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ]),
+                  );
+                }),
+              ])),
             const SizedBox(height: 12),
-            _Card(
-              child: Text('完整参数分组（${_sections.keys.length} 组）：${_sections.keys.join(" / ")}\n'
-                  '在「设置」页可逐项微调；这里通过 WS RPC 的 config.get / config.set 读写同一份用户差异补丁。',
-                  style: const TextStyle(color: _hint, fontSize: 11, height: 1.6)),
-            ),
+            _Card(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+              const Text('统一模型路由', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              const Text('每个用途一个下拉：本地 / 号池模型 / 云供应商 / 自定义。'
+                  'Embedding/Rerank 可用硅基流动免费预设；抽取/巩固可用号池或已存 key 的供应商。',
+                  style: TextStyle(color: _hint, fontSize: 10, height: 1.5)),
+              const SizedBox(height: 6),
+              // 云路由总开关：enabled=false 时 provider:* 供应商不进候选池（填了 key 也不生效）
+              Row(children: <Widget>[
+                Icon(Icons.cloud_outlined, size: 15,
+                    color: _routerEnabled ? Colors.greenAccent : _hint),
+                const SizedBox(width: 6),
+                const Text('云供应商路由', style: TextStyle(color: Colors.white, fontSize: 12)),
+                const Spacer(),
+                Text(_routerEnabled ? '开（允许数据出本机）' : '关（仅本地/号池）',
+                    style: TextStyle(color: _routerEnabled ? Colors.greenAccent : _hint, fontSize: 10)),
+                Switch(
+                  value: _routerEnabled,
+                  onChanged: (v) => unawaited(_setRouterEnabled(v)),
+                  activeThumbColor: Colors.greenAccent,
+                ),
+              ]),
+              if (_savedProviders.isEmpty)
+                const Padding(padding: EdgeInsets.only(bottom: 2),
+                  child: Text('尚无已存 key 的供应商：请到「号池网关 → 云供应商」填 key，自动开启本开关。',
+                      style: TextStyle(color: Color(0xFFFFB74D), fontSize: 10))),
+              const Divider(color: Color(0xFF1B2A42), height: 14),
+              ..._tasks.map(_taskRow),
+              const SizedBox(height: 10),
+              Row(children: <Widget>[
+                FilledButton(onPressed: _busy ? null : _save, child: Text(_busy ? '处理中…' : '保存')),
+                const SizedBox(width: 12),
+                OutlinedButton(onPressed: _busy ? null : _restart, child: const Text('应用并重启内核')),
+              ]),
+              const SizedBox(height: 8),
+              Text(_message, style: const TextStyle(color: _hint, fontSize: 11)),
+            ])),
           ],
         ),
       );
@@ -1182,6 +1790,9 @@ class _SyncPageState extends State<SyncPage> {
   final TextEditingController _localDir = TextEditingController();
   final TextEditingController _deviceId = TextEditingController();
   final TextEditingController _interval = TextEditingController();
+  // GitHub PAT 从「密钥保管」页迁入此处（同步私库用），存系统钥匙串不落盘
+  final TextEditingController _githubPat = TextEditingController();
+  bool _githubPatSaved = false;
 
   @override
   void initState() {
@@ -1196,23 +1807,51 @@ class _SyncPageState extends State<SyncPage> {
     _localDir.dispose();
     _deviceId.dispose();
     _interval.dispose();
+    _githubPat.dispose();
     super.dispose();
   }
 
   Future<void> _loadConfig() async {
     try {
-      final config = await widget.client.config();
+      final results = await Future.wait<dynamic>(<Future<dynamic>>[
+        widget.client.config(), widget.client.secretsStatus(),
+      ]);
+      final config = results[0] as Map<String, dynamic>? ?? <String, dynamic>{};
       final sections = config['sections'] as Map<String, dynamic>? ?? <String, dynamic>{};
       final sync = sections['sync'] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final secrets = results[1] as Map<String, dynamic>? ?? <String, dynamic>{};
+      final accounts = secrets['accounts'] as Map<String, dynamic>? ?? <String, dynamic>{};
       if (!mounted) return;
       _repoUrl.text = sync['repo_url']?.toString() ?? '';
       _localDir.text = sync['local_repo_dir']?.toString() ?? '';
       _deviceId.text = sync['device_id']?.toString() ?? '';
       _interval.text = sync['sync_interval_sec']?.toString() ?? '300';
+      _githubPatSaved = accounts['github_pat'] == true;
       setState(() {});
     } catch (error) {
       if (mounted) setState(() => _status = '读取同步配置失败：$error');
     }
+  }
+
+  Future<void> _saveGithubPat() async {
+    final value = _githubPat.text.trim();
+    if (value.isEmpty) {
+      if (mounted) setState(() => _status = 'PAT 输入为空，未改动');
+      return;
+    }
+    final result = await widget.client.writeSecret('github_pat', value);
+    _githubPat.clear();
+    if (!mounted) return;
+    setState(() {
+      _githubPatSaved = result['ok'] == true;
+      _status = '${result['ok'] == true ? 'GitHub PAT 已存' : '保存失败'} · ${result['backend'] ?? '—'}';
+    });
+  }
+
+  Future<void> _deleteGithubPat() async {
+    await widget.client.deleteSecret('github_pat');
+    if (!mounted) return;
+    setState(() { _githubPatSaved = false; _status = 'GitHub PAT 已删除'; });
   }
 
   Future<void> _saveRepo() async {
@@ -1311,6 +1950,29 @@ class _SyncPageState extends State<SyncPage> {
                       isDense: true, border: OutlineInputBorder(),
                     ),
                   )),
+                ]),
+                const SizedBox(height: 8),
+                const Divider(color: Color(0xFF1B2A42), height: 14),
+                Row(children: <Widget>[
+                  SizedBox(width: 120,
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+                      const Text('GitHub PAT', style: TextStyle(color: Colors.white, fontSize: 11)),
+                      Text(_githubPatSaved ? '● 已保存' : '○ 未保存',
+                          style: TextStyle(color: _githubPatSaved ? const Color(0xFF4ADE80) : _hint, fontSize: 10)),
+                    ])),
+                  Expanded(child: TextField(
+                    controller: _githubPat, obscureText: true,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                    decoration: const InputDecoration(
+                      hintText: '私库令牌（存系统钥匙串，不落配置文件）',
+                      hintStyle: TextStyle(color: _hint, fontSize: 10),
+                      isDense: true, border: OutlineInputBorder(),
+                    ),
+                  )),
+                  const SizedBox(width: 6),
+                  OutlinedButton(onPressed: _saveGithubPat, child: const Text('保存', style: TextStyle(fontSize: 11))),
+                  IconButton(tooltip: '删除 PAT', onPressed: _deleteGithubPat,
+                    icon: const Icon(Icons.delete_outline, color: _hint, size: 18)),
                 ]),
                 const SizedBox(height: 8),
                 OutlinedButton(onPressed: _saveRepo, child: const Text('保存仓库设置', style: TextStyle(fontSize: 11))),
@@ -1413,7 +2075,8 @@ class AboutPage extends StatelessWidget {
               '硬件仪表：CPU / 内存 / NVIDIA 显卡利用率、显存与温度，2 秒采样。',
               '托盘与单实例：dart:ffi 调 Win32；点 X 隐藏进托盘，托盘右键「完全退出」'
                   '会先让后端优雅停机再退出，Job Object 保证前端被强杀时后端不残留。',
-              '开机自启、密钥串（DPAPI）、数据目录迁移均可在「桌面能力」页配置。',
+              '开机自启、数据目录迁移在「桌面能力」页；GitHub PAT 在「同步与备份」页；'
+              '模型 API Key 在「模型配置」页（均存系统钥匙串，不落配置文件）。',
             ]),
             const SizedBox(height: 10),
             _section('长时挂机与数据安全', <String>[

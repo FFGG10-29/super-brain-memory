@@ -76,28 +76,36 @@ class ModelConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MODEL_")
 
     dense_dim: int = 1024                                # BGE-M3 稠密维度
-    embedding_model: str = "BAAI/bge-m3"                 # 稠密+稀疏
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"      # 交叉编码精排
-    llm_gguf_file: str = "qwen3-0.6b-q8_0.gguf"         # 本地 GGUF 文件名（严格 JSON 抽取/总结）
+    embedding_model: str = "BAAI/bge-m3"                 # 稠密+稀疏（本地文件已删，仅历史字段）
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"      # 交叉编码精排（本地文件已删，仅历史字段）
+    llm_gguf_file: str = "qwen3-0.6b-q8_0.gguf"         # ★ 本地 GGUF 已删除（2026-11-12 全面云端）
     llm_gguf_dir: Path = models_dir()
     use_cuda: bool = False                               # CUDA→CPU 自动降级
     llm_gpu_layers: int = -1                             # n_gpu_layers 递减降级
     llm_max_tokens: int = 512                            # 单次 JSON 抽取生成上限，防止 thinking 失控
     onnx_providers: list[str] = Field(default_factory=lambda: ["CPUExecutionProvider"])
-    # 模型来源：local=全本地；cloud=云端 OpenAI 兼容 API（未配齐自动退本地）；auto=本地有模型文件用本地，否则云
-    # 每条通道独立选择本地 / 云端（OpenAI 兼容），地址与 key 各自独立
+    # ★【2026-11-12 用户裁决】本地模型全删（bge-m3 / reranker / Qwen3-0.6B 一并裁撤），
+    #   三通道默认云端，不考虑本地降级。本地档只有显式占位（DisabledXxx），云端失败
+    #   如实降级（向量投影跳过留 outbox / 精排跳过 / 抽取走规则拆分），绝不加载本地大模型。
+    # 每条通道独立选云端供应商（OpenAI 兼容），地址与 key 各自独立
     # —— Embedding 和 LLM 可以是两家不同供应商（如 OpenAI 向量 + DeepSeek 对话）。
-    embed_backend: Literal["local", "cloud"] = "local"
+    embed_backend: Literal["local", "cloud"] = "cloud"
     embed_base_url: str = ""                             # 如 https://api.openai.com/v1（不带尾斜杠）
     embed_model: str = ""                                # 如 text-embedding-3-small
     embed_dim: int = 1024                                # 云端向量维度，必须与 dense_dim 一致
     embed_timeout_sec: int = 30
     embed_api_key_env: str = "EMBED_API_KEY"             # key 来源：钥匙串(embed_api_key) > 该环境变量
-    llm_backend: Literal["local", "cloud"] = "local"
+    llm_backend: Literal["local", "cloud"] = "cloud"
     llm_base_url: str = ""                               # 如 https://api.deepseek.com/v1
     llm_model: str = ""                                  # 如 deepseek-chat / gpt-4o-mini
     llm_timeout_sec: int = 30
     llm_api_key_env: str = "LLM_API_KEY"
+    # Rerank 云端通道（硅基流动 /v1/rerank，BAAI/bge-reranker-v2-m3 免费）；
+    # 与 embed/llm 对称独立配置。连不上时 FallbackReranker 回落本地 ONNX。
+    rerank_backend: Literal["local", "cloud"] = "cloud"
+    rerank_base_url: str = ""                            # 如 https://api.siliconflow.cn/v1
+    rerank_model: str = ""                               # 如 BAAI/bge-reranker-v2-m3
+    rerank_api_key_env: str = "RERANK_API_KEY"           # key 来源：钥匙串(rerank_api_key) > 该环境变量
     # ★ 本地 LLM 总开关（MODEL_LLM_ENABLED，默认 True=启用 GPU/CPU 推理）。
     #   2026-11-10 实测：GTX 1060(Pascal 6.1) 上 bge-m3+reranker(CUDA)+qwen3-0.6b
     #   (n_gpu_layers=-1) 三模型同进程共存、推理全部正常，无需禁用 LLM。
@@ -219,6 +227,24 @@ class GatewayConfig(BaseSettings):
     autostart_http: bool = True                          # 启动即开 HTTP，供多 Agent 的 MCP 转接
     default_rate_limit: int = 60                         # 丘脑按 agent 限速(/min)
     registry_enabled: bool = True
+
+
+class OneToManyConfig(BaseSettings):
+    """一进多出铁律（2026-11-12 用户裁决，无例外）。
+
+    任何途径写记忆（聊天 / MCP save_memory / stdio / OneBot / 蒸馏 / 导入 / 系统）
+    都必须先按新架构拆成一组结构化记忆（profile/emotion/fact/scenario/code +
+    事件超边）再整组入池；抽取失败或不合规 → 原文留项目档案待重试，
+    绝不降级成单条 neuron 混入记忆库。
+
+    唯一合法的单条写入是 ``remember(..., _from_bundle=True)``：由 remember_bundle
+    内部逐条落库时打标记（它们已属于一个合规 bundle）。系统派生（叙事/蒸馏/合并
+    更新）也必须走 bundle 或显式 _from_bundle，没有旁路。
+    """
+    model_config = SettingsConfigDict(env_prefix="ONETOMANY_")
+    enforce: bool = True                          # 铁律总开关（关掉=退回旧行为）
+    min_items: int = 1                            # bundle 至少几条才算合规
+    retry_doc_title: str = "[待重试·一进多出] 未入池的对话原文"
 
 
 class MergeConfig(BaseSettings):
@@ -362,7 +388,15 @@ class MediaServiceConfig(BaseSettings):
 
 
 class CacheConfig(BaseSettings):
-    """v4.1-C / C0：缓存专项。默认开启但容量保守；输出缓存默认关（语义风险，Q34）。"""
+    """v4.1-C / C0：缓存专项。2026-11-12 用户裁决：**默认全开全用上**。
+
+    原 Q34「输出缓存默认关（语义风险）」已被用户明确推翻——C16/C17 的精确失效
+    （memory_ids → memory_updated 按值删）已能兜住陈旧风险，且 sensitive 内容
+    一律不读不写，故 output/semantic 默认打开。
+    纯架构预留位（thalamus/safety/narrative/path/route/conflict/tool）无生产消费者，
+    开关虽按要求全开，但快照会把它们单列到 reserved 分组，不再混进活跃列表制造"假 0"。
+    有真实消费者的命名空间清单见 core.cache_manager._CONSUMERS（单一真源）。
+    """
     model_config = SettingsConfigDict(env_prefix="CACHE_")
 
     enabled: bool = True                       # 总开关；false 时全部回退无缓存路径
@@ -377,25 +411,33 @@ class CacheConfig(BaseSettings):
     cognitive_namespaces: list[str] = Field(default_factory=lambda: ["output"])
     namespaces: dict[str, dict[str, Any]] = Field(default_factory=lambda: {
         # media: memory（LRU）| lmdb；ttl_sec<=0 = 永不过期（靠精确失效）
+        # ── 有真实生产消费者（详见 core.cache_manager._CONSUMERS）──
         "recall": {"enabled": True, "capacity": 512, "ttl_sec": 600, "media": "memory"},
         "embedding": {"enabled": True, "capacity": 5000, "ttl_sec": 2592000, "media": "lmdb"},
+        # C18 向量索引段缓存：此前漏登记，快照列表不显示；本次补进配置（memory 介质、保守容量）
+        "vector_index": {"enabled": True, "capacity": 512, "ttl_sec": 600, "media": "memory"},
         "salience": {"enabled": True, "capacity": 2000, "ttl_sec": 600, "media": "memory"},
         "episodic": {"enabled": True, "capacity": 256, "ttl_sec": 3600, "media": "memory"},
         "prompt_prefix": {"enabled": True, "capacity": 16, "ttl_sec": 0, "media": "memory"},
         "path": {"enabled": True, "capacity": 256, "ttl_sec": 300, "media": "memory"},
-        "persona": {"enabled": True, "capacity": 8, "ttl_sec": 0, "media": "memory"},
+        "persona": {"enabled": True, "capacity": 8, "ttl_sec": 86400, "media": "memory"},
         "route": {"enabled": True, "capacity": 256, "ttl_sec": 1800, "media": "memory"},
-        "doc_distill": {"enabled": True, "capacity": 1000, "ttl_sec": 0, "media": "lmdb"},
-        # 语义风险最高，默认关（Q34）；C16 先做、C17 缓一档
-        "output": {"enabled": False, "capacity": 1000, "ttl_sec": 86400, "media": "lmdb"},
+        # E6 Agent 心智模型 brief：按 agent_id 缓存 300s（与 _agent_brief 私有 L1 同 TTL）
+        "agent_brief": {"enabled": True, "capacity": 128, "ttl_sec": 300, "media": "memory"},
+        "doc_distill": {"enabled": True, "capacity": 1000, "ttl_sec": 259200, "media": "lmdb"},
+        # C16 精确输出缓存：用户裁决默认开（原 Q34 关）；sensitive 不读不写 + 精确失效兜底
+        "output": {"enabled": True, "capacity": 1000, "ttl_sec": 86400, "media": "lmdb"},
         # C17 语义输出缓存：条目键=sha256(normalize(prompt))，值含 embedding/text/affected_ids
         "semantic": {"enabled": True, "capacity": 256, "ttl_sec": 86400, "media": "memory"},
-        # 以下为预留位（Q28/Q31 裁决：narrative 由 W8 投影缓存承担、thalamus/safety 砍）
-        "thalamus": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},
-        "safety": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "memory"},
-        "narrative": {"enabled": False, "capacity": 256, "ttl_sec": 0, "media": "memory"},
-        "tool": {"enabled": False, "capacity": 256, "ttl_sec": 600, "media": "lmdb"},
-        "conflict": {"enabled": False, "capacity": 1000, "ttl_sec": 0, "media": "memory"},
+        # ── 架构预留位：开关按要求全开，但无生产消费者；快照归入 reserved 分组 ──
+        # narrative 由 W8 fast_recall.ProjectionCache 承担（Q28）；其余 Q31 砍/合并
+        "thalamus": {"enabled": True, "capacity": 256, "ttl_sec": 600, "media": "memory"},
+        "safety": {"enabled": True, "capacity": 256, "ttl_sec": 600, "media": "memory"},
+        "narrative": {"enabled": True, "capacity": 256, "ttl_sec": 0, "media": "memory"},
+        # tool 承接 tools/list 的 schema 清单：进程内静态常量、跟代码版本走，
+        # 用 memory 即可（lmdb 跨进程持久化对"随版本重算"的 schema 无价值，反增序列化开销）
+        "tool": {"enabled": True, "capacity": 256, "ttl_sec": 0, "media": "memory"},
+        "conflict": {"enabled": True, "capacity": 1000, "ttl_sec": 0, "media": "memory"},
     })
 
 
@@ -517,6 +559,7 @@ class BrainConfig(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     forget: ForgetConfig = Field(default_factory=ForgetConfig)
     account_pool: AccountPoolConfig = Field(default_factory=AccountPoolConfig)
+    one_to_many: OneToManyConfig = Field(default_factory=OneToManyConfig)
 
 
 # 单例配置（懒加载于 main.py）

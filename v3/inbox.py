@@ -123,5 +123,22 @@ class Inbox:
         rows = self._conn.execute("SELECT status, count(*) AS n FROM inbox GROUP BY status").fetchall()
         return {row["status"]: row["n"] for row in rows}
 
+    def peek(self, status: str = "pending", *, limit: int = 10) -> list[dict[str, Any]]:
+        """队列明细（提炼进度卡可视化）：来源 agent / 空间 / 字数 / 内容预览。"""
+        rows = self._conn.execute(
+            """SELECT row_id, agent_id, namespace, content, created_ms, attempts
+               FROM inbox WHERE status=? ORDER BY row_id LIMIT ?""",
+            (status, int(limit)),
+        ).fetchall()
+        return [{
+            "row_id": int(r["row_id"]),
+            "agent_id": str(r["agent_id"]),
+            "namespace": str(r["namespace"]),
+            "chars": len(str(r["content"] or "")),
+            "preview": str(r["content"] or "")[:80],
+            "created_ms": int(r["created_ms"]),
+            "attempts": int(r["attempts"]),
+        } for r in rows]
+
     def close(self) -> None:
         self._conn.close()

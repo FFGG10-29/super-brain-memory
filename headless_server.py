@@ -50,6 +50,33 @@ from v3.daemon import V3Daemon
 
 __all__ = ["HeadlessServer", "create_server", "ensure_chat_token", "serve"]
 
+# pythonw（无控制台）下 sys.stdout/stderr 为 None，任何 print 都会炸——兜底重定向到日志文件。
+# 2026-11-13：backend_command 切 pythonw.exe（消除 GUI 前端拉后端时的黑窗），此兜底为前置条件。
+import sys as _sys
+
+# pythonw（无控制台）判定：强制重定向 stdout/stderr 到日志，规避 pyreadline3
+# 控制台钩子格式化中文 traceback 时的死锁（2026-11-13 实测卡死根因）。
+if _sys.executable and _sys.executable.lower().endswith("pythonw.exe"):
+    try:
+        from core.runtime_paths import data_dir as _dd
+        _log_dir = _dd() / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _f = open(_log_dir / "backend-stdout.log", "a", buffering=1, encoding="utf-8")
+        if _sys.stdout is None:
+            _sys.stdout = _f
+        if _sys.stderr is None:
+            _sys.stderr = _f
+    except Exception:  # noqa: BLE001  连日志文件都开不了就静默丢弃，绝不让后端起不来
+        class _Null:
+            def write(self, *_a, **_k):
+                return 0
+            def flush(self):
+                return 0
+            def isatty(self):
+                return False
+        _sys.stdout = _Null()
+        _sys.stderr = _Null()
+
 
 def ensure_chat_token(path: str | None = None) -> str:
     """A2 / Q22：chat 专用令牌，持久在文件里，绝不复用 MCP 的 Bridge 令牌。"""

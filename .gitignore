@@ -1,12 +1,33 @@
-# 运行期数据与密钥，禁止入库
+# ── 运行期数据 / 记忆 / 凭证：一律禁止入库 ──────────────────────────────
+# 记忆库、人格档案、聊天记录等只存本机，不随源码同步到任何远端仓库
 data/
-.env
+.memory/
+*.db
+*.db-wal
+*.db-shm
+*.lance/
+*.kuzu/
+*.lmdb/
+brain-sync/
+context/
+chat_token.txt
+flutter_prefs.json
+config.json
 *.pat
 *.token
-# 子代理团队运行时状态
-.codebuddy/teams/
+*.pem
+*.key
+*credentials*
+.env
+.env.*
+!.env.example
 
-# Python
+# ── 本机备份 / 日志 / 临时产物 ─────────────────────────────────────────
+*.bak
+*.bak.*
+*.bak-*
+*.log
+*.tmp
 __pycache__/
 *.py[cod]
 .venv/
@@ -17,28 +38,17 @@ venv/
 .mypy_cache/
 .ruff_cache/
 backups/
+.codebuddy/teams/
 
-# 工作记忆目录必须随仓库同步到 GitHub（见 .memory/README.md）
-!.memory/
-!.memory/**
-
-# 本地库文件（六引擎落盘产物）
-*.db
-*.db-wal
-*.db-shm
-*.lance/
-*.kuzu/
-*.lmdb/
-brain-sync/
-
-# 打包产物（PyInstaller；含 3GB+ 模型，绝不入库）
+# ── 打包产物（PyInstaller；含 3GB+ 模型，绝不入库）────────────────────
 build/
 app_entry.py
-backend_entry.py
 super-brain.spec
 super-brain-backend.spec
 dist/
 release/
+installer/
+installer-stage/
 
 # Flutter（平台 runner 入库，构建产物与本机缓存不入库）
 flutter_app/build/

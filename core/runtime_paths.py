@@ -73,29 +73,67 @@ def _data_pointer() -> str:
 
 
 def data_dir() -> Path:
-    override = os.environ.get("SUPER_BRAIN_DATA_DIR") or _data_pointer()
-    if override:
-        path = Path(override)
-    elif is_frozen():
-        path = user_dir() / "data"
-    else:
-        path = project_root() / "data"
+    """可写数据目录。v4.1-C：解析结果缓存进 ``path`` ns（运行期频繁调用点）。"""
+    def _compute() -> Path:
+        override = os.environ.get("SUPER_BRAIN_DATA_DIR") or _data_pointer()
+        if override:
+            return Path(override)
+        if is_frozen():
+            return user_dir() / "data"
+        return project_root() / "data"
+    path = _cached_path("data_dir", _compute)
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cached_path(ns_key: str, compute) -> Path:
+    """v4.1-C 全开：把路径解析结果缓存进 ``path`` ns（纯进程内、启动期固定）。
+
+    环境变量/冻结态在进程生命周期内不变，解析结果是确定值；缓存避免每次 stat。
+    未装配/异常一律回退现算，行为与原实现一致。
+    """
+    try:
+        from core.cache_manager import get_cache_manager
+
+        mgr = get_cache_manager()
+    except Exception:  # noqa: BLE001
+        mgr = None
+    if mgr is not None:
+        try:
+            hit = mgr.get("path", ns_key)
+            if hit is not None:
+                return Path(str(hit))
+        except Exception:  # noqa: BLE001
+            pass
+    path = compute()
+    if mgr is not None:
+        try:
+            mgr.set("path", ns_key, str(path))
+        except Exception:  # noqa: BLE001
+            pass
     return path
 
 
 def models_dir() -> Path:
     """模型权重目录：环境变量 > 随包 models/ > 用户目录 models/ > 开发态 data/models。"""
-    override = os.environ.get("MODEL_LLM_GGUF_DIR") or os.environ.get("SUPER_BRAIN_MODELS_DIR")
-    if override:
-        return Path(override)
-    if is_frozen():
-        candidates = [resource_root() / "models", user_dir() / "models"]
+    def _compute() -> Path:
+        override = os.environ.get("MODEL_LLM_GGUF_DIR") or os.environ.get("SUPER_BRAIN_MODELS_DIR")
+        if override:
+            return Path(override)
+        if is_frozen():
+            candidates = [resource_root() / "models", user_dir() / "models"]
+        else:
+            # dev/源码态（含 .venv 裸命令）：先探安装包随带模型目录（同一台机已有，
+            # 不重复下载、仍在 D 盘），再退项目 data/models。这样不带环境变量时
+            # reranker/embedder 也能解析到真模型，消除"embedder 正常/reranker 摆烂"的
+            # 双路径不一致（P0-1）。目录不存在时回退到 data/models（保持原语义）。
+            install_models = Path("D:/SuperBrain/backend/_internal/models")
+            candidates = [install_models, user_dir() / "models", data_dir() / "models"]
         for path in candidates:
             if path.is_dir():
                 return path
         return candidates[0]
-    return data_dir() / "models"
+    return _cached_path("models_dir", _compute)
 
 
 def local_bridge_path() -> Path:

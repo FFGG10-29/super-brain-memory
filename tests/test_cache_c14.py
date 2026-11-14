@@ -56,17 +56,33 @@ def test_rollback_invalidates_cache(layer, mgr) -> None:
     assert "斗嘴0.6" in layer.compose_text()              # 再读拿到回滚值
 
 
-def test_apply_proposal_invalidates_cache(layer, mgr) -> None:
+def test_apply_proposal_invalidates_cache(layer, mgr, monkeypatch) -> None:
+    # ★ 阻尼门槛（2026-11-12）：同向 streak 必须跨 ≥24h——把时钟推到三天后逐条喂
+    clock = {"ms": persona_mod._now_ms()}
+    monkeypatch.setattr(persona_mod, "_now_ms", lambda: clock["ms"])
     for _ in range(3):
+        clock["ms"] += 24 * 3600 * 1000 + 60_000  # 每天一条：满足 24h 跨度
         layer.feedback(signal="夸奖", valence=0.8, target="sassiness",
                        session_id=f"s-{_}", note="t")
     proposals = [p for p in layer._read().get("proposals", []) if p["status"] == "pending"]
-    assert proposals, "三次同向跨会话反馈应生成提案"
+    assert proposals, "同向跨会话且跨 24h 的反馈应生成提案"
     layer.compose_text()
     result = layer.apply_proposal(proposals[-1]["id"])
     assert result["ok"] is True
     assert mgr.size("persona") == 0                      # 提案应用后失效
     assert f"斗嘴{result['params']['sassiness']}" in layer.compose_text()
+
+
+def test_damping_blocks_same_day_streak(layer, monkeypatch) -> None:
+    """★ 阻尼验收：同天连发 3 次夸奖不生成提案（时间跨度不足 24h），人设不瞬变。"""
+    clock = {"ms": persona_mod._now_ms()}
+    monkeypatch.setattr(persona_mod, "_now_ms", lambda: clock["ms"])
+    for _ in range(3):
+        clock["ms"] += 60_000  # 三分钟内连发
+        layer.feedback(signal="夸奖", valence=0.8, target="sassiness",
+                       session_id=f"s-{_}", note="t")
+    proposals = [p for p in layer._read().get("proposals", []) if p["status"] == "pending"]
+    assert not proposals, "同天 3 连夸必须被 24h 跨度门槛挡住（防一时情绪冲垮人设）"
 
 
 def test_no_manager_falls_back_to_disk(tmp_path, monkeypatch) -> None:

@@ -584,7 +584,35 @@ class Prefrontal:
            duck-typed 的 `supersede_edges_of(id)`（返回对端 id 列表）时启用；
            对端记忆仍在召回池（is_active）才算「未消解」——已被封存即已裁决。
         2. 主库 payload 的 supersede 相关字段（memory_editor 纠正链落库痕迹）。
+
+        v4.1-C 全开：结果写 ``conflict`` ns（键=neuron_id）。该查询每次召回对每条
+        候选都跑一遍（查主库+查图），同批/跨批重复命中率高。失效走 C0 总线：
+        supersede/correct 写入的 memory_updated 事件 affected_ids 含本 neuron_id 时，
+        ``invalidate_by_event`` 默认扫 conflict ns（见下方 _CONFLICT_NS 注册），按值精确删。
         """
+        try:
+            from core.cache_manager import get_cache_manager
+
+            mgr = get_cache_manager()
+        except Exception:  # noqa: BLE001
+            mgr = None
+        if mgr is not None:
+            try:
+                hit = mgr.get("conflict", neuron_id)
+                if isinstance(hit, bool):
+                    return hit
+            except Exception:  # noqa: BLE001
+                pass
+        verdict = self._supersede_trace_uncached(neuron_id)
+        if mgr is not None:
+            try:
+                mgr.set("conflict", neuron_id, verdict)
+            except Exception:  # noqa: BLE001
+                pass
+        return verdict
+
+    def _supersede_trace_uncached(self, neuron_id: str) -> bool:
+        """无缓存的冲突痕迹实查（缓存未装配/失效后的真实路径）。"""
         try:
             record = self._relational.get("neuron", neuron_id)
         except Exception:  # noqa: BLE001
@@ -681,6 +709,23 @@ class Prefrontal:
         if not recall.rerank_enabled:
             # 低配设备/追求低延迟：跳过交叉编码精排，保留 RRF 顺序
             return fallback
+        # ★ 远程精排（task_routes["rerank"]）：配了 pool:/free:/provider: 就把本地
+        #   bge-reranker 负载卸给远程模型（省 CPU 算子回落 + ~543M 显存）。模型不可用时
+        #   静默回退本地 ONNX 精排，绝不因远程抖动阻断召回。
+        order = self._rerank_remote(query, candidates) if self._rerank_route() else None
+        if order is not None:
+            by_id = {hit.neuron.uuid7_id: hit for hit in candidates}
+            reranked: list[RecallHit] = []
+            for rank, scored in enumerate(order):
+                hit = by_id.get(str(scored.get("id", "")))
+                if hit is None:
+                    continue
+                blended = 0.5 * hit.score + 0.5 * (1.0 - rank / max(len(order), 1))
+                reranked.append(RecallHit(neuron=hit.neuron, score=blended,
+                                          channels=hit.channels, confidence=hit.confidence))
+            if reranked:
+                reranked.sort(key=lambda item: item.score, reverse=True)
+                return reranked[: max(top_k * recall.rrf_k_oversample, top_k)]
         # 硬超时：超时直接回退 RRF 顺序，绝不让 deep 卡死 Agent 一轮对话
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(max_workers=1)
@@ -709,6 +754,49 @@ class Prefrontal:
             ))
         reranked.sort(key=lambda item: item.score, reverse=True)
         return reranked[: max(top_k * self._config.recall.rrf_k_oversample, top_k)]
+
+    def _rerank_route(self) -> str:
+        """task_routes["rerank"] 的远程 spec（pool:/free:/provider:）；空=用本地 ONNX。"""
+        try:
+            from gateway.model_router import get_model_router
+
+            router = get_model_router()
+            overlay = getattr(router, "_task_routes_overlay", lambda: {})()
+            routes = overlay or getattr(self._config.model_router, "task_routes", {}) or {}
+            return str(routes.get("rerank") or "")
+        except Exception:  # noqa: BLE001  路由层异常一律走本地
+            return ""
+
+    def _rerank_remote(self, query: str, candidates: list[RecallHit]) -> list[dict[str, Any]] | None:
+        """远程模型精排：让模型按相关性给候选 id 排序。失败返回 None 回落本地 ONNX。"""
+        import json as _json
+
+        from gateway.model_router import get_model_router
+
+        lines = "\n".join(
+            f"{index}. [{hit.neuron.uuid7_id}] {hit.neuron.content[:160]}"
+            for index, hit in enumerate(candidates, start=1))
+        prompt = (
+            "你是记忆检索精排器。按与「查询」的相关性，把下面候选重新排序。\n"
+            "只输出 JSON：{\"order\":[\"候选id\", ...]}，id 必须来自原文、按最相关到最不相关，"
+            "数量可少于候选数。不要输出任何其它文字。\n\n"
+            f"查询：{query}\n\n候选：\n{lines}"
+        )
+        try:
+            raw = get_model_router().complete_task("rerank", prompt)
+            text = str(raw or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`").lstrip("json").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            payload = _json.loads(text[start:end + 1])
+            ids = [str(x) for x in (payload.get("order") or []) if x]
+            valid = {hit.neuron.uuid7_id for hit in candidates}
+            order = [{"id": item} for item in ids if item in valid]
+            return order or None
+        except Exception:  # noqa: BLE001  远程精排失败静默回落本地
+            return None
 
     def _apply_tier_quota(self, hits: list[RecallHit], top_k: int) -> list[RecallHit]:
         """分层配额：核心层优先，缓冲层次之，归档已被排除。"""

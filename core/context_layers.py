@@ -318,8 +318,14 @@ class ContextLayers:
             index["documents"] = rows
             index["revision"] = int(index.get("revision", 1)) + 1
             _atomic_json(self._doc_index_path, index)
-        # 实时提炼触发器：create/update 后异步把档案送进六引擎（不阻塞写入）
-        if action in ("create", "update") and _DISTILL_TRIGGER is not None and doc_id:
+        # 变更后的文档标题（蒸馏跳过判定用）
+        row_title = next((str(r.get("title") or "") for r in rows
+                          if r.get("id") == doc_id), "")
+        # 实时提炼触发器：create/update 后异步把档案送进六引擎（不阻塞写入）。
+        # ★ [待重试 档案绝不送蒸馏：它们本身就是"一进多出失败留档"，再蒸馏只会
+        #   失败→再留档→再触发，无限循环制造垃圾记忆（2026-11-12 用户裁决禁止）。
+        if (action in ("create", "update") and _DISTILL_TRIGGER is not None and doc_id
+                and not str(row_title).startswith("[待重试")):
             try:
                 _DISTILL_TRIGGER(doc_id)
             except Exception:  # noqa: BLE001  触发失败不影响档案写入
